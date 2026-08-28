@@ -8,7 +8,10 @@ import {
   resolveFabricExecProgram,
 } from "../src/fabric-exec-arguments.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
-import { fabricScriptTitleHint } from "../src/ui/fabric-code-parser.js";
+import {
+  fabricExecTitleHint,
+  fabricScriptTitleHint,
+} from "../src/ui/fabric-code-parser.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
@@ -108,27 +111,43 @@ describe("script-mode rendering", () => {
 
   it("titles a compact card from the payload, skipping shell preamble", () => {
     const compact = renderCall(renderState("compact"), scriptArgs({ script: payload }));
-    expect(compact).toContain("Shell pnpm");
-    expect(compact).not.toContain("--filter core");
+    expect(compact).toContain("Shell pnpm test --filter core");
     expect(compact).not.toContain("set -eu");
   });
 
-  it("keeps secret-bearing shell arguments out of compact and durable titles", () => {
-    const secret = "supersecretvalue";
-    const script = [
-      `export API_TOKEN=${secret}`,
-      `curl -H "Authorization: Bearer ${secret}" https://example.invalid`,
-    ].join("\n");
+  it("skips preamble that leading assignments would otherwise hide", () => {
+    // Without stripping `FOO=bar` first, this line does not match the preamble
+    // pattern and the run titles after the directory change instead of the
+    // command that follows it.
+    expect(fabricScriptTitleHint("FOO=bar cd /tmp\npnpm build"))
+      .toBe("Shell pnpm build");
+    expect(fabricScriptTitleHint("cd /repo || exit 1\ngit status --short"))
+      .toBe("Shell git status --short");
+    // A script that is nothing but preamble still deserves a title.
+    expect(fabricScriptTitleHint("cd /repo")).toBe("Shell cd /repo");
+  });
 
-    expect(fabricScriptTitleHint(script)).toBe("Shell curl");
-    expect(fabricScriptTitleHint(`export API_TOKEN=${secret}`)).toBe("Shell export");
-    expect(fabricScriptTitleHint(
-      `API_TOKEN=${secret} curl https://example.invalid`,
-    )).toBe("Shell curl");
-    const compact = renderCall(renderState("compact"), scriptArgs({ script }));
-    expect(compact).toContain("Shell curl");
-    expect(compact).not.toContain(secret);
-    expect(compact).not.toContain("Authorization");
+  // Replaces an earlier test that asserted script titles were redacted to the
+  // bare command name. That redaction was reverted deliberately: it covered only
+  // this surface, so the same command titled differently depending on whether it
+  // was authored as `script` or as `code`, while the `code` path kept the very
+  // exposure the redaction was for. The property worth locking is that the two
+  // agree. Both still put clipped command text into durable compaction intent,
+  // including flag values that may carry credentials; that is a pre-existing
+  // `code`-path limitation to fix in piCallTarget for both surfaces at once, not
+  // a difference this feature introduces.
+  it("titles a script exactly as the equivalent hand-written pi.bash call", () => {
+    const commands = [
+      "pnpm run check",
+      "pnpm test --filter core",
+      "git status --short",
+      "curl -fsS -H \"Authorization: Bearer $TOKEN\" https://example.invalid",
+    ];
+    for (const command of commands) {
+      expect(fabricScriptTitleHint(command), command).toBe(
+        fabricExecTitleHint(`const r = await pi.bash(${JSON.stringify(command)}); return r.output;`),
+      );
+    }
   });
 
   it("renders the streaming script argument before execution starts", () => {

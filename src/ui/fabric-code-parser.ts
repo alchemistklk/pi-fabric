@@ -294,24 +294,32 @@ const pathTarget = (tokens: Token[], start: number, end: number): string | undef
 };
 
 // Deterministic title for a script-mode payload. The compiled program is a
-// constant, so tokenizing it yields a bare "Shell" for every script ever run.
-// Only the command identity is retained: arguments may contain credentials,
-// headers, URLs, or other payload text, and this title is reused by the compact
-// card, activity, and durable compaction intent. Leading shebangs, comments,
-// and shell-option preamble are skipped because they identify no work.
+// constant, so tokenizing it yields a bare "Shell" for every script ever run;
+// this reads the authored shell instead and produces the same "Shell <command>"
+// shape, clipped to the same width, that a hand-written pi.bash("...") call
+// already produces through piCallTarget. Keeping the two identical is the point:
+// one command must not title differently depending on which surface authored it.
+//
+// The consequence is inherited rather than introduced. Both paths put clipped
+// command text into the compact card, the activity feed, and durable compaction
+// intent, so a credential sitting in a flag value can reach those records. That
+// is a pre-existing property of the `code` path; narrowing only this side would
+// have left the exposure in place while making the two surfaces disagree. Fix it
+// for both in piCallTarget, or not at all.
 const SCRIPT_TITLE_PREAMBLE = /^(?:set|shopt|export|cd|source|\.)\b/;
 const SCRIPT_TITLE_ASSIGNMENT =
   /^[A-Za-z_][A-Za-z0-9_]*=(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s]+)\s*/;
 
-const scriptCommandName = (line: string): string | undefined => {
+// Leading `VAR=value` assignments are not the command. They have to come off
+// before the preamble test, or `FOO=bar cd /tmp` reads as real work and titles
+// the run after a directory change instead of the command that follows.
+const commandStartOf = (line: string): string => {
   let remaining = line.trimStart();
-  while (true) {
+  for (;;) {
     const assignment = SCRIPT_TITLE_ASSIGNMENT.exec(remaining);
-    if (!assignment) break;
+    if (!assignment) return remaining;
     remaining = remaining.slice(assignment[0].length);
   }
-  const command = /^[A-Za-z0-9_./@+-]+/.exec(remaining)?.[0];
-  return command ? titleBasename(command) : undefined;
 };
 
 export const fabricScriptTitleHint = (script: string): string | undefined => {
@@ -320,13 +328,12 @@ export const fabricScriptTitleHint = (script: string): string | undefined => {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
-    const command = scriptCommandName(trimmed);
-    if (!command) continue;
-    if (SCRIPT_TITLE_PREAMBLE.test(trimmed)) {
-      fallback ??= command;
+    const clipped = titleClip(trimmed, TITLE_MAX_COMMAND_CHARS);
+    if (SCRIPT_TITLE_PREAMBLE.test(commandStartOf(trimmed))) {
+      fallback ??= clipped;
       continue;
     }
-    return `Shell ${command}`;
+    return `Shell ${clipped}`;
   }
   return fallback === undefined ? undefined : `Shell ${fallback}`;
 };
