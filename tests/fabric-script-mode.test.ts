@@ -214,3 +214,121 @@ describe("script-mode gates", () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 });
+
+const renderResult = (
+  state: FabricState,
+  args: Record<string, unknown>,
+  details: Record<string, unknown>,
+  output: string,
+  overrides: Record<string, unknown> = {},
+): string => {
+  const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), (t) => t);
+  const context = {
+    args,
+    toolCallId: "fabric-call-1",
+    invalidate: vi.fn(),
+    lastComponent: undefined,
+    state: {},
+    cwd: process.cwd(),
+    executionStarted: true,
+    argsComplete: true,
+    isPartial: false,
+    expanded: false,
+    showImages: true,
+    isError: false,
+    ...overrides,
+  };
+  return tool.renderResult!(
+    { content: output ? [{ type: "text", text: output }] : [], details } as never,
+    {
+      expanded: Boolean(overrides.expanded),
+      isPartial: Boolean(overrides.isPartial),
+    },
+    plainTheme,
+    context as never,
+  ).render(120).join("\n");
+};
+
+describe("script-mode result cards", () => {
+  const payload = "set -eu\npnpm test --filter core";
+  const args = compile({ script: payload });
+  const auditFor = (success: boolean) => ({
+    ref: "pi.bash",
+    provider: "pi",
+    tool: "bash",
+    args: { command: payload },
+    preview: { bashCommand: payload, result: success ? "3 passed\n" : "" },
+    success,
+    ...(success ? { result: "3 passed\n" } : { error: "Command exited with code 1" }),
+  });
+  const occurrences = (haystack: string, needle: string): number =>
+    haystack.split(needle).length - 1;
+
+  it("renders a success card once, without the compiled program", () => {
+    for (const expanded of [false, true]) {
+      const rendered = renderResult(
+        renderState("full"),
+        args,
+        { success: true, audits: [auditFor(true)], phases: [] },
+        "3 passed\n",
+        { expanded },
+      );
+      expect(occurrences(rendered, "pnpm test --filter core")).toBe(1);
+      expect(rendered).not.toContain("__fabric_script");
+      expect(rendered).not.toContain("pi.bash(π.");
+    }
+  });
+
+  // A failed nested call collapses to its command headline, the same as any
+  // hand-written pi.bash failure, so the assertion is on that headline rather
+  // than on the whole payload.
+  it("renders a failure card once, without the compiled program", () => {
+    const oneLine = "pnpm test --filter core";
+    const rendered = renderResult(
+      renderState("full"),
+      compile({ script: oneLine }),
+      {
+        success: false,
+        audits: [{
+          ref: "pi.bash",
+          provider: "pi",
+          tool: "bash",
+          args: { command: oneLine },
+          preview: { bashCommand: oneLine, result: "" },
+          success: false,
+          error: "Command exited with code 1",
+        }],
+        phases: [],
+      },
+      "Runtime error: Command exited with code 1",
+      { expanded: true, isError: true },
+    );
+    expect(occurrences(rendered, oneLine)).toBe(1);
+    expect(rendered).toContain("Command exited with code 1");
+    expect(rendered).not.toContain("__fabric_script");
+    expect(rendered).not.toContain("pi.bash(π.");
+  });
+
+  // A resumed card is complete (isPartial false) but never had executionStarted
+  // flipped, which is the combination that double-rendered previews before.
+  it("renders a resumed card without duplicating the payload", () => {
+    const rendered = renderResult(
+      renderState("full"),
+      args,
+      { success: true, audits: [auditFor(true)], phases: [] },
+      "3 passed\n",
+      { expanded: true, executionStarted: false },
+    );
+    expect(occurrences(rendered, "pnpm test --filter core")).toBe(1);
+  });
+
+  it("renders a partial card without throwing while arguments stream", () => {
+    expect(() => renderResult(
+      renderState("full"),
+      { script: payload },
+      { audits: [], phases: [] },
+      "",
+      { isPartial: true, argsComplete: false, executionStarted: false },
+    )).not.toThrow();
+  });
+});
