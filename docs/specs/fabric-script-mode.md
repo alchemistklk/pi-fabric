@@ -40,6 +40,24 @@ The candidate selected `script` in 26/36 runs. Those 26 runs had zero static fai
 
 Read the paired table as directional only. The task distribution was modeled rather than sampled from live traffic, and at n=36 the 9→2 static-failure difference carries a wide interval: it is enough to motivate building the feature, not enough to calibrate a threshold. The corpus table above is the firmer half of the evidence, and it measures the problem, not this solution. Unlike the corpus figures, these paired runs have not been re-measured; treat every number in this section as a stale snapshot until reproduced.
 
+## Design stance
+
+`script` is syntactic sugar over `code`. It is not a second mode, a sibling surface, or a parallel execution path, and the spec should be read with that framing throughout.
+
+The claim is mechanical, not rhetorical: script mode has no runtime of its own. Compilation produces `code + strings`, and everything from that point on — type check, QuickJS, provider registry, approval controller, lifecycle replay, audit trace, `pi.bash` — is the single existing path. The compiled artifact *is* code. The problem being solved is an authoring failure (JSON → TypeScript-string → shell triple escaping), never a capability gap; nothing in this spec was impossible in `code`, only hard to write correctly.
+
+That framing settles scope questions without re-litigating them. The test for any proposed addition is one question: **can the desugared `code` form do it?**
+
+- If yes, and the sugar can carry it without string-building — `timeout`, `settle`, and later `cwd` — it belongs.
+- If no, because the desugared form cannot reach it at all — `strings`, `tokenBudget`, `agentBudget` — it is rejected, not silently accepted.
+- If yes, but only by writing a program around the shell call — multiple Bash calls, branching on a result, combining other tools, post-processing output — then the caller wants `code`, and adding it here would rebuild `code` behind a worse syntax. That is the failure mode the non-goals list and the semantic-not-size-based selection rule exist to prevent.
+
+Two consequences follow and are load-bearing elsewhere in this document.
+
+Sugar must desugar back. `strings.__fabric_script` is what keeps the compiled form reversible: any persisted call can still be recognized as script-authored. Sugar that cannot be recovered is not sugar but a second module, and a second module would mean maintaining approval, audit, rendering, and lifecycle twice.
+
+Sugar is normally transparent to review; this sugar is not. A `code` payload is parsed and type-checked, while a `script` payload is inspected by nothing. So the two are one path mechanically and divergent on exactly one axis — opacity — and every risk this feature carries sits on that axis. The enforce-mode rejection and the forfeited type check are both consequences of it, not independent policy choices.
+
 ## Invariants
 
 - `fabric_exec` remains the only model-facing execution path in effective full-code mode.
@@ -323,6 +341,8 @@ Report every metric as measured, including the ones that moved the wrong way, an
 Rollback by restoring the prior local package path. Do not remove or alter the independent cwd dogfood build when isolating a script-mode regression.
 
 ## Non-goals
+
+Each entry below is the design stance applied, not an independent judgment call. Reopening one means arguing that `script` is something other than sugar over `code`.
 
 - Generic batch or structured multi-tool IR
 - Automatic conversion based on payload length
