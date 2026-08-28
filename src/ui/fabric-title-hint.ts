@@ -28,4 +28,21 @@ export const fabricExecTitleHintCached = memoize(new Map(), fabricExecTitleHint)
 // Separate cache, not a shared one: a shell payload and a TypeScript program can
 // be the same string ("ls") and derive different titles, so one map keyed by
 // text alone would hand a script the program's title.
-export const fabricScriptTitleHintCached = memoize(new Map(), fabricScriptTitleHint);
+const fabricScriptTitleHintCached = memoize(new Map(), fabricScriptTitleHint);
+
+/**
+ * Resolve the title of the model-authored surface. Callers pass the same flat
+ * arguments that cross the public fabric_exec seam; script/code selection and
+ * cache policy live here so UI, activity, and compaction cannot drift.
+ */
+export const fabricAuthoredTitleHintCached = (args: unknown): string | undefined => {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return undefined;
+  const record = args as Record<string, unknown>;
+  if (typeof record.script === "string") {
+    return fabricScriptTitleHintCached(record.script);
+  }
+  const code = Array.isArray(record.code) && record.code.every((line) => typeof line === "string")
+    ? record.code.join("\n")
+    : record.code;
+  return typeof code === "string" ? fabricExecTitleHintCached(code) : undefined;
+};

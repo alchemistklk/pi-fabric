@@ -17,8 +17,7 @@ import {
   withCodePreviewShell,
 } from "./ui/code-preview-shell.js";
 import {
-  fabricExecTitleHintCached,
-  fabricScriptTitleHintCached,
+  fabricAuthoredTitleHintCached,
 } from "./ui/fabric-title-hint.js";
 import { Type } from "typebox";
 import {
@@ -29,8 +28,8 @@ import { DEFAULT_FABRIC_CONFIG } from "./config.js";
 import type { FabricState } from "./fabric-state.js";
 import { formatFailureProgress } from "./failure-progress.js";
 import {
-  fabricScriptPayload,
   prepareFabricExecArguments,
+  resolveFabricExecProgram,
 } from "./fabric-exec-arguments.js";
 import { typeErrorRecoveryHint } from "./type-error-guidance.js";
 import { normalizeRunDisplay } from "./run-display.js";
@@ -186,7 +185,7 @@ export const createFabricExecTool = (
       code: Type.Optional(
         Type.String({
           description:
-            "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. See session guidance / `fabric-exec` skill for exact signatures. Use this, not `script`, whenever the work runs more than one command, branches on a result, combines other tools, or post-processes output.",
+            "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. See session guidance / `fabric-exec` skill for exact signatures. Use this, not `script`, whenever the work invokes multiple Fabric/Pi/MCP actions, branches on an action result, combines tools, or post-processes structured output. One shell program may contain any number of shell commands and still belongs in `script`.",
         }),
       ),
       script: Type.Optional(
@@ -259,13 +258,10 @@ export const createFabricExecTool = (
     renderCall(params, theme, context) {
       observePiTheme(theme);
       const program = Array.isArray(params.code) ? params.code.join("\n") : params.code;
-      // Script mode resolves from the reserved strings key on a settled card and
-      // from the streaming `script` argument while arguments are still arriving
-      // — the same way `code` may still be an unjoined array here. Either way
-      // the authored payload is what gets rendered; the constant compiled
-      // program is never presented as model-authored code.
-      const script = fabricScriptPayload({ code: program, strings: params.strings })
-        ?? (typeof params.script === "string" ? params.script : null);
+      // `script` stays explicit through preparation, validation, persistence,
+      // and rendering. Only the execution seam compiles it, so the constant
+      // internal program is never presented as model-authored code.
+      const script = typeof params.script === "string" ? params.script : null;
       const code = script ?? program ?? "";
       const mode = toolDisplayMode(state);
       const rendererState = context.state as FabricRendererState;
@@ -276,8 +272,7 @@ export const createFabricExecTool = (
         context.invalidate,
       );
       const rowBalance = rendererState.fabricResultRowBalance ??= {};
-      // Write bindings are TypeScript call shapes, and a script call's only
-      // `strings` entry is the reserved payload; scanning shell text for them
+      // Write bindings are TypeScript call shapes. Scanning shell text for them
       // could only produce a false positive that renders the payload twice.
       if (rendererState.fabricWriteBindingsCode !== code) {
         rendererState.fabricWriteBindingsCode = code;
@@ -309,10 +304,7 @@ export const createFabricExecTool = (
         const display = normalizeRunDisplay(params.display);
         // Session-wide memo keyed by the program string: the same hint serves
         // the live card, the activity feed, and compaction intent.
-        const title = display?.name?.trim()
-          || (script === null
-            ? fabricExecTitleHintCached(code)
-            : fabricScriptTitleHintCached(script));
+        const title = display?.name?.trim() || fabricAuthoredTitleHintCached(params);
         const header = renderBoundedLines(
           [
             theme.fg("toolTitle", theme.bold(safeTerminalText(title || "Fabric"))),
@@ -843,19 +835,20 @@ export const createFabricExecTool = (
       // all" case out of host schema validation, so it has to fail loudly here
       // rather than reach QuickJS as an undefined program.
       const prepared = prepareFabricExecArguments(params) as typeof params;
-      const code = prepared.code as string;
-      const scriptPayload = fabricScriptPayload(prepared);
+      const program = resolveFabricExecProgram(prepared);
+      const titleHint = fabricAuthoredTitleHintCached(prepared);
       // Thrown, not returned: this shares the argument-error path with the
       // contract failures above, so the refusal reaches the model before
       // QuickJS starts and before any nested lifecycle event is emitted.
-      if (scriptPayload !== null) {
+      if (program.kind === "script") {
         const refusal = scriptModeRefusal(state);
         if (refusal) throw new Error(refusal);
       }
       const runDisplay = normalizeRunDisplay(prepared.display);
       const result = await state.execution.execute({
-        code,
-        ...(prepared.strings ? { strings: prepared.strings } : {}),
+        code: program.code,
+        ...(program.strings ? { strings: program.strings } : {}),
+        ...(titleHint ? { titleHint } : {}),
         signal,
         parentToolCallId: toolCallId,
         context,
@@ -953,7 +946,7 @@ export const createFabricExecTool = (
               : error.message,
           )
           .join("\n");
-        const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors);
+        const recoveryHint = typeErrorRecoveryHint(program.code, result.typeErrors);
         const bounded = await boundModelOutput(
           `Type errors; code was not executed:\n${text}${
             recoveryHint ? `\n\n${recoveryHint}` : ""

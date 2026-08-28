@@ -1,14 +1,24 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { FabricState } from "../src/fabric-state.js";
 import { createFabricExecTool } from "../src/fabric-exec-tool.js";
-import { prepareFabricExecArguments } from "../src/fabric-exec-arguments.js";
+import {
+  prepareFabricExecArguments,
+  resolveFabricExecProgram,
+} from "../src/fabric-exec-arguments.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
+import { fabricScriptTitleHint } from "../src/ui/fabric-code-parser.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
-const compile = (args: Record<string, unknown>): { code: string; strings: Record<string, string> } =>
-  prepareFabricExecArguments(args) as { code: string; strings: Record<string, string> };
+const scriptArgs = (args: Record<string, unknown>): Record<string, unknown> =>
+  prepareFabricExecArguments(args) as Record<string, unknown>;
+const compile = (args: Record<string, unknown>): { code: string; strings: Record<string, string> } => {
+  const program = resolveFabricExecProgram(scriptArgs(args));
+  if (program.kind !== "script") throw new Error("Expected a script program");
+  return { code: program.code, strings: program.strings };
+};
 
 describe("compiled script programs", () => {
   // Script mode forfeits the type check on the payload, not on the program it
@@ -80,7 +90,7 @@ describe("script-mode rendering", () => {
   const payload = "set -eu\npnpm test --filter core\nprintf 'done\\n'";
 
   it("renders the authored shell rather than the compiled program", () => {
-    const rendered = renderCall(renderState("full"), compile({ script: payload }), {
+    const rendered = renderCall(renderState("full"), scriptArgs({ script: payload }), {
       expanded: true,
     });
     expect(rendered).toContain("Shell · 3 lines");
@@ -97,12 +107,31 @@ describe("script-mode rendering", () => {
   });
 
   it("titles a compact card from the payload, skipping shell preamble", () => {
-    const compact = renderCall(renderState("compact"), compile({ script: payload }));
-    expect(compact).toContain("Shell pnpm test --filter core");
+    const compact = renderCall(renderState("compact"), scriptArgs({ script: payload }));
+    expect(compact).toContain("Shell pnpm");
+    expect(compact).not.toContain("--filter core");
     expect(compact).not.toContain("set -eu");
   });
 
-  it("renders the streaming script argument before compilation lands", () => {
+  it("keeps secret-bearing shell arguments out of compact and durable titles", () => {
+    const secret = "supersecretvalue";
+    const script = [
+      `export API_TOKEN=${secret}`,
+      `curl -H "Authorization: Bearer ${secret}" https://example.invalid`,
+    ].join("\n");
+
+    expect(fabricScriptTitleHint(script)).toBe("Shell curl");
+    expect(fabricScriptTitleHint(`export API_TOKEN=${secret}`)).toBe("Shell export");
+    expect(fabricScriptTitleHint(
+      `API_TOKEN=${secret} curl https://example.invalid`,
+    )).toBe("Shell curl");
+    const compact = renderCall(renderState("compact"), scriptArgs({ script }));
+    expect(compact).toContain("Shell curl");
+    expect(compact).not.toContain(secret);
+    expect(compact).not.toContain("Authorization");
+  });
+
+  it("renders the streaming script argument before execution starts", () => {
     const partial = renderCall(
       renderState("full"),
       { script: payload },
@@ -161,6 +190,36 @@ const runExecute = async (
 };
 
 describe("script-mode gates", () => {
+  it("passes raw script through the real Pi prepare then schema-validation order", async () => {
+    const { state, execute } = executeState({ fullCodeMode: true, schemaMode: "off" });
+    const tool = createFabricExecTool(
+      state,
+      defaultCodePreviewSettings(),
+      new Map(),
+      (definition) => definition,
+    );
+    const raw = { script: "printf 'host-order\\n'" };
+    const prepared = tool.prepareArguments!(raw);
+    expect(prepared).toBe(raw);
+    const validated = validateToolArguments(tool, {
+      type: "toolCall",
+      id: "fabric-host-order",
+      name: "fabric_exec",
+      arguments: prepared as Record<string, unknown>,
+    });
+    expect(validated).toEqual(raw);
+
+    await expect(tool.execute(
+      "fabric-host-order",
+      validated as never,
+      undefined,
+      undefined,
+      {} as never,
+    )).rejects.toBe(EXECUTED);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]![0]).toMatchObject(compile(raw));
+  });
+
   it("executes in full code mode with schema off or audit", async () => {
     for (const schemaMode of ["off", "audit"] as const) {
       const { state, execute } = executeState({ fullCodeMode: true, schemaMode });
@@ -251,7 +310,7 @@ const renderResult = (
 
 describe("script-mode result cards", () => {
   const payload = "set -eu\npnpm test --filter core";
-  const args = compile({ script: payload });
+  const args = scriptArgs({ script: payload });
   const auditFor = (success: boolean) => ({
     ref: "pi.bash",
     provider: "pi",
@@ -286,7 +345,7 @@ describe("script-mode result cards", () => {
     const oneLine = "pnpm test --filter core";
     const rendered = renderResult(
       renderState("full"),
-      compile({ script: oneLine }),
+      scriptArgs({ script: oneLine }),
       {
         success: false,
         audits: [{
