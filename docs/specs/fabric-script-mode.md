@@ -73,7 +73,7 @@ Rules:
 - At least one must be a string after compatibility preparation.
 - `script` may coexist with `strings`, `display`, budgets, and `resultFormat`.
 - Fabric reserves `strings.__fabric_script`; a caller-provided collision fails before execution.
-- Script mode returns the Bash text output as the outer Fabric value.
+- Script mode returns the Bash text output as the outer Fabric value, except under `settle: true`, where it returns the outcome envelope described in Deterministic compilation.
 - A script value is preserved exactly as received. Fabric performs no shell escaping, interpolation, rewriting, or normalization.
 
 ### Bash execution options
@@ -89,7 +89,11 @@ Both are exposed as flat, optional, script-only scalars:
 - Both are rejected before execution when `script` is absent; they are not a second way to configure a `code` program, which already has the real option object.
 - Both compile into the nested call's option object rather than into the script text.
 
-Per-call `cwd` is deliberately excluded here — it ships on its own branch and is a follow-up once that change lands upstream. Any other Bash option stays out of scope: a payload needing one is a `code` payload.
+`PiBashOptions` canonically carries exactly three settings — `timeout`, `settle`, and `cwd` — with the remaining spellings being runtime-repaired aliases of those. Script mode therefore reaches two of three here, and the third is deferred rather than refused: per-call `cwd` ships on its own branch and is a follow-up once that change lands upstream, at which point script mode is at full option parity with `pi.bash`.
+
+The interim `cwd` gap is also the least load-bearing of the three, because a shell program can root itself: `cd <path> || exit 1` as the script's first line does what the option does. That is not true of `timeout` or `settle`, which no amount of script text can reproduce — which is why those two could not wait.
+
+Any option outside those three does not exist. A payload needing something else is a `code` payload.
 
 The model-facing schema stays flat:
 
@@ -145,12 +149,16 @@ compiles to:
 
 ```json
 {
-  "code": "const result = await pi.bash(π.__fabric_script, { timeout: 600, settle: true }); return result.output;",
+  "code": "const result = await pi.bash(π.__fabric_script, { timeout: 600, settle: true }); return { ok: result.ok, exitCode: result.exitCode ?? 0, output: result.output };",
   "strings": { "__fabric_script": "<payload>" }
 }
 ```
 
+The return projection differs by option because the nested envelope does. A default or `timeout`-only call resolves to `{ ok: true, output, details }` and returns bare `result.output`. A `settle: true` call resolves to `{ ok: false, output, details, exitCode, error }` on an ordinary nonzero exit, so it must return the outcome alongside the text: returning `result.output` there would hand back the output while discarding the exit status that is the entire reason to pass `settle`, leaving the model to infer pass/fail by reading the text.
+
 Emit only the options the caller actually supplied, so the default case stays byte-for-byte identical to the bare compiled program above. The compiled program is a fixed template selected by which options are present — never string-built from caller values, which stay in the option object as typed scalars.
+
+One projection loss is accepted and must be documented rather than worked around: neither template returns `details`, so a script cannot read structured truncation metadata the way a `code` program can. The truncation notice remains in the output text, and a payload that needs the structured form is a `code` payload.
 
 Compilation must be idempotent. A second preparation pass sees canonical `code + strings` and leaves the object unchanged.
 
@@ -250,7 +258,7 @@ Completion criteria:
 - Approval receives the exact script command and the normal Bash risk.
 - `tool_call`, `tool_result`, and `tool_execution_*` events match ordinary nested `pi.bash` calls.
 - Audit and trace outcomes cover success, nonzero exit, cancellation, timeout, and denial.
-- A `settle: true` script returns a nonzero-exit result as an outer value instead of aborting the Fabric call; without it, the same script fails the way any failed nested `pi.bash` fails today.
+- A `settle: true` script returns a nonzero-exit result as an outer value instead of aborting the Fabric call, and that value carries the exit status, not the output text alone; without `settle`, the same script fails the way any failed nested `pi.bash` fails today.
 - A `timeout` script reaches the host with seconds, not milliseconds.
 - No script payload is duplicated into durable trace-safe error fields.
 
@@ -262,7 +270,7 @@ Completion criteria:
 
 - All repository checks pass with no skipped regression test.
 - A deterministic CLI probe executes a script containing quotes, `${HOME}`, backticks, heredoc syntax, command substitution, and sed backreferences without embedding it in TypeScript.
-- A second probe covers the option path end to end: a deliberately nonzero-exit script with `settle: true` returns its output, and a raised `timeout` is honored.
+- A second probe covers the option path end to end: a deliberately nonzero-exit script with `settle: true` returns its output *and* its exit code, and a raised `timeout` is honored.
 - The local dogfood build has an explicit start time and rollback path.
 
 ## Dogfood protocol
