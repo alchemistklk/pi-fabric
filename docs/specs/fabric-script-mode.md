@@ -90,7 +90,7 @@ against real traffic and can be re-run from recorded sessions at any time.
 
 `script` is syntactic sugar over `code`. It is not a second mode, a sibling surface, or a parallel execution path, and the spec should be read with that framing throughout.
 
-The claim is mechanical, not rhetorical: script mode has no runtime of its own. Compilation produces `code + strings`, and everything from that point on — type check, QuickJS, provider registry, approval controller, lifecycle replay, audit trace, `pi.bash` — is the single existing path. The compiled artifact *is* code. The problem being solved is an authoring failure (JSON → TypeScript-string → shell triple escaping), never a capability gap; nothing in this spec was impossible in `code`, only hard to write correctly.
+The claim is mechanical, not rhetorical: script mode has no runtime of its own. The public `{script}` value remains explicit through compatibility preparation, Pi schema validation, persistence, rendering, and mode gates. The execution seam then resolves it into a discriminated internal program and produces `code + strings`; everything from that point on — type check, QuickJS, provider registry, approval controller, lifecycle replay, audit trace, `pi.bash` — is the single existing path. The compiled artifact *is* code. The problem being solved is an authoring failure (JSON → TypeScript-string → shell triple escaping), never a capability gap; nothing in this spec was impossible in `code`, only hard to write correctly.
 
 That framing settles scope questions without re-litigating them. The test for any proposed addition is one question: **can the desugared `code` form do it?**
 
@@ -100,7 +100,7 @@ That framing settles scope questions without re-litigating them. The test for an
 
 Two consequences follow and are load-bearing elsewhere in this document.
 
-Sugar must desugar back. `strings.__fabric_script` is what keeps the compiled form reversible: any persisted call can still be recognized as script-authored. Sugar that cannot be recovered is not sugar but a second module, and a second module would mean maintaining approval, audit, rendering, and lifecycle twice.
+Sugar must remain explicit until it desugars. The persisted model-facing call keeps its `script` field, while one execution module resolves `{script}` into `{kind: "script", code, strings}`. No downstream caller infers authorship from a magic strings key, a regex, or byte-identical generated source. `strings.__fabric_script` remains only the internal QuickJS transport after validation, not a persistence marker or public discriminator.
 
 Sugar is normally transparent to review; this sugar is not. A `code` payload is parsed and type-checked, while a `script` payload is inspected by nothing. So the two are one path mechanically and divergent on exactly one axis — opacity — and every risk this feature carries sits on that axis. The enforce-mode rejection and the forfeited type check are both consequences of it, not independent policy choices.
 
@@ -179,7 +179,7 @@ One naming collision to keep straight while reading the runtime: the guest-type 
 
 ## Deterministic compilation
 
-`prepareFabricExecArguments` compiles:
+`prepareFabricExecArguments` validates and normalizes the model-facing call without consuming `script`:
 
 ```json
 {
@@ -187,7 +187,7 @@ One naming collision to keep straight while reading the runtime: the guest-type 
 }
 ```
 
-to the existing internal representation:
+After Pi validates and persists that authored surface, `resolveFabricExecProgram` produces the existing internal representation at the execution seam:
 
 ```json
 {
@@ -228,9 +228,9 @@ Emit only the options the caller actually supplied, so the default case stays by
 
 One projection loss is accepted and must be documented rather than worked around: neither template returns `details`, so a script cannot read structured truncation metadata the way a `code` program can. The truncation notice remains in the output text, and a payload that needs the structured form is a `code` payload.
 
-Compilation must be idempotent. A second preparation pass sees canonical `code + strings` and leaves the object unchanged.
+Preparation must be idempotent and preserve object identity for canonical `{script}` calls. Program resolution is deterministic: resolving the same validated arguments produces the same internal `code + strings` value.
 
-`strings.__fabric_script` is the authoritative marker for "this call was authored as a script". Everything downstream of preparation — mode gates, rendering, title hints — detects script mode by that key, not by an outer `script` argument, which no longer exists after preparation.
+The outer `script` field is the authoritative marker for "this call was authored as a script" through validation, mode gates, rendering, title hints, persistence, and compaction. The internal `strings.__fabric_script` key exists only inside the resolved execution program.
 
 ## What script mode gives up
 
@@ -257,7 +257,7 @@ The outer schema may remain stable across modes, but its `script` description mu
 
 ### Outer call
 
-- Render a script call as Shell, not as user-authored TypeScript, resolving the payload from `strings.__fabric_script` on settled cards and from the streaming `script` argument while arguments are still arriving.
+- Render a script call as Shell, not as user-authored TypeScript, directly from the authored `script` field for partial, live, settled, and resumed cards.
 - Apply the existing bounded code-preview rules and terminal sanitization.
 - Render the payload once. The constant compiled program is never shown alongside it, and the reserved key is never shown as an ordinary `strings` entry.
 - Partial streaming arguments must not throw when `code` is absent.
@@ -271,12 +271,11 @@ The outer schema may remain stable across modes, but its `script` description mu
 
 ### Persistence
 
-Pi validates custom-tool arguments before `tool_call` and `execute`, so `prepareArguments` output — not the model's raw object — is what Pi persists and renders. There is therefore no persisted outer `script` argument to preserve, and the implementation must not try to manufacture one by moving compilation out of `prepareArguments`; that would break the host validation order the existing hook comment documents.
+Pi calls `prepareArguments` before schema validation. Preparation validates the exclusive contract but preserves the authored `script`, so the real host validator checks the same public surface the model selected. Compilation occurs only inside `execute`, after live mode gates and before `FabricExecutionService`.
 
-- The authored payload is persisted exactly once, as `strings.__fabric_script`, through Pi's normal tool-call transcript behavior. Do not add a parallel copy under a `script` key.
+- The authored payload is persisted exactly once under the public `script` key through Pi's normal tool-call transcript behavior. The execution-local `strings.__fabric_script` binding must not be copied back into the outer transcript.
 - Durable Fabric traces continue their existing safe projection and must not add a second payload copy.
-- Compaction intent may use the declared display metadata; when it would otherwise infer a title from the constant compiled program, it must resolve the payload through `strings.__fabric_script` on the normal title-hint path instead.
-- Renderers may still see an uncompiled `script` in partial streaming arguments, the same way they see a not-yet-joined `code` array today. Treat that as a streaming affordance only; the settled card resolves script mode from the marker.
+- Compaction intent may use declared display metadata; otherwise the shared authored-title resolver reads the public `script` field. It retains only a safe command identity, never shell arguments that may contain credentials, headers, URLs, or payload text.
 
 ## Implementation brief
 
@@ -288,7 +287,7 @@ Update `src/fabric-exec-arguments.ts` and its focused tests.
 
 Completion criteria:
 
-- Script compilation, reserved-key collision, `code + script` conflict, rejection of `strings`/`tokenBudget`/`agentBudget` alongside `script`, malformed values, and idempotency are all covered by red-then-green tests.
+- Script contract validation, deterministic execution-time compilation, `code + script` conflict, rejection of `strings`/`tokenBudget`/`agentBudget` alongside `script`, malformed values, and preparation idempotency are all covered by red-then-green tests.
 - `strings` passed with `code` keeps its current identity/no-copy behavior; only the `script` pairing is rejected.
 - Existing compatibility cases retain their current identity/no-copy behavior.
 
@@ -300,7 +299,7 @@ Relaxing `code` from required to optional moves a case host validation used to c
 
 Completion criteria:
 
-- A real Pi tool invocation accepts `{script}` before ordinary schema validation.
+- The real `fabric_exec` ToolDefinition preserves `{script}` through its official prepare hook, and Pi's actual `validateToolArguments` accepts that prepared value before execute compiles it.
 - `{code}`, root-string code shorthand, and code arrays retain current behavior.
 - `{}`, `{code, script}`, and non-string `script` fail before execution with actionable errors routed through the existing argument-error path, asserted on message content rather than on rejection alone.
 - `timeout`/`settle` without `script` fail the same way; with `script` they reach the nested option object with the correct units and types.
@@ -318,7 +317,7 @@ Completion criteria:
 
 ### Step 4: Render the authored surface
 
-Render script calls through the existing Shell/code-preview components, including partial argument streaming and bounded expansion. Detect script mode from `strings.__fabric_script`; the streaming `script` argument is an affordance for the partial card only, in the same way `code` may still arrive as an unjoined array there.
+Render script calls through the existing Shell/code-preview components, including partial argument streaming and bounded expansion. Detect script mode from the explicit outer `script` field on every card. Route compact UI, activity, and compaction title selection through one shared authored-title resolver.
 
 Completion criteria:
 
@@ -333,7 +332,7 @@ Add focused provider/integration tests around the compiled nested Bash call.
 Completion criteria:
 
 - Approval receives the exact script command and the normal Bash risk.
-- `tool_call`, `tool_result`, and `tool_execution_*` events match ordinary nested `pi.bash` calls.
+- `tool_call`, `tool_result`, and `tool_execution_*` events match ordinary nested `pi.bash` calls, including exact call arguments and `tool_result` patch behavior.
 - Audit and trace outcomes cover success, nonzero exit, cancellation, timeout, and denial.
 - A `settle: true` script returns a nonzero-exit result as an outer value instead of aborting the Fabric call, and that value carries the exit status, not the output text alone; without `settle`, the same script fails the way any failed nested `pi.bash` fails today.
 - A `timeout` script reaches the host with seconds, not milliseconds.
