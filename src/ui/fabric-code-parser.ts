@@ -293,6 +293,29 @@ const pathTarget = (tokens: Token[], start: number, end: number): string | undef
   return keyed !== undefined ? dirQualifier(keyed) : undefined;
 };
 
+// Deterministic title for a script-mode payload. The compiled program is a
+// constant, so tokenizing it yields a bare "Shell" for every script ever run;
+// this reads the authored shell instead and produces the same "Shell <command>"
+// shape a hand-written pi.bash("...") call would. Leading shebangs, comments,
+// and shell-option preamble are skipped because they identify no work.
+const SCRIPT_TITLE_PREAMBLE = /^(?:set|shopt|export|cd|source|\.)\b/;
+
+export const fabricScriptTitleHint = (script: string): string | undefined => {
+  const lines = script.split("\n");
+  let fallback: string | undefined;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const clipped = titleClip(trimmed, TITLE_MAX_COMMAND_CHARS);
+    if (SCRIPT_TITLE_PREAMBLE.test(trimmed)) {
+      fallback ??= clipped;
+      continue;
+    }
+    return `Shell ${clipped}`;
+  }
+  return fallback === undefined ? undefined : `Shell ${fallback}`;
+};
+
 const piCallTarget = (
   label: string,
   tokens: Token[],
