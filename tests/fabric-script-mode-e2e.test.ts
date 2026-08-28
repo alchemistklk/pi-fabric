@@ -1,10 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import type {
+  ExtensionContext,
+  ExtensionRunner,
+} from "@earendil-works/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { DEFAULT_FABRIC_CONFIG, type FabricConfig } from "../src/config.js";
 import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registry.js";
+import type { FabricAutoApprovalClassifier } from "../src/core/auto-approval-classifier.js";
+import type { FabricExecutionTraceV1 } from "../src/audit/trace.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { prepareFabricExecArguments } from "../src/fabric-exec-arguments.js";
@@ -12,25 +18,47 @@ import { prepareFabricExecArguments } from "../src/fabric-exec-arguments.js";
 const compile = (args: Record<string, unknown>) =>
   prepareFabricExecArguments(args) as { code: string; strings: Record<string, string> };
 
-const runScript = async (
-  cwd: string,
-  args: Record<string, unknown>,
-): Promise<{
+type RunOptions = {
+  configure?: (config: FabricConfig) => void;
+  classifier?: FabricAutoApprovalClassifier;
+  runner?: ExtensionRunner;
+  signal?: AbortSignal;
+};
+
+type RunResult = {
   success: boolean;
   value: unknown;
   audits: FabricCallAudit[];
+  trace: FabricExecutionTraceV1;
   error?: string;
-}> => {
+};
+
+const runProgram = async (
+  cwd: string,
+  program: { code: string; strings?: Record<string, string> },
+  options: RunOptions = {},
+): Promise<RunResult> => {
   const registry = new ActionRegistry();
-  registry.register(new PiToolsProvider(cwd, undefined, undefined));
+  let catalog: CapturedToolCatalog | undefined;
+  if (options.runner) {
+    catalog = new CapturedToolCatalog();
+    catalog.replace([], options.runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+  }
+  registry.register(new PiToolsProvider(cwd, catalog, undefined));
   const config = structuredClone(DEFAULT_FABRIC_CONFIG);
   config.approvals.execute = "allow";
-  const service = new FabricExecutionService(registry, config);
-  const { code, strings } = compile(args);
+  options.configure?.(config);
+  const service = new FabricExecutionService(
+    registry,
+    config,
+    undefined,
+    undefined,
+    options.classifier,
+  );
   const result = await service.execute({
-    code,
-    strings,
-    signal: undefined,
+    code: program.code,
+    ...(program.strings ? { strings: program.strings } : {}),
+    signal: options.signal,
     parentToolCallId: "script-probe",
     context: {
       cwd,
@@ -46,9 +74,16 @@ const runScript = async (
     success: result.success,
     value: result.value,
     audits: result.audits,
+    trace: result.trace,
     ...(result.error ? { error: result.error } : {}),
   };
 };
+
+const runScript = async (
+  cwd: string,
+  args: Record<string, unknown>,
+  options: RunOptions = {},
+): Promise<RunResult> => runProgram(cwd, compile(args), options);
 
 const withTempDir = async (run: (cwd: string) => Promise<void>): Promise<void> => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-script-"));
@@ -127,6 +162,197 @@ describe("script mode end to end", () => {
       });
       expect(result.success).toBe(true);
       expect(result.value).toBe("slept\n");
+    });
+  });
+});
+
+// A marker that appears only in the script *source* — carried in a comment so
+// it never reaches stdout. That separation is the point: a failed pi.bash
+// deliberately preserves its own output as the failure cause (trace.ts's
+// preserveCause branch), for scripts exactly as for hand-written calls, so a
+// canary that printed itself would test the wrong thing. What must not leak is
+// the authored program text.
+const CANARY = "SCRIPT_PAYLOAD_CANARY";
+const canaryLine = `# ${CANARY}`;
+
+// The payload legitimately appears once as the nested call's `command`, exactly
+// as it would for a hand-written pi.bash. It must appear nowhere else in the
+// durable record — not in an operation error, not in the run-level error, which
+// is the field the trace contract keeps free of guest text.
+const expectNoPayloadInErrorFields = (result: RunResult): void => {
+  expect(result.trace.error ?? "").not.toContain(CANARY);
+  for (const operation of result.trace.operations) {
+    expect(operation.error ?? "").not.toContain(CANARY);
+  }
+  for (const audit of result.audits) {
+    expect(audit.error ?? "").not.toContain(CANARY);
+  }
+  // Still recorded once, where a reviewer expects to find it.
+  expect(JSON.stringify(result.trace.operations.map((operation) => operation.args)))
+    .toContain(CANARY);
+};
+
+describe("script mode approval", () => {
+  it("hands approval the exact script under the ordinary Bash risk", async () => {
+    await withTempDir(async (cwd) => {
+      const classified: { ref: string; risk: string; args: unknown }[] = [];
+      const classifier = {
+        async classify(action: { ref: string; risk: string }, args: unknown) {
+          classified.push({ ref: action.ref, risk: action.risk, args });
+          return {
+            decision: "allow" as const,
+            reason: "probe",
+            model: "stub",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          };
+        },
+      } as unknown as FabricAutoApprovalClassifier;
+
+      const script = `${canaryLine}\nprintf '%s\\n' 'approved'`;
+      const result = await runScript(cwd, { script }, {
+        classifier,
+        configure: (config) => {
+          config.approvals.execute = "auto";
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(classified).toEqual([
+        { ref: "pi.bash", risk: "execute", args: { command: script } },
+      ]);
+    });
+  });
+
+  it("fails at the approve stage under a deny policy, without leaking the payload", async () => {
+    await withTempDir(async (cwd) => {
+      const result = await runScript(cwd, { script: canaryLine }, {
+        configure: (config) => {
+          config.approvals.execute = "deny";
+        },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.trace.outcome).toBe("failed");
+      expect(result.trace.operations[0]).toMatchObject({
+        ref: "pi.bash",
+        failureStage: "approve",
+      });
+      expect(result.trace.operations[0]?.error)
+        .toContain("denied by the Fabric execute policy");
+      expectNoPayloadInErrorFields(result);
+    });
+  });
+});
+
+describe("script mode failure outcomes", () => {
+  it("records a host timeout in seconds without leaking the payload", async () => {
+    await withTempDir(async (cwd) => {
+      const result = await runScript(cwd, {
+        script: `${canaryLine}\nsleep 5`,
+        timeout: 1,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.trace.operations[0]).toMatchObject({
+        ref: "pi.bash",
+        failureStage: "invoke",
+      });
+      // Seconds, not milliseconds: a millisecond reading would not have waited.
+      expect(result.trace.operations[0]?.error).toContain("timed out after 1 seconds");
+      expectNoPayloadInErrorFields(result);
+    });
+  });
+
+  it("records cancellation as aborted without leaking the payload", async () => {
+    await withTempDir(async (cwd) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new Error("cancelled by user")), 250);
+      const result = await runScript(
+        cwd,
+        { script: `${canaryLine}\nsleep 5` },
+        { signal: controller.signal },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.trace.outcome).toBe("aborted");
+      expect(result.trace.operations[0]?.outcome).toBe("aborted");
+      expectNoPayloadInErrorFields(result);
+    });
+  });
+
+  it("keeps the payload out of error fields on an ordinary nonzero exit", async () => {
+    await withTempDir(async (cwd) => {
+      const result = await runScript(cwd, { script: `${canaryLine}\nexit 3` });
+      expect(result.success).toBe(false);
+      expectNoPayloadInErrorFields(result);
+    });
+  });
+});
+
+describe("script mode nested-call parity", () => {
+  const makeRunner = (events: string[]): ExtensionRunner => ({
+    createContext: () => ({ cwd: process.cwd() }),
+    getActiveTools: () => [],
+    emit: vi.fn(async (event: { type: string }) => {
+      events.push(event.type);
+    }),
+    emitToolCall: vi.fn(async () => undefined),
+    emitToolResult: vi.fn(async () => undefined),
+  }) as unknown as ExtensionRunner;
+
+  // The strongest available statement of "script mode is sugar": a compiled
+  // script and the hand-written program it desugars to must be
+  // indistinguishable everywhere downstream of preparation.
+  it("matches a hand-written pi.bash program event for event and record for record", async () => {
+    await withTempDir(async (cwd) => {
+      const script = `printf '%s\\n' 'parity'`;
+      const scriptEvents: string[] = [];
+      const codeEvents: string[] = [];
+
+      const scripted = await runScript(cwd, { script }, {
+        runner: makeRunner(scriptEvents),
+      });
+      const handwritten = await runProgram(
+        cwd,
+        {
+          code: "const result = await pi.bash(π.command); return result.output;",
+          strings: { command: script },
+        },
+        { runner: makeRunner(codeEvents) },
+      );
+
+      expect(scriptEvents[0]).toBe("tool_execution_start");
+      expect(scriptEvents.at(-1)).toBe("tool_execution_end");
+      expect(scriptEvents).toEqual(codeEvents);
+      expect(scripted.value).toEqual(handwritten.value);
+      expect(scripted.success).toBe(handwritten.success);
+
+      const shape = (result: RunResult) => ({
+        audits: result.audits.map((audit) => ({
+          ref: audit.ref,
+          tool: audit.tool,
+          provider: audit.provider,
+          args: audit.args,
+          success: audit.success,
+          preview: audit.preview,
+        })),
+        operations: result.trace.operations.map((operation) => ({
+          ref: operation.ref,
+          provider: operation.provider,
+          action: operation.action,
+          args: operation.args,
+          outcome: operation.outcome,
+          result: operation.result,
+        })),
+      });
+      expect(shape(scripted)).toEqual(shape(handwritten));
     });
   });
 });
