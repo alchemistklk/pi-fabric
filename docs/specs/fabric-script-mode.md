@@ -11,34 +11,80 @@ The feature succeeds when large shell programs no longer require JSON → TypeSc
 
 ## Evidence
 
-Corpus figures below were re-measured on 2026-08-28 with `measure-fabric-failures.mjs` over `~/.pi/agent/sessions`, deduplicated by `toolCallId`, across a window of 2026-08-19 → 2026-08-28 (8 recorded days). They supersede an earlier snapshot; re-measure rather than quoting them once the window moves.
+Every figure below comes from `~/.pi/agent/sessions`, deduplicated by
+`toolCallId`, over sessions started 2026-08-19 through the 2026-08-28T06:33:52Z
+dogfood build switch — 8 recorded days on the unmodified build. Sessions are
+append-only, so these are reproducible; re-measure rather than quoting them once
+the window moves.
+
+### The problem, measured
 
 | Measure | Count | Share |
 | --- | ---: | ---: |
-| `fabric_exec` calls with a string `code` argument | 7,438 | — |
-| Static rejections (type errors, code never ran) | 140 | 1.88% of calls |
-| Static rejections in the syntax / embedded-text bucket | 77 | 55.0% of static |
-| Syntax-bucket failures whose own source contains `pi.bash(` | 37 | 26.4% of static, 48.1% of syntax |
-| Static rejections mentioning `pi.bash` under any cause | 89 | 63.6% of static |
-| `pi.bash` `cwd` rejections (the separate change) | 26 | 18.6% of static |
+| `fabric_exec` calls | 7,739 | — |
+| — of those, Bash-related | 4,511 | 58.3% of calls |
+| Static rejections (type errors, code never ran) | 145 | 1.87% of calls |
+| Static rejections in the syntax family | 73 | 50.3% of static |
 
-Two caveats on how to read that table. The buckets are regexes over diagnostic text rather than parser-confirmed classifications, and they overlap: the per-cause counts sum past 140 because one rejection can match several. Separately, the `cwd` bucket and the syntax bucket are fully disjoint in this window — zero rejections appear in both — which is the concrete reason this change and the `cwd` change are independent rather than merely scheduled apart.
+### What would fix each rejection
 
-The 37-call figure is the honest size of the target: about a quarter of static rejections, not a third, and under half of syntax rejections rather than the majority. The corpus is also one operator's 8-day local window, self-selected toward this repository's own work, so it sizes a problem worth fixing — not a rate that generalizes to other users.
+Each of the 145 rejections was replayed through Fabric's own type gate and
+classified by which change, if any, owns it. The classification is by first
+diagnostic plus a count of `pi.*` call sites in the source, not by regex over
+diagnostic text alone.
 
-An anonymized paired evaluation modeled the observed distribution of heredocs, pipes, loops, command substitutions, sed/awk backreferences, embedded Python/Node programs, and payload sizes. Across 36 paired task runs:
-
-| Metric | Baseline | Structured script |
+| Owner | Count | Share of static |
 | --- | ---: | ---: |
-| Static failures | 9/36 | 2/36 |
-| Completed validly scored tasks | 34/34 | 34/34 |
-| Tool calls | 65 | 66 |
-| Mean wall time | 22.44 s | 22.07 s |
-| Processed tokens | 248,540 | 268,259 |
+| **This change (`script`)** | **26** | **17.9%** |
+| The separate `pi.bash cwd` change | 26 | 17.9% |
+| Syntax, but no shell at all — `pi.edit`/`pi.write` payloads | 36 | 24.8% |
+| Syntax, shell inside a multi-tool program — stays `code` | 11 | 7.6% |
+| `stdin` — a declared non-goal | 3 | 2.1% |
+| Other type errors | 43 | 29.7% |
 
-The candidate selected `script` in 26/36 runs. Those 26 runs had zero static failures. These are local, synthetic results rather than production proof; they justify engineering and dogfood, not a success claim for upstream users.
+All 26 script-owned rejections are escaping failures and nothing else:
+`',' expected` (16), `Unterminated string literal` (4), `'}' expected` (4),
+`Invalid character` (2). Fourteen are one-line programs — a single shell command
+whose inner quoting closed the TypeScript literal early. Script mode does not
+merely reduce this class; the class cannot occur, because the payload never
+enters TypeScript.
 
-Read the paired table as directional only. The task distribution was modeled rather than sampled from live traffic, and at n=36 the 9→2 static-failure difference carries a wide interval: it is enough to motivate building the feature, not enough to calibrate a threshold. The corpus table above is the firmer half of the evidence, and it measures the problem, not this solution. Unlike the corpus figures, these paired runs have not been re-measured; treat every number in this section as a stale snapshot until reproduced.
+Three of the rejected payloads were recovered by hand and re-authored as
+`script`: each compiles to a program with zero type errors, emits JavaScript, and
+preserves the payload byte-for-byte, with the original `settle`/`timeout` intact
+in the nested option object.
+
+### Read this honestly
+
+**17.9%, not a quarter.** An earlier draft of this spec counted 37 syntax
+rejections "whose own source contains `pi.bash(`" and treated 37 as the target.
+That count reproduces exactly — 26 single-shell-call plus 11 multi-tool — but it
+conflates two populations. The 11 are shell embedded in programs that also drive
+other tools, which the design stance below deliberately keeps in `code`. The
+addressable share is a sixth of static rejections, not a quarter.
+
+**The largest syntax bucket is not shell.** Thirty-six rejections are
+`pi.edit`/`pi.write` payloads with no shell in them. `strings` + `π.key` already
+solves those and long has. That is a discoverability problem, and `script` does
+nothing for it — it is a larger bucket than the one this change addresses.
+
+**This measures the problem, not the solution.** These payloads were rejected
+before running, so nothing here says whether the same programs would fail at
+runtime instead. That is the counter-metric the dogfood protocol exists to
+collect, and it is the gate the feature turns on.
+
+**One operator, 8 days, self-selected toward this repository's own work.** It
+sizes a problem worth fixing; it is not a rate that generalizes to other users.
+
+### On the earlier paired evaluation
+
+Previous revisions of this spec carried a 36-run paired evaluation reporting a
+9→2 drop in static failures. It is removed rather than restated. The repository's
+DeepSWE harness could not reproduce it — the reported medians, per-task tool
+counts, and wall times are not shapes that harness emits, and it collected no
+static-failure metric at all until one was added. Numbers that cannot be
+reproduced should not carry a decision. The replay above measures the same thing
+against real traffic and can be re-run from recorded sessions at any time.
 
 ## Design stance
 
@@ -326,7 +372,20 @@ Measure:
 - calls, processed tokens, and elapsed time where available
 - script selections on tasks that later require multi-tool code orchestration
 
-Establish the baseline before fixing any numeric gate. The synthetic evaluation is too small and too modeled to calibrate a threshold from, so run the first measurement window against the unmodified build, record the same metrics, and only then set the numeric targets for the script-mode window. Recording a matched baseline is a completion requirement; hitting a particular number is not.
+Establish the baseline before fixing any numeric gate. A matched baseline has been recorded from sessions started 2026-08-19 through the build switch, under the same instrument and the same definitions the script-mode window will use:
+
+| Baseline metric | Value |
+| --- | ---: |
+| Bash-related calls | 4,511 |
+| Bash syntax failures per Bash call | 0.0086 |
+| Runtime authoring faults per Bash call | 0.0144 |
+| **Combined authoring failures per Bash call** | **0.0231** |
+| Mean calls to recover after a static rejection | 1.15 |
+| Mean calls to recover after a runtime shell failure | 1.07 |
+
+The pre-registered gate is that the combined figure falls below 0.0231. Recording a matched baseline is a completion requirement; hitting a particular number is not.
+
+Two measurement rules the instrument had to learn the hard way, both of which silently produced plausible wrong numbers first. Deduplicate globally by `toolCallId` and by record id: resumed and branched sessions replay earlier tool calls and assistant turns, which inflates call counts and makes token totals quadratic. And select windows by **session start**, not by record timestamp: Pi binds the extension build when a session starts, so a session running across the switch keeps the old build to its end, and time-filtering counts its calls against the new build — reading 0% script selection for calls that could not have selected `script`.
 
 Two gates are unconditional, because they are correctness rather than adoption:
 
@@ -334,10 +393,12 @@ Two gates are unconditional, because they are correctness rather than adoption:
 - no material increase in total tool calls; investigate token growth above 10%
 - no net transfer of failures from static rejection to runtime script fault: the two counts are read together, and a reduction in the first that is matched by a rise in the second is a null result, not a win
 
-The adoption targets below are starting hypotheses carried over from the synthetic runs, to be replaced by baseline-derived numbers before the window closes. Missing one is a signal to investigate — a discoverability problem, a mode boundary, a wrong default — not by itself a reason to abandon the feature:
+The adoption targets below are starting hypotheses, not gates, and no measurement backs them yet. Replace them with baseline-derived numbers before the window closes. Missing one is a signal to investigate — a discoverability problem, a mode boundary, a wrong default — not by itself a reason to abandon the feature:
 
 - around 60% natural script selection on eligible one-script tasks
 - a substantial reduction in Bash syntax failures against the matched baseline, provisionally half
+
+Size the second one against what the replay found: `script` owns 26 of 145 static rejections. Halving the Bash syntax rate is plausible only if script selection is high on exactly the payloads that produce it; a miss is more likely to be a selection-rate finding than a failure of the mechanism, which cannot produce this class of rejection at all.
 
 Report every metric as measured, including the ones that moved the wrong way, and state which gate was pre-registered and which was set after seeing the baseline.
 
