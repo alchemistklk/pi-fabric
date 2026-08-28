@@ -11,7 +11,20 @@ The feature succeeds when large shell programs no longer require JSON → TypeSc
 
 ## Evidence
 
-The local historical corpus contains 7,349 completed `fabric_exec` calls, 136 static failures, and 74 failures confirmed by the TypeScript parser as syntax failures. Raw source text identifies `pi.bash(` in 41 syntax failures; the recovery AST still recognizes the Bash call in 38 of them. This is about 30% of all static failures and 55% of syntax failures.
+Corpus figures below were re-measured on 2026-08-28 with `measure-fabric-failures.mjs` over `~/.pi/agent/sessions`, deduplicated by `toolCallId`, across a window of 2026-08-19 → 2026-08-28 (8 recorded days). They supersede an earlier snapshot; re-measure rather than quoting them once the window moves.
+
+| Measure | Count | Share |
+| --- | ---: | ---: |
+| `fabric_exec` calls with a string `code` argument | 7,438 | — |
+| Static rejections (type errors, code never ran) | 140 | 1.88% of calls |
+| Static rejections in the syntax / embedded-text bucket | 77 | 55.0% of static |
+| Syntax-bucket failures whose own source contains `pi.bash(` | 37 | 26.4% of static, 48.1% of syntax |
+| Static rejections mentioning `pi.bash` under any cause | 89 | 63.6% of static |
+| `pi.bash` `cwd` rejections (the separate change) | 26 | 18.6% of static |
+
+Two caveats on how to read that table. The buckets are regexes over diagnostic text rather than parser-confirmed classifications, and they overlap: the per-cause counts sum past 140 because one rejection can match several. Separately, the `cwd` bucket and the syntax bucket are fully disjoint in this window — zero rejections appear in both — which is the concrete reason this change and the `cwd` change are independent rather than merely scheduled apart.
+
+The 37-call figure is the honest size of the target: about a quarter of static rejections, not a third, and under half of syntax rejections rather than the majority. The corpus is also one operator's 8-day local window, self-selected toward this repository's own work, so it sizes a problem worth fixing — not a rate that generalizes to other users.
 
 An anonymized paired evaluation modeled the observed distribution of heredocs, pipes, loops, command substitutions, sed/awk backreferences, embedded Python/Node programs, and payload sizes. Across 36 paired task runs:
 
@@ -25,7 +38,7 @@ An anonymized paired evaluation modeled the observed distribution of heredocs, p
 
 The candidate selected `script` in 26/36 runs. Those 26 runs had zero static failures. These are local, synthetic results rather than production proof; they justify engineering and dogfood, not a success claim for upstream users.
 
-Read the paired table as directional only. The task distribution was modeled rather than sampled from live traffic, and at n=36 the 9→2 static-failure difference carries a wide interval: it is enough to motivate building the feature, not enough to calibrate a threshold. The historical-corpus counts in the paragraph above are the firmer half of the evidence, and they measure the problem, not this solution.
+Read the paired table as directional only. The task distribution was modeled rather than sampled from live traffic, and at n=36 the 9→2 static-failure difference carries a wide interval: it is enough to motivate building the feature, not enough to calibrate a threshold. The corpus table above is the firmer half of the evidence, and it measures the problem, not this solution. Unlike the corpus figures, these paired runs have not been re-measured; treat every number in this section as a stale snapshot until reproduced.
 
 ## Invariants
 
