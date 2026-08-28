@@ -38,10 +38,8 @@ import {
 } from "./runtime/orchestration.js";
 import type { FabricCommittedCapabilityView } from "./protocol.js";
 import {
-  fabricExecTitleHintCached,
-  fabricScriptTitleHintCached,
+  fabricAuthoredTitleHintCached,
 } from "./ui/fabric-title-hint.js";
-import { fabricScriptPayload } from "./fabric-exec-arguments.js";
 import type {
   QuickJsRuntime,
   FabricSandboxResult,
@@ -155,17 +153,8 @@ export interface FabricExecutionOptions {
   maxAgentCalls?: number;
   display?: FabricRunDisplay;
   onPartial(snapshot: FabricExecutionPartial): void;
+  titleHint?: string;
 }
-
-// A script-authored run carries the constant compiled program as its code, so
-// the lexical program title would be identical for every script; the activity
-// feed reads the authored payload instead, matching the compact card.
-const executionTitleHint = (options: FabricExecutionOptions): string | undefined => {
-  const script = fabricScriptPayload(options);
-  return script !== null
-    ? fabricScriptTitleHintCached(script)
-    : fabricExecTitleHintCached(options.code);
-};
 
 export class FabricExecutionService {
   #runtime: QuickJsRuntime | NodeProcessRuntime | undefined;
@@ -191,7 +180,9 @@ export class FabricExecutionService {
     this.activity?.start(
       options.parentToolCallId,
       options.display,
-      options.display?.name?.trim() ? undefined : executionTitleHint(options),
+      options.display?.name?.trim()
+        ? undefined
+        : options.titleHint ?? fabricAuthoredTitleHintCached(options),
     );
     const dependencies = await loadRuntimeDependencies();
     const effectiveFullCodeMode =

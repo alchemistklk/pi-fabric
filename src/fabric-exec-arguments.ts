@@ -13,12 +13,7 @@ const OPTIONAL_FABRIC_EXEC_KEYS = [
   "settle",
 ] as const;
 
-/**
- * Reserved `strings` key holding a script-mode payload. This is the
- * authoritative marker for "this call was authored as a script": the outer
- * `script` argument is consumed by preparation and never reaches execute,
- * persistence, or a settled render.
- */
+/** Internal guest binding used only after a validated script reaches execute. */
 const FABRIC_SCRIPT_STRING_KEY = "__fabric_script";
 
 /** Script-only scalars consumed by compilation into the nested pi.bash options. */
@@ -121,38 +116,6 @@ const compileFabricScriptProgram = (options: ScriptOptions): string =>
   `const result = await pi.bash(π.${FABRIC_SCRIPT_STRING_KEY}${scriptOptionLiteral(options)}); `
   + (options.settle === true ? SETTLED_RETURN : PLAIN_RETURN);
 
-const COMPILED_PROGRAM_PATTERN = new RegExp(
-  String.raw`^const result = await pi\.bash\(π\.${FABRIC_SCRIPT_STRING_KEY}`
-  + String.raw`(?:, \{ (?:timeout: (\d+))?(?:, )?(?:settle: (true|false))? \})?\); `,
-);
-
-/**
- * True when `code` is exactly what {@link compileFabricScriptProgram} emits.
- * Matching by reconstruction rather than by prefix keeps the reserved-key rule
- * and the idempotency rule from contradicting each other: a second preparation
- * pass over a compiled call is a no-op, while a hand-written `code` payload
- * that squats on the reserved key still fails.
- */
-const isCompiledFabricScriptProgram = (code: unknown): boolean => {
-  if (typeof code !== "string") return false;
-  const match = COMPILED_PROGRAM_PATTERN.exec(code);
-  if (!match) return false;
-  const options: ScriptOptions = {};
-  if (match[1] !== undefined) options.timeout = Number(match[1]);
-  if (match[2] !== undefined) options.settle = match[2] === "true";
-  return compileFabricScriptProgram(options) === code;
-};
-
-/** The script payload of a prepared call, or null when the call is not script-authored. */
-export const fabricScriptPayload = (args: unknown): string | null => {
-  if (!isRecord(args)) return null;
-  const strings = args.strings;
-  if (!isRecord(strings)) return null;
-  const payload = strings[FABRIC_SCRIPT_STRING_KEY];
-  if (typeof payload !== "string") return null;
-  return isCompiledFabricScriptProgram(args.code) ? payload : null;
-};
-
 const present = (args: Record<string, unknown>, key: string): boolean =>
   Object.hasOwn(args, key) && args[key] !== undefined && args[key] !== null;
 
@@ -160,9 +123,8 @@ const readScriptOptions = (args: Record<string, unknown>): ScriptOptions => {
   const options: ScriptOptions = {};
   if (present(args, "timeout")) {
     const timeout = args.timeout;
-    // Whole seconds only, and bounded: the compiled program embeds the value
-    // literally, so a fractional or exponentially-formatted number would break
-    // the reconstruct-and-compare that recognizes a compiled program.
+    // Whole seconds only, and bounded: the execution seam embeds this typed
+    // scalar into a fixed program template rather than interpolating payload text.
     if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1
       || timeout > MAX_SCRIPT_TIMEOUT_SECONDS) {
       throw argumentError(
@@ -182,8 +144,9 @@ const readScriptOptions = (args: Record<string, unknown>): ScriptOptions => {
 };
 
 /**
- * Enforce the flat `code` XOR `script` contract and compile a script payload
- * onto the existing `code + strings` path.
+ * Enforce the flat `code` XOR `script` contract before Pi validates the public
+ * schema. Compilation stays behind {@link resolveFabricExecProgram}, after the
+ * host has validated and persisted the authored surface.
  *
  * Contract violations throw. Pi wraps prepareArguments in the same try/catch
  * that serves schema validation, so a throw here becomes an ordinary argument
@@ -191,7 +154,6 @@ const readScriptOptions = (args: Record<string, unknown>): ScriptOptions => {
  */
 const applyScriptContract = (
   args: Record<string, unknown>,
-  writable: () => Record<string, unknown>,
 ): Record<string, unknown> => {
   const hasScript = Object.hasOwn(args, "script") && args.script !== undefined
     && args.script !== null;
@@ -209,17 +171,6 @@ const applyScriptContract = (
       throw argumentError(
         "fabric_exec requires either `code` (a TypeScript function body) or "
         + "`script` (one complete shell program).",
-      );
-    }
-    const strings = args.strings;
-    if (
-      isRecord(strings)
-      && Object.hasOwn(strings, FABRIC_SCRIPT_STRING_KEY)
-      && !isCompiledFabricScriptProgram(args.code)
-    ) {
-      throw argumentError(
-        `fabric_exec reserves \`strings.${FABRIC_SCRIPT_STRING_KEY}\` for script mode. `
-        + "Rename that key, or pass the shell program as `script`.",
       );
     }
     return args;
@@ -244,13 +195,50 @@ const applyScriptContract = (
     );
   }
 
-  const options = readScriptOptions(args);
-  const prepared = writable();
-  prepared.code = compileFabricScriptProgram(options);
-  prepared.strings = { [FABRIC_SCRIPT_STRING_KEY]: args.script };
-  delete prepared.script;
-  for (const key of SCRIPT_OPTION_KEYS) delete prepared[key];
-  return prepared;
+  readScriptOptions(args);
+  return args;
+};
+
+export type FabricExecProgram =
+  | {
+      kind: "code";
+      code: string;
+      strings?: Record<string, string>;
+    }
+  | {
+      kind: "script";
+      code: string;
+      strings: Record<string, string>;
+    };
+
+/**
+ * Resolve validated model-facing arguments into the one internal execution
+ * shape. Script identity remains explicit until this seam; no downstream
+ * caller has to infer authorship from a magic key or generated source text.
+ */
+export const resolveFabricExecProgram = (input: unknown): FabricExecProgram => {
+  if (!isRecord(input)) {
+    throw argumentError("fabric_exec arguments must be an object.");
+  }
+  if (typeof input.script === "string") {
+    return {
+      kind: "script",
+      code: compileFabricScriptProgram(readScriptOptions(input)),
+      strings: { [FABRIC_SCRIPT_STRING_KEY]: input.script },
+    };
+  }
+  if (typeof input.code !== "string") {
+    throw argumentError(
+      "fabric_exec requires either `code` (a TypeScript function body) or "
+      + "`script` (one complete shell program).",
+    );
+  }
+  const payloads = resolveFabricExecPayloads(input);
+  return {
+    kind: "code",
+    code: input.code,
+    ...(payloads ? { strings: payloads } : {}),
+  };
 };
 
 export const prepareFabricExecArguments = (input: unknown): unknown => {
@@ -303,5 +291,5 @@ export const prepareFabricExecArguments = (input: unknown): unknown => {
     return prepared;
   }
 
-  return applyScriptContract(prepared, writable);
+  return applyScriptContract(prepared);
 };

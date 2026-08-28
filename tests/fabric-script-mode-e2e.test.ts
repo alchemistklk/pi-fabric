@@ -13,10 +13,16 @@ import type { FabricAutoApprovalClassifier } from "../src/core/auto-approval-cla
 import type { FabricExecutionTraceV1 } from "../src/audit/trace.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
-import { prepareFabricExecArguments } from "../src/fabric-exec-arguments.js";
+import {
+  prepareFabricExecArguments,
+  resolveFabricExecProgram,
+} from "../src/fabric-exec-arguments.js";
 
-const compile = (args: Record<string, unknown>) =>
-  prepareFabricExecArguments(args) as { code: string; strings: Record<string, string> };
+const compile = (args: Record<string, unknown>) => {
+  const program = resolveFabricExecProgram(prepareFabricExecArguments(args));
+  if (program.kind !== "script") throw new Error("Expected a script program");
+  return { code: program.code, strings: program.strings };
+};
 
 type RunOptions = {
   configure?: (config: FabricConfig) => void;
@@ -297,14 +303,28 @@ describe("script mode failure outcomes", () => {
 });
 
 describe("script mode nested-call parity", () => {
-  const makeRunner = (events: string[]): ExtensionRunner => ({
+  type RunnerRecords = {
+    events: string[];
+    calls: Array<Record<string, unknown>>;
+    results: Array<Record<string, unknown>>;
+  };
+  const makeRunner = (records: RunnerRecords): ExtensionRunner => ({
     createContext: () => ({ cwd: process.cwd() }),
     getActiveTools: () => [],
     emit: vi.fn(async (event: { type: string }) => {
-      events.push(event.type);
+      records.events.push(event.type);
     }),
-    emitToolCall: vi.fn(async () => undefined),
-    emitToolResult: vi.fn(async () => undefined),
+    emitToolCall: vi.fn(async (event: Record<string, unknown>) => {
+      records.calls.push(structuredClone(event));
+      return undefined;
+    }),
+    emitToolResult: vi.fn(async (event: Record<string, unknown>) => {
+      records.results.push(structuredClone(event));
+      return {
+        content: [{ type: "text", text: "patched-by-tool-result" }],
+        details: { patched: true },
+      };
+    }),
   }) as unknown as ExtensionRunner;
 
   // The strongest available statement of "script mode is sugar": a compiled
@@ -313,11 +333,12 @@ describe("script mode nested-call parity", () => {
   it("matches a hand-written pi.bash program event for event and record for record", async () => {
     await withTempDir(async (cwd) => {
       const script = `printf '%s\\n' 'parity'`;
-      const scriptEvents: string[] = [];
-      const codeEvents: string[] = [];
+      const records = (): RunnerRecords => ({ events: [], calls: [], results: [] });
+      const scriptRecords = records();
+      const codeRecords = records();
 
       const scripted = await runScript(cwd, { script }, {
-        runner: makeRunner(scriptEvents),
+        runner: makeRunner(scriptRecords),
       });
       const handwritten = await runProgram(
         cwd,
@@ -325,12 +346,34 @@ describe("script mode nested-call parity", () => {
           code: "const result = await pi.bash(π.command); return result.output;",
           strings: { command: script },
         },
-        { runner: makeRunner(codeEvents) },
+        { runner: makeRunner(codeRecords) },
       );
 
-      expect(scriptEvents[0]).toBe("tool_execution_start");
-      expect(scriptEvents.at(-1)).toBe("tool_execution_end");
-      expect(scriptEvents).toEqual(codeEvents);
+      expect(scriptRecords.events[0]).toBe("tool_execution_start");
+      expect(scriptRecords.events.at(-1)).toBe("tool_execution_end");
+      expect(scriptRecords.events).toEqual(codeRecords.events);
+      const withoutCallId = ({ toolCallId: _toolCallId, ...event }: Record<string, unknown>) =>
+        event;
+      expect(scriptRecords.calls.map(withoutCallId)).toEqual(
+        codeRecords.calls.map(withoutCallId),
+      );
+      expect(scriptRecords.calls).toHaveLength(1);
+      expect(scriptRecords.calls[0]).toMatchObject({
+        type: "tool_call",
+        toolName: "bash",
+        input: { command: script },
+      });
+      expect(scriptRecords.results.map(withoutCallId)).toEqual(
+        codeRecords.results.map(withoutCallId),
+      );
+      expect(scriptRecords.results).toHaveLength(1);
+      expect(scriptRecords.results[0]).toMatchObject({
+        type: "tool_result",
+        toolName: "bash",
+        input: { command: script },
+        isError: false,
+      });
+      expect(scripted.value).toBe("patched-by-tool-result");
       expect(scripted.value).toEqual(handwritten.value);
       expect(scripted.success).toBe(handwritten.success);
 
