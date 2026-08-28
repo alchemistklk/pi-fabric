@@ -8,7 +8,11 @@ import {
 } from "./branch-details.js";
 import { clipUtf8, utf8Bytes } from "./bounds.js";
 import { normalizeRunDisplay } from "../run-display.js";
-import { fabricExecTitleHintCached } from "../ui/fabric-title-hint.js";
+import {
+  fabricExecTitleHintCached,
+  fabricScriptTitleHintCached,
+} from "../ui/fabric-title-hint.js";
+import { fabricScriptPayload } from "../fabric-exec-arguments.js";
 
 // A purely structural, typed view of one session window. Every event carries
 // the 1-based `index` it occupied in the normalized stream (stable, used by the
@@ -240,11 +244,17 @@ const fabricRunIntent = (call: PendingCall | undefined): FabricRunIntent | undef
   // no name is declared, derive one lexically from the recorded program so
   // intent continuity never depends on the live UI. A declared description is
   // preserved even when the name comes from the program.
+  // A script-authored call records the constant compiled program as `code`,
+  // which would derive the same bare title for every script ever run; resolve
+  // the authored payload through the reserved key instead.
+  const scriptPayload = fabricScriptPayload(call.args);
   const intentName = display?.name?.trim()
     ? display.name
-    : typeof call.args.code === "string"
-      ? fabricExecTitleHintCached(call.args.code)
-      : undefined;
+    : scriptPayload !== null
+      ? fabricScriptTitleHintCached(scriptPayload)
+      : typeof call.args.code === "string"
+        ? fabricExecTitleHintCached(call.args.code)
+        : undefined;
   if (intentName === undefined) return undefined;
   const name = clipUtf8(intentName.trim(), FABRIC_BRANCH_RUN_NAME_MAX_BYTES);
   if (!name) return undefined;
