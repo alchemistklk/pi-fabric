@@ -137,8 +137,7 @@ One naming collision to keep straight while reading the runtime: the guest-type 
 
 ```json
 {
-  "script": "<payload>",
-  "strings": { "note": "keep" }
+  "script": "<payload>"
 }
 ```
 
@@ -148,11 +147,13 @@ to the existing internal representation:
 {
   "code": "const result = await pi.bash(π.__fabric_script); return result.output;",
   "strings": {
-    "note": "keep",
     "__fabric_script": "<payload>"
   }
 }
 ```
+
+The compiled `strings` holds the reserved key and nothing else, because the
+contract rejects a caller-supplied `strings` alongside `script`.
 
 With execution options, the compiled call carries them in the nested option object and the outer scalars are consumed:
 
@@ -168,12 +169,14 @@ compiles to:
 
 ```json
 {
-  "code": "const result = await pi.bash(π.__fabric_script, { timeout: 600, settle: true }); return { ok: result.ok, exitCode: result.exitCode ?? 0, output: result.output };",
+  "code": "const result = await pi.bash(π.__fabric_script, { timeout: 600, settle: true }); return result.ok ? { ok: true, exitCode: 0, output: result.output } : { ok: false, exitCode: result.exitCode, output: result.output };",
   "strings": { "__fabric_script": "<payload>" }
 }
 ```
 
 The return projection differs by option because the nested envelope does. A default or `timeout`-only call resolves to `{ ok: true, output, details }` and returns bare `result.output`. A `settle: true` call resolves to `{ ok: false, output, details, exitCode, error }` on an ordinary nonzero exit, so it must return the outcome alongside the text: returning `result.output` there would hand back the output while discarding the exit status that is the entire reason to pass `settle`, leaving the model to infer pass/fail by reading the text.
+
+The settle template branches on `result.ok` rather than reading `result.exitCode ?? 0` directly, because `pi.bash` returns a discriminated union whose `ok: true` member carries no `exitCode`. Fabric's own type gate would not catch the flat form — it filters type-correctness diagnostics, `TS2339` among them, and rejects on syntax — so this is written to be correct under an ordinary `tsc`, and stays correct if that filter is ever tightened.
 
 Emit only the options the caller actually supplied, so the default case stays byte-for-byte identical to the bare compiled program above. The compiled program is a fixed template selected by which options are present — never string-built from caller values, which stay in the option object as typed scalars.
 
