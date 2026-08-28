@@ -71,7 +71,8 @@ Rules:
 
 - `code` and `script` are mutually exclusive.
 - At least one must be a string after compatibility preparation.
-- `script` may coexist with `strings`, `display`, budgets, and `resultFormat`.
+- `script` may coexist with `display` and `resultFormat`, which still act on the outer call.
+- `script` rejects `strings`, `tokenBudget`, and `agentBudget`. None of the three can reach a shell payload: `π` is a guest-side binding a shell script cannot read and Fabric performs no interpolation into the script, while both budgets are observed only by `workflow.agent()` calls, which a compiled script never makes. Passing one is not a harmless extra — it is evidence the caller wanted `code`, and accepting it silently would both waste transcript and teach the model that `π` works inside a script. Fabric's own reserved `strings.__fabric_script` is written by compilation, not by the caller.
 - Fabric reserves `strings.__fabric_script`; a caller-provided collision fails before execution.
 - Script mode returns the Bash text output as the outer Fabric value, except under `settle: true`, where it returns the outcome envelope described in Deterministic compilation.
 - A script value is preserved exactly as received. Fabric performs no shell escaping, interpolation, rewriting, or normalization.
@@ -164,6 +165,14 @@ Compilation must be idempotent. A second preparation pass sees canonical `code +
 
 `strings.__fabric_script` is the authoritative marker for "this call was authored as a script". Everything downstream of preparation — mode gates, rendering, title hints — detects script mode by that key, not by an outer `script` argument, which no longer exists after preparation.
 
+## What script mode gives up
+
+The type check is the one Fabric guarantee this feature deliberately forfeits, and the spec is not honest without saying so. A `code` payload is parsed and type-checked before it runs; that is what produces the static rejections this change is trying to remove. A `script` payload is never inspected at all. The compiled program around it type-checks trivially and always passes, so a malformed shell program reaches the sandbox and fails at runtime instead of being rejected before it starts.
+
+That is the trade the whole feature makes: fewer static rejections caused by TypeScript string escaping, in exchange for no pre-execution validation of the payload. `set -eu` and correct quoting become the model's own responsibility. The Fabric-side affordances built on the type checker do not apply either — no type-error recovery hint, and none of the guest-type near-miss argument repairs, which operate on a parsed call the script does not have.
+
+The consequence for measurement is direct: a drop in static rejections is not by itself a win if the same payloads now fail at runtime instead. The dogfood protocol must watch both sides of that ledger, or the feature will look successful while having only moved failures between buckets.
+
 ## Mode gates
 
 After `state.ensure(context)` and before `state.execution.execute(...)`, reject script mode unless all conditions hold:
@@ -212,7 +221,8 @@ Update `src/fabric-exec-arguments.ts` and its focused tests.
 
 Completion criteria:
 
-- Script compilation, caller strings preservation, reserved-key collision, `code + script` conflict, malformed values, and idempotency are all covered by red-then-green tests.
+- Script compilation, reserved-key collision, `code + script` conflict, rejection of `strings`/`tokenBudget`/`agentBudget` alongside `script`, malformed values, and idempotency are all covered by red-then-green tests.
+- `strings` passed with `code` keeps its current identity/no-copy behavior; only the `script` pairing is rejected.
 - Existing compatibility cases retain their current identity/no-copy behavior.
 
 ### Step 2: Expose the flat schema
@@ -290,6 +300,8 @@ Measure:
 - Bash calls using `code + strings`
 - Bash calls with inline payloads
 - retries after static rejection
+- runtime shell failures per script call, split into script-authoring faults (syntax, quoting, unset variable) and genuine command failures — the counter-metric for the forfeited type check
+- retries after a runtime script failure, compared against retries after a static rejection
 - calls, processed tokens, and elapsed time where available
 - script selections on tasks that later require multi-tool code orchestration
 
@@ -299,6 +311,7 @@ Two gates are unconditional, because they are correctness rather than adoption:
 
 - no script-caused approval, audit, cancellation, timeout, or rendering regression
 - no material increase in total tool calls; investigate token growth above 10%
+- no net transfer of failures from static rejection to runtime script fault: the two counts are read together, and a reduction in the first that is matched by a rise in the second is a null result, not a win
 
 The adoption targets below are starting hypotheses carried over from the synthetic runs, to be replaced by baseline-derived numbers before the window closes. Missing one is a signal to investigate — a discoverability problem, a mode boundary, a wrong default — not by itself a reason to abandon the feature:
 
