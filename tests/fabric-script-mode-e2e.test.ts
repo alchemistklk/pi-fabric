@@ -96,7 +96,15 @@ const withTempDir = async (run: (cwd: string) => Promise<void>): Promise<void> =
   try {
     await run(cwd);
   } finally {
-    fs.rmSync(cwd, { recursive: true, force: true });
+    // Windows can retain the cancelled child process's cwd handle briefly
+    // after the provider reports the aborted result. Keep cleanup bounded but
+    // allow that native handle to settle before removing the test directory.
+    fs.rmSync(cwd, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
   }
 };
 
