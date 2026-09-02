@@ -96,15 +96,7 @@ const withTempDir = async (run: (cwd: string) => Promise<void>): Promise<void> =
   try {
     await run(cwd);
   } finally {
-    // Windows can retain the cancelled child process's cwd handle briefly
-    // after the provider reports the aborted result. Keep cleanup bounded but
-    // allow that native handle to settle before removing the test directory.
-    fs.rmSync(cwd, {
-      recursive: true,
-      force: true,
-      maxRetries: 10,
-      retryDelay: 100,
-    });
+    fs.rmSync(cwd, { recursive: true, force: true });
   }
 };
 
@@ -285,20 +277,21 @@ describe("script mode failure outcomes", () => {
   });
 
   it("records cancellation as aborted without leaking the payload", async () => {
-    await withTempDir(async (cwd) => {
-      const controller = new AbortController();
-      setTimeout(() => controller.abort(new Error("cancelled by user")), 250);
-      const result = await runScript(
-        cwd,
-        { script: `${canaryLine}\nsleep 5` },
-        { signal: controller.signal },
-      );
+    // This probe writes no files. Reusing the system temp directory avoids
+    // making Windows cleanup depend on when a cancelled shell descendant
+    // releases its cwd handle.
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("cancelled by user")), 250);
+    const result = await runScript(
+      os.tmpdir(),
+      { script: `${canaryLine}\nsleep 5` },
+      { signal: controller.signal },
+    );
 
-      expect(result.success).toBe(false);
-      expect(result.trace.outcome).toBe("aborted");
-      expect(result.trace.operations[0]?.outcome).toBe("aborted");
-      expectNoPayloadInErrorFields(result);
-    });
+    expect(result.success).toBe(false);
+    expect(result.trace.outcome).toBe("aborted");
+    expect(result.trace.operations[0]?.outcome).toBe("aborted");
+    expectNoPayloadInErrorFields(result);
   });
 
   it("keeps the payload out of error fields on an ordinary nonzero exit", async () => {
