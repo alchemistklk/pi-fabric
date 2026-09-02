@@ -220,6 +220,39 @@ describe("script-mode gates", () => {
     expect(execute.mock.calls[0]![0]).toMatchObject(compile(raw));
   });
 
+  it("keeps payloads canonical through Pi validation and maps them at execute", async () => {
+    const { state, execute } = executeState({ fullCodeMode: true, schemaMode: "off" });
+    const tool = createFabricExecTool(
+      state,
+      defaultCodePreviewSettings(),
+      new Map(),
+      (definition) => definition,
+    );
+    const raw = { code: "return π.body;", payloads: { body: "ok" } };
+    const prepared = tool.prepareArguments!(raw);
+    expect(prepared).toBe(raw);
+    const validated = validateToolArguments(tool, {
+      type: "toolCall",
+      id: "fabric-payload-order",
+      name: "fabric_exec",
+      arguments: prepared as Record<string, unknown>,
+    });
+    expect(validated).toEqual(raw);
+
+    await expect(tool.execute(
+      "fabric-payload-order",
+      validated as never,
+      undefined,
+      undefined,
+      {} as never,
+    )).rejects.toBe(EXECUTED);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]![0]).toMatchObject({
+      code: raw.code,
+      strings: raw.payloads,
+    });
+  });
+
   it("executes in full code mode with schema off or audit", async () => {
     for (const schemaMode of ["off", "audit"] as const) {
       const { state, execute } = executeState({ fullCodeMode: true, schemaMode });

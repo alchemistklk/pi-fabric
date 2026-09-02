@@ -198,8 +198,10 @@ describe("prepareFabricExecArguments script mode", () => {
   });
 
   it("rejects keys a shell payload cannot reach", () => {
+    expect(() => prepareFabricExecArguments({ script: "ls", payloads: { a: "b" } }))
+      .toThrow(/`payloads` cannot be used with `script`/);
     expect(() => prepareFabricExecArguments({ script: "ls", strings: { a: "b" } }))
-      .toThrow(/`strings` cannot be used with `script`/);
+      .toThrow(/`payloads` cannot be used with `script`/);
     expect(() => prepareFabricExecArguments({ script: "ls", tokenBudget: 10 }))
       .toThrow(/`tokenBudget` cannot be used with `script`/);
     expect(() => prepareFabricExecArguments({ script: "ls", agentBudget: 2 }))
@@ -224,13 +226,17 @@ describe("prepareFabricExecArguments script mode", () => {
       .toThrow(/`settle` must be a boolean/);
   });
 
-  it("leaves caller strings untouched for ordinary code", () => {
+  it("canonicalizes legacy strings without inferring script authorship", () => {
     const input = {
       code: "return π.__fabric_script;",
       strings: { __fabric_script: "ls" },
     };
-    expect(prepareFabricExecArguments(input)).toBe(input);
-    expect(resolveFabricExecProgram(input)).toMatchObject({
+    const prepared = prepareFabricExecArguments(input);
+    expect(prepared).toEqual({
+      code: input.code,
+      payloads: input.strings,
+    });
+    expect(resolveFabricExecProgram(prepared)).toMatchObject({
       kind: "code",
       strings: input.strings,
     });
@@ -243,6 +249,17 @@ describe("prepareFabricExecArguments script mode", () => {
 });
 
 describe("resolveFabricExecProgram", () => {
+  it("maps canonical code payloads onto the internal guest bindings", () => {
+    expect(resolveFabricExecProgram({
+      code: "return π.body;",
+      payloads: { body: "ok" },
+    })).toEqual({
+      kind: "code",
+      code: "return π.body;",
+      strings: { body: "ok" },
+    });
+  });
+
   it("keeps authorship explicit instead of inferring it from code and a magic key", () => {
     expect(resolveFabricExecProgram({ script: "ls -la" })).toMatchObject({
       kind: "script",
