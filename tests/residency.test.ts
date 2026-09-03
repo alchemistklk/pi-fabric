@@ -616,7 +616,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     initRepository(unrelated);
     const id = randomId().padEnd(32, "0").slice(0, 32);
     const branch = `pi-fabric/tampered-${id.slice(0, 8)}`;
-    const worktree = path.join(os.tmpdir(), "pi-fabric-worktrees", id);
+    const worktree = path.join(source, ".pi", "fabric", "worktrees", id);
     fs.mkdirSync(path.dirname(worktree), { recursive: true });
     git(source, "worktree", "add", "-q", "-b", branch, worktree, "HEAD");
     const runDirectory = path.join(state.config.residencyRoot, "runs", id);

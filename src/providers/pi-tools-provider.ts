@@ -11,6 +11,7 @@ import {
   type ExtensionRunner,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { PI_CORE_TOOL_NAMES, type PiCoreToolName } from "../core/pi-tools.js";
@@ -272,6 +273,13 @@ export class PiToolsProvider implements FabricProvider {
   ): Promise<unknown> {
     if (!(actionName in this.#tools)) throw new Error(`Unknown Pi tool: ${actionName}`);
     const name = actionName as PiCoreToolName;
+    if (name === "bash") {
+      const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
+      if (intercepted) {
+        this.#attachPreview(name, intercepted, args, context);
+        return this.#normalizeResult(name, intercepted, args);
+      }
+    }
     // A captured extension override (e.g. an extension that registered a "read"
     // tool) already replays the full event lifecycle itself via
     // CapturedToolsProvider, so delegate to it unchanged.

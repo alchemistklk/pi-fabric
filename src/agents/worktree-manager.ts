@@ -1,7 +1,8 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { addCloneFirstWorktree } from "./clone-first-worktree.js";
 import { executeFile } from "./transports/process-utils.js";
+import { fabricWorktreePath } from "./worktree-paths.js";
 
 export interface WorktreeLease {
   gitRoot: string;
@@ -54,12 +55,12 @@ export class WorktreeManager {
       throw new Error("Worktree isolation requires a Git repository");
     }
     const branch = `pi-fabric/${safeLabel(name)}-${id.slice(0, 8)}`;
-    const parent = path.join(os.tmpdir(), "pi-fabric-worktrees");
-    fs.mkdirSync(parent, { recursive: true });
-    const worktreePath = path.join(parent, id);
-    await executeFile("git", ["worktree", "add", "-b", branch, worktreePath, "HEAD"], {
-      cwd: gitRoot,
-      timeoutMs: 60_000,
+    const worktreePath = fabricWorktreePath(gitRoot, id);
+    await addCloneFirstWorktree({
+      gitRoot,
+      dest: worktreePath,
+      branch: { flag: "-b", name: branch },
+      startPoint: "HEAD",
     });
     const canonicalWorktreePath = fs.realpathSync(worktreePath);
     const prefix = preserveSourceSubdirectory ? worktreePrefixParts(sourcePrefix) : undefined;

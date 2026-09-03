@@ -264,6 +264,9 @@ describe("one-shot agent cwd", () => {
         path: worktree!,
         branch: result.branch!,
       });
+      expect(fs.realpathSync(worktree!)).toBe(
+        fs.realpathSync(path.join(target, ".pi", "fabric", "worktrees", result.id)),
+      );
       expect(result.cwd).toBe(fs.realpathSync(path.join(worktree!, "packages", "app")));
       expect(fs.existsSync(result.cwd)).toBe(true);
       expect((result as unknown as { projectRoot: string }).projectRoot).toBe(parent);
