@@ -1,34 +1,23 @@
 #!/usr/bin/env node
 // Deterministic tool-entropy certification. Measures fixed corpora with the
 // versioned entropy meter, verifies the exact math, proves the ratchet
-// (compile proposals never increase the score and converge), exercises the
-// ledger store, and ingests synthetic session JSONL — all offline, with no
-// model and no clocks inside the measured values.
+// (compile proposals never increase the score and converge), and ingests
+// synthetic session JSONL — all offline, with no model and no clocks inside
+// the measured values.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   ENTROPY_METRIC_VERSION,
-  MAX_ENTROPY_LEDGER_ENTRIES,
-  appendEntropyLedgerEntry,
   applyProposalsToSurface,
-  entropyDirectory,
   entropyReportHash,
   entropySurfaceHash,
   entropyTracesFromSessionJsonl,
   entropyValueObservationsFromSessionJsonl,
-  entropyTrend,
   evaluateGate,
-  loadEntropyLedger,
   measureEntropy,
   proposeEntropyReductions,
   surfaceFreedomReport,
 } from "../../dist/entropy/index.js";
-
-const defaultAgentDir = () =>
-  process.env.PI_CODING_AGENT_DIR
-    ? process.env.PI_CODING_AGENT_DIR
-    : path.join(os.homedir(), ".pi", "agent");
 
 const op = (ref, args, outcome = "succeeded", failureStage) => ({
   ref,
@@ -502,86 +491,9 @@ export const runEntropyCertification = async (options = {}) => {
     `observations ${valueObservations.length} renders ${renderObservations.length}`,
   );
 
-  // Ledger: round trip, cap, exact trend slope, and damage behavior.
-  const ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-"));
-  let ledgerEntries = 0;
-  let ledgerSlope = 0;
-  let ledgerLast = 0;
-  let capEntries = 0;
-  let capLast = -1;
-  let damageError = "";
-  let appendThrew = false;
-  let damagePreserved = false;
-  try {
-    for (const score of [0.6, 0.4, 0.2]) {
-      appendEntropyLedgerEntry(ledgerDir, {
-        catalogDigest: "digest-test",
-        score,
-        operations: 10,
-        invocationRejectionsPer1k: 0,
-        source: "certify-entropy",
-      });
-    }
-    const loaded = loadEntropyLedger(ledgerDir);
-    const trend = entropyTrend(loaded.ledger);
-    ledgerEntries = loaded.ledger.entries.length;
-    ledgerSlope = trend.slopePerEntry;
-    ledgerLast = trend.lastScore ?? 0;
-    check(
-      "ledger-round-trip",
-      !loaded.error &&
-        ledgerEntries === 3 &&
-        ledgerSlope === -0.2 &&
-        ledgerLast === 0.2,
-      `entries ${ledgerEntries} slope ${ledgerSlope} last ${ledgerLast} error ${loaded.error ?? "none"}`,
-    );
-    for (let index = 0; index < MAX_ENTROPY_LEDGER_ENTRIES + 10; index++) {
-      appendEntropyLedgerEntry(ledgerDir, {
-        catalogDigest: "digest-test",
-        score: index,
-        operations: 10,
-        invocationRejectionsPer1k: 0,
-        source: "certify-entropy",
-      });
-    }
-    const capped = loadEntropyLedger(ledgerDir);
-    capEntries = capped.ledger.entries.length;
-    capLast =
-      capped.ledger.entries[capped.ledger.entries.length - 1]?.score ?? -1;
-    check(
-      "ledger-cap",
-      capEntries === MAX_ENTROPY_LEDGER_ENTRIES &&
-        capLast === MAX_ENTROPY_LEDGER_ENTRIES + 10 - 1,
-      `entries ${capEntries} last ${capLast}`,
-    );
-    const damagedPath = path.join(ledgerDir, "ledger.json");
-    fs.writeFileSync(damagedPath, "{oops", "utf8");
-    const damaged = loadEntropyLedger(ledgerDir);
-    damageError = damaged.error ?? "";
-    try {
-      appendEntropyLedgerEntry(ledgerDir, {
-        catalogDigest: "digest-test",
-        score: 1,
-        operations: 1,
-        invocationRejectionsPer1k: 0,
-        source: "certify-entropy",
-      });
-    } catch {
-      appendThrew = true;
-    }
-    damagePreserved = fs.readFileSync(damagedPath, "utf8") === "{oops";
-  } finally {
-    fs.rmSync(ledgerDir, { recursive: true, force: true });
-  }
-  check(
-    "ledger-damage-surfaced",
-    damageError.length > 0 && appendThrew && damagePreserved,
-    `error "${damageError}" appendThrew ${appendThrew} preserved ${damagePreserved}`,
-  );
-
-  // Real session corpus (opt-in). A live surface snapshot
-  // (/fabric entropy export <path>) adds static freedom and keys the ledger
-  // entry to the surface hash, so trend lines compare like against like.
+  // Real session corpus (opt-in, development and CI). A live surface
+  // snapshot (/fabric entropy export <path>) adds static freedom and keys
+  // the report to the surface hash.
   let corpus;
   let surfaceSummary;
   if (options.surfacePath && !options.sessionsDir) {
@@ -636,16 +548,6 @@ export const runEntropyCertification = async (options = {}) => {
         corpus.totals.operations > 0,
         `files ${files.length} traces ${traces.length} operations ${corpus.totals.operations}`,
       );
-      if (options.record) {
-        const agentDir = options.agentDir ?? defaultAgentDir();
-        appendEntropyLedgerEntry(entropyDirectory(agentDir), {
-          catalogDigest: corpus.catalogDigest,
-          score: corpus.score,
-          operations: corpus.totals.operations,
-          invocationRejectionsPer1k: corpus.totals.invocationRejectionsPer1k,
-          source: "certify-entropy",
-        });
-      }
     }
   }
 
@@ -681,11 +583,6 @@ export const runEntropyCertification = async (options = {}) => {
       },
       structure: {
         proposals: structureProposals,
-      },
-      ledger: {
-        entries: ledgerEntries,
-        slope: ledgerSlope,
-        cappedEntries: capEntries,
       },
       ingestion: {
         traces: ingestedTraces.length,

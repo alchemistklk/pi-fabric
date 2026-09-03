@@ -2,7 +2,11 @@
 // traces and session JSONL into meter traces, and normalize catalog repair
 // rows. Only guarded, typed records are consumed — never rendered prose.
 
-import { readFabricExecutionTraceV1, type FabricExecutionTraceV1 } from "../audit/trace.js";
+import {
+  FABRIC_EXECUTION_TRACE_KIND,
+  readFabricExecutionTraceV1,
+  type FabricExecutionTraceV1,
+} from "../audit/trace.js";
 import { stableJsonHash } from "../core/stable-hash.js";
 import type { CatalogRepair } from "../repairs/types.js";
 import type {
@@ -34,6 +38,9 @@ const sessionDetailsRecords = (lines: readonly string[]): Record<string, unknown
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === "") continue;
+    // Cheap pre-filter: only lines that can carry a trace envelope get
+    // parsed. This keeps on-demand multi-session scans fast on large logs.
+    if (!trimmed.includes(FABRIC_EXECUTION_TRACE_KIND)) continue;
     let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);

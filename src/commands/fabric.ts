@@ -19,14 +19,13 @@ import {
 } from "../protocol.js";
 import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
 import type { RepairStatus } from "../repairs/types.js";
-import {
-  entropyDirectory,
-  entropyTrend,
-  loadEntropyLedger,
-  type LoadedEntropyLedger,
-} from "../entropy/ledger.js";
 import { ENTROPY_METRIC_VERSION } from "../entropy/types.js";
-import { liveSurfaceSnapshot, surfaceFreedomReport } from "../entropy/surface.js";
+import {
+  entropySurfaceHash,
+  liveSurfaceSnapshot,
+  surfaceFreedomReport,
+} from "../entropy/surface.js";
+import { measureSessionCorpus, projectSessionFiles } from "../entropy/sessions.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -253,26 +252,6 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       status.repairs.length > 0 ? `current:\n${rows}` : "current: (empty)",
       ...(status.storeError ? [`store: ${status.storeError}`] : []),
       top ? `fingerprints:\n${top}` : "fingerprints: (none this session)",
-    ].join("\n");
-  };
-
-  const formatEntropyStatus = (
-    status: RepairStatus,
-    loaded: LoadedEntropyLedger,
-    surfaceLine: string,
-  ): string => {
-    const trend = entropyTrend(loaded.ledger);
-    const ledgerLine =
-      trend.count === 0
-        ? "ledger: (empty — run `bun run certify:entropy --record` against a session corpus)"
-        : `ledger: ${trend.count} entries · last score ${trend.lastScore ?? "n/a"} · slope ${trend.slopePerEntry}/entry`;
-    return [
-      `entropy: metric v${ENTROPY_METRIC_VERSION} · digest ${status.catalogDigest.slice(0, 12) || "none"}`,
-      `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
-      surfaceLine,
-      ledgerLine,
-      ...(loaded.error ? [`store: ${loaded.error}`] : []),
-      "certify: bun run certify:entropy   # offline corpus meter, ratchet gate, ledger append",
     ].join("\n");
   };
 
@@ -909,27 +888,48 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           context.ui.notify("Usage: /fabric entropy [export <path>]", "warning");
           return;
         }
-        const loaded = loadEntropyLedger(entropyDirectory(resolveAgentDir()));
-        let surfaceLine = "surface: (unavailable)";
         try {
+          const status = state.repairs.status();
           const snapshot = await liveSurfaceSnapshot({
             registry: state.registry,
             extensionContext: context,
             cwd: state.cwd ?? context.cwd,
           });
           const freedom = surfaceFreedomReport(snapshot);
-          const top = freedom.actions
+          const surfaceDigest = entropySurfaceHash(snapshot);
+          const files = projectSessionFiles(resolveAgentDir(), state.cwd ?? context.cwd);
+          const corpus = measureSessionCorpus({
+            files,
+            surface: snapshot,
+            catalogDigest: surfaceDigest,
+          });
+          const format = (value: number): string =>
+            String(Math.round(value * 100) / 100);
+          const worst = freedom.actions
             .slice(0, 4)
-            .map((action) => `${action.ref} ${action.freedom}`)
+            .map((action) => `${action.ref} ${format(action.freedom)}`)
             .join(" · ");
-          surfaceLine = `surface: ${freedom.actions.length} actions · static freedom ${freedom.total} (mean ${freedom.mean})${top ? ` · top ${top}` : ""}`;
-        } catch {
-          // Surface listing is best-effort; the ledger line stays authoritative.
+          const latest = corpus.latest;
+          const sessionsLine =
+            corpus.sessions.length === 0
+              ? `session entropy (observed): no fabric_exec traces in the latest ${files.length} project sessions`
+              : `session entropy (observed): ${corpus.sessions.length} sessions measured · latest ${latest?.totals.operations ?? 0} ops · score ${format(latest?.score ?? 0)} · slope ${format(corpus.trend.slopePerStep)}/session`;
+          context.ui.notify(
+            [
+              `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
+              `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
+              `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
+              sessionsLine,
+              "export: /fabric entropy export <path>   # snapshot the live surface",
+            ].join("\n"),
+            "info",
+          );
+        } catch (error) {
+          context.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
         }
-        context.ui.notify(
-          formatEntropyStatus(state.repairs.status(), loaded, surfaceLine),
-          "info",
-        );
         return;
       }
       if (command !== "status") {

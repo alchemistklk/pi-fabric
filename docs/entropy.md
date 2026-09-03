@@ -105,47 +105,55 @@ diff. Monotonicity is measured, never argued. A converged surface stops
 proposing, which the certification proves by requiring an empty second
 round.
 
-## Ledger
+## On-demand measurement
 
-`~/.pi/agent/fabric/entropy/ledger.json` (under `PI_CODING_AGENT_DIR`) holds
-up to 256 appended entries with the catalog digest, metric version, score,
-operation count, and rejection rate. `entropyTrend` reports the least-squares
-score slope per entry. A damaged ledger surfaces as an error and blocks
-appends and never silently rebuilds the file, mirroring the repair table
-contract.
+Session JSONL is the source of truth, so nothing is recorded. `/fabric
+entropy` reads the newest project sessions (window of 8 files, newest first
+by mtime), measures each against the live surface snapshot, and reports the
+latest session's score plus the least-squares slope across the window's
+session scores (`trendFromScores`). Lines without a trace envelope are
+skipped by a cheap substring filter before parsing, so large logs stay
+fast. The repair table remains the only durable derived artifact because it
+is the only one that changes runtime behavior.
 
 ## Commands and certification
 
 ```text
-/fabric entropy                                        # live counters, surface freedom, ledger trend
-/fabric entropy export <path>                          # write the live surface snapshot as JSON
-bun run certify:entropy                                # offline fixtures, exact math, ratchet, ledger, ingestion
-bun run certify:entropy --sessions <dir> --record      # measure a real session corpus into the ledger
-bun run certify:entropy --sessions <dir> --surface <snap> --record
+/fabric entropy                     # live surface freedom + observed session entropy trend
+/fabric entropy export <path>       # write the live surface snapshot as JSON
 ```
 
-`/fabric entropy export <path>` snapshots the live registry through the
-discovery path (read-only, authorization-free) as `{ version: 1, actions:
-[{ ref, inputSchema }] }`, sorted by ref so it hashes stably. Pass it with
-`--surface` to measure a session corpus against the live surface; the
-ledger entry then carries the surface hash as its catalog digest, so trend
-lines compare like against like.
+Repo-side only (development and CI; these scripts are not part of the
+installed package):
+
+```text
+bun run certify:entropy                                     # offline fixtures, exact math, ratchet proof, ingestion
+bun run certify:entropy --sessions <dir> --surface <snap>   # measure an arbitrary session corpus
+```
+
+`/fabric entropy` measures on demand: the newest project sessions are read
+from the session logs, measured against the live surface, and the trend is
+the per-session slope. `/fabric entropy export <path>` snapshots the live
+registry through the discovery path (read-only, authorization-free) as
+`{ version: 1, actions: [{ ref, inputSchema }] }`, sorted by ref so it
+hashes stably. Pass an exported snapshot with `--surface` to measure a
+copied corpus against the surface it ran on; the report then carries the
+surface hash as its catalog digest, so scores compare like against like.
 
 The certification harness exits nonzero on any failed check, mirroring
 `certify:context`: determinism (double-run hash equality), exact metric math
 on fixed corpora, the full ratchet loop with convergence, surface-apply
-purity, ledger round trip, cap, and damage behavior, synthetic
-session-JSONL ingestion, and audit-derived value observations. The
-`Entropy` GitHub workflow runs the certification on every push to `main`
-and weekly, uploading the JSON report as an artifact; a red certification
-fails the build, so the ratchet line stays visible per commit.
+purity, synthetic session-JSONL ingestion, and audit-derived value
+observations. The `Entropy` GitHub workflow runs the certification on every
+push to `main` and weekly, uploading the JSON report as an artifact; a red
+certification fails the build, so the metric and ratchet stay verified per
+commit.
 
 ## Determinism contract
 
 - Fixed canonicalization, fixed thresholds, fixed weights; changes bump
   `ENTROPY_METRIC_VERSION` so ledger trends never mix formulas.
-- No clocks, randomness, or model calls inside measured values; timestamps
-  exist only as ledger metadata.
+- No clocks, randomness, or model calls inside measured values.
 - Only typed records are consumed; prose is never classified, the same
   discipline as [schema enforcement](schema-enforcement.md).
 - The report hashes stably (`entropyReportHash`), so per-commit scores are
@@ -164,3 +172,6 @@ fails the build, so the ratchet line stays visible per commit.
   successes) carry the replay-safety argument for retired refs.
 - Flow entropy groups executions by the persisted first workflow phase (or
   `(none)`), which is a coarse task key.
+- The on-demand trend covers the newest project sessions only (mtime
+  ordered): sessions the user prunes leave the trend, and the slope is only
+  as strong as the window.

@@ -26,7 +26,8 @@ const isJsonlFile = (name: string): boolean => name.endsWith(".jsonl");
 export const encodeCwdDir = (cwd: string): string =>
   `--${path.resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 
-const sessionDirForCwd = (cwd: string, agentDir: string): string =>
+/** Directory pi stores this project's session JSONL files under. */
+export const sessionDirForCwd = (cwd: string, agentDir: string): string =>
   path.join(agentDir, SESSIONS_SUBDIR, encodeCwdDir(cwd));
 
 const listJsonlInDir = (dir: string): string[] => {

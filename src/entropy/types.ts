@@ -7,11 +7,9 @@
 // the same metric version always produce the same report.
 
 export const ENTROPY_METRIC_VERSION = 1 as const;
-export const ENTROPY_LEDGER_VERSION = 1 as const;
-export const MAX_ENTROPY_LEDGER_ENTRIES = 256 as const;
 
 // Fixed weights per metric version. Changing any weight bumps
-// ENTROPY_METRIC_VERSION so ledger trends never mix formulas.
+// ENTROPY_METRIC_VERSION so trend lines never mix formulas.
 export const ENTROPY_WEIGHTS = {
   shape: 1,
   failureStage: 1,
@@ -161,26 +159,11 @@ export interface EntropyGateResult {
   reasons: string[];
 }
 
-export interface EntropyLedgerEntry {
-  catalogDigest: string;
-  metricVersion: number;
-  score: number;
-  operations: number;
-  invocationRejectionsPer1k: number;
-  source: string;
-  createdAt: string;
-}
-
-export interface EntropyLedgerFile {
-  version: typeof ENTROPY_LEDGER_VERSION;
-  entries: EntropyLedgerEntry[];
-  createdAt: string;
-  updatedAt: string;
-}
-
+// Trend of a score sequence, oldest to newest: the ratchet's line. A
+// negative slopePerStep means the surface is compiling down.
 export interface EntropyTrend {
   count: number;
-  firstScore?: number;
-  lastScore?: number;
-  slopePerEntry: number;
+  first?: number;
+  last?: number;
+  slopePerStep: number;
 }

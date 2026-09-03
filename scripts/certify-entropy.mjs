@@ -10,9 +10,7 @@ const argumentValue = (name) => {
 try {
   const report = await runEntropyCertification({
     sessionsDir: argumentValue("--sessions"),
-    agentDir: argumentValue("--agent-dir"),
     surfacePath: argumentValue("--surface"),
-    record: process.argv.includes("--record"),
   });
   const json = `${JSON.stringify(report, null, 2)}\n`;
   const jsonPath = argumentValue("--json");

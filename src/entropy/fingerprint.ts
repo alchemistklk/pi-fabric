@@ -3,6 +3,8 @@
 // the static freedom score of a JSON Schema. Everything here is a pure
 // function of its inputs; the same value always yields the same fingerprint.
 
+import type { EntropyTrend } from "./types.js";
+
 const SIGNATURE_MAX_KEYS = 32;
 const SIGNATURE_MAX_DEPTH = 3;
 // Enum cardinality whose freedom saturates at 1.0 (log2 of 64 values).
@@ -155,3 +157,30 @@ const schemaFreedom = (schema: unknown, depth: number): number => {
 // open-ended parameters add tax. Computable with an empty corpus, which is
 // what lets the compiler score candidate surfaces before deployment.
 export const staticFreedomFromSchema = (schema: unknown): number => schemaFreedom(schema, 0);
+
+// Least-squares slope of a score sequence, oldest to newest. The on-demand
+// session trend feeds this per-session scores; a flat or negative slope is
+// the ratchet holding.
+export const trendFromScores = (scores: readonly number[]): EntropyTrend => {
+  const count = scores.length;
+  const first = count > 0 ? scores[0] : undefined;
+  const last = count > 0 ? scores[count - 1] : undefined;
+  let slope = 0;
+  if (count >= 2) {
+    const meanX = (count - 1) / 2;
+    const meanY = scores.reduce((sum, value) => sum + value, 0) / count;
+    let numerator = 0;
+    let denominator = 0;
+    for (let index = 0; index < count; index++) {
+      numerator += (index - meanX) * (scores[index]! - meanY);
+      denominator += (index - meanX) ** 2;
+    }
+    slope = denominator > 0 ? numerator / denominator : 0;
+  }
+  return {
+    count,
+    ...(first !== undefined ? { first: roundMetric(first) } : {}),
+    ...(last !== undefined ? { last: roundMetric(last) } : {}),
+    slopePerStep: roundMetric(slope),
+  };
+};
