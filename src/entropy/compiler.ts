@@ -12,7 +12,12 @@
 
 import { stableJsonHash } from "../core/stable-hash.js";
 import { measureEntropy } from "./meter.js";
-import { applyProposalsToSurface, evaluateGate, proposeEntropyReductions } from "./passes.js";
+import {
+  applyProposalsToSurface,
+  evaluateGate,
+  proposeEntropyReductions,
+  type EntropyProposalInput,
+} from "./passes.js";
 import {
   COMPILED_SURFACE_VERSION,
   MAX_COMPILED_SURFACE_PROPOSALS,
@@ -38,6 +43,37 @@ import type {
 // The kinds the autonomous loop may apply. Every other proposal carries its
 // evidence to the surfaced review queue instead.
 export const AUTO_APPLY_PROPOSAL_KINDS: readonly string[] = ["enum-tighten", "noise-quarantine"];
+
+// The review queue for display: every proposal the autonomous loop declined
+// to apply, derived from the same evidence a tick would use. Each signal
+// names freedom the compiler found and refused to invent.
+export const entropyReviewSignals = (input: EntropyProposalInput): EntropyProposal[] =>
+  proposeEntropyReductions(input).filter(
+    (proposal) => !(AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
+  );
+
+// One-line rendering of a review signal for the /fabric entropy display.
+export const formatEntropyReviewSignal = (proposal: EntropyProposal): string => {
+  if (proposal.kind === "declare-enum") {
+    const values = proposal.values
+      .slice(0, 4)
+      .map((value) => String(value))
+      .join(", ");
+    return `declare-enum ${proposal.ref}.${proposal.key} (${values}${
+      proposal.values.length > 4 ? ", ..." : ""
+    })`;
+  }
+  if (proposal.kind === "overload-split") {
+    return `overload-split ${proposal.ref} (${proposal.clusters.length} key-set clusters)`;
+  }
+  if (proposal.kind === "sequence-fuse") {
+    return `sequence-fuse ${proposal.sequence.join(" -> ")}`;
+  }
+  if (proposal.kind === "modal-rename") {
+    return `modal-rename ${proposal.level} ${proposal.from} -> ${proposal.to}`;
+  }
+  return `${proposal.kind} ${proposal.ref}`;
+};
 
 export interface CompileEntropyInput {
   traces: readonly EntropyTraceInput[];

@@ -75,7 +75,26 @@ const descriptors: FabricActionDescriptor[] = [
         },
         page: { type: "number", minimum: 1 },
         pageSize: { type: "number", minimum: 1, maximum: RECALL_MAX_PAGE_SIZE },
-        role: { type: "string" },
+        role: {
+          type: "string",
+          enum: [
+            "assistant",
+            "bashExecution",
+            "branchCustomMessage",
+            "branchSummary",
+            "branchUser",
+            "compaction",
+            "compactionSummary",
+            "custom",
+            "fabricOperation",
+            "fabricPhase",
+            "fabricRun",
+            "toolResult",
+            "user",
+          ],
+          description:
+            "Exact normalized entry role to filter by: the closed set the session normalizer can produce.",
+        },
         tool: { type: "string" },
         ref: {
           type: "string",

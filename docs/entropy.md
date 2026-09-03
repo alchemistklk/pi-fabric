@@ -126,7 +126,10 @@ reviewable, evidence-carrying proposals with fixed thresholds:
   entirely) is evidence about the author's domain, not the compiler's to
   enforce. It surfaces as a review signal naming the observed vocabulary:
   once the author declares the enum, later compiles tighten beneath it
-  automatically. The auto loop never applies it.
+  automatically. The auto loop never applies it. The first declaration
+  from this pipeline is `memory.recall.role`, which now enumerates the
+  session normalizer's entry roles, so the compiler tightens it to the
+  roles models filter by.
 - `modal-rename`: a repair row whose target ref is called: compile the
   modal spilled spelling into the schema (rename the declared key or
   action) and retire the row. Skipped when the rename is already compiled
@@ -260,7 +263,10 @@ from the session logs (all projects; `--project` scopes to the current
 project's window), measured against the effective surface (live plus
 the compiled overlay), and the trend is the per-session slope; the display
 carries a `compiled:` line with the artifact's applied proposals and last
-gate outcome. Gate rejections are silent by design: the ratchet kept the
+gate outcome, and a `review:` line listing the signals the compiler declined
+to apply (declare-enum vocabularies, overload splits, sequence fusions,
+modal renames), derived read-only from the current window and the
+observation pool. Gate rejections are silent by design: the ratchet kept the
 old surface, and the display shows the compiled state on demand. `/fabric entropy export [path]` snapshots the live
 registry through the discovery path (read-only, authorization-free), defaulting
 to `<agent dir>/fabric/entropy/surface.json` beside the repair table, as

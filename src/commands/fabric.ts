@@ -29,7 +29,13 @@ import {
   machineSessionFiles,
   measureSessionCorpus,
   projectSessionFiles,
+  sessionWindowEvidence,
 } from "../entropy/sessions.js";
+import { measureEntropy } from "../entropy/meter.js";
+import { entropyRepairRows } from "../entropy/corpus.js";
+import { entropyReviewSignals, formatEntropyReviewSignal } from "../entropy/compiler.js";
+import { loadObservationPool } from "../entropy/pool-store.js";
+import { mergeObservationWindow, poolToValueObservations } from "../entropy/pool.js";
 import { applyCompiledSurface } from "../entropy/compiled-surface.js";
 import {
   loadCompiledSurface,
@@ -1032,11 +1038,50 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
             : loadedCompiled.file
               ? `compiled: v${loadedCompiled.file.metricVersion} · ${loadedCompiled.file.actions.length} tightened · ${loadedCompiled.file.quarantined.length} quarantined · ${loadedCompiled.file.applied.length} applied · gate ${loadedCompiled.file.gate.passed ? "pass" : "REJECTED"} (${format(loadedCompiled.file.gate.beforeScore)} → ${format(loadedCompiled.file.gate.afterScore)})`
               : "compiled: none";
+          // Review listing: the signals the compiler declined to apply,
+          // derived read-only from the current window plus the pool (the
+          // merge is in memory; the listing never writes the pool).
+          let reviewLine: string;
+          try {
+            const windowEvidence = sessionWindowEvidence(files);
+            const poolLoaded = loadObservationPool(resolveAgentDir());
+            if (poolLoaded.error) {
+              reviewLine = `review: unavailable — ${poolLoaded.error}`;
+            } else if (windowEvidence.traces.length === 0) {
+              reviewLine = "review: no window evidence";
+            } else {
+              const mergedPool = mergeObservationWindow(
+                poolLoaded.file,
+                windowEvidence.observationWindows,
+              );
+              const signals = entropyReviewSignals({
+                report: measureEntropy({
+                  traces: windowEvidence.traces,
+                  surface: snapshot,
+                  catalogDigest: surfaceDigest,
+                }),
+                traces: windowEvidence.traces,
+                surface: snapshot,
+                repairs: entropyRepairRows(state.repairs.repairs),
+                valueObservations: poolToValueObservations(mergedPool.file),
+              });
+              reviewLine =
+                signals.length === 0
+                  ? "review: none"
+                  : `review: ${signals.length} signal${signals.length === 1 ? "" : "s"} · ${signals
+                      .slice(0, 4)
+                      .map(formatEntropyReviewSignal)
+                      .join(" · ")}${signals.length > 4 ? ` · +${signals.length - 4} more` : ""}`;
+            }
+          } catch {
+            reviewLine = "review: unavailable";
+          }
           context.ui.notify(
             [
               `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
               `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
               compiledLine,
+              reviewLine,
               `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
               ...(modelsLine ? [modelsLine] : []),

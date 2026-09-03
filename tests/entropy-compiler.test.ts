@@ -4,7 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   compileEntropySurface,
+  entropyReviewSignals,
+  formatEntropyReviewSignal,
   loadCompiledSurface,
+  measureEntropy,
   saveCompiledSurface,
   schemaDigest,
   type CompiledSurfaceFile,
@@ -290,5 +293,81 @@ describe("compiled surface store", () => {
     expect(() => saveCompiledSurface(agentDir, artifact)).toThrow(
       "compiled surface is malformed JSON",
     );
+  });
+});
+
+describe("entropyReviewSignals", () => {
+  it("excludes the auto kinds and keeps the review queue", () => {
+    const outcome = compileEntropySurface(compileInput());
+    const review = entropyReviewSignals({
+      report: outcome.report,
+      traces: ratchetTraces(),
+      surface: ratchetSurface(),
+      repairs: ratchetRepairs(),
+    });
+    expect(review.map((proposal) => proposal.kind)).toEqual(["modal-rename"]);
+  });
+
+  it("surfaces declare-enum for open domains and formats it", () => {
+    const surface: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [
+        {
+          ref: "mcp.render",
+          inputSchema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["format"],
+            properties: { format: { type: "string" } },
+          },
+        },
+      ],
+    };
+    const traces: EntropyTraceInput[] = [
+      trace([
+        ...Array.from({ length: 7 }, () => op("mcp.render", { format: "pdf" })),
+        op("mcp.render", { format: "html" }),
+      ]),
+    ];
+    const review = entropyReviewSignals({
+      report: measureEntropy({ traces, surface }),
+      traces,
+      surface,
+    });
+    expect(review).toHaveLength(1);
+    expect(formatEntropyReviewSignal(review[0]!)).toBe(
+      "declare-enum mcp.render.format (pdf, html)",
+    );
+  });
+
+  it("formats structural signals and truncates long vocabularies", () => {
+    expect(
+      formatEntropyReviewSignal({
+        kind: "sequence-fuse",
+        sequence: ["pi.read", "pi.grep", "pi.edit"],
+        occurrences: 2,
+      }),
+    ).toBe("sequence-fuse pi.read -> pi.grep -> pi.edit");
+    expect(
+      formatEntropyReviewSignal({
+        kind: "declare-enum",
+        ref: "mcp.render",
+        key: "format",
+        values: ["a", "b", "c", "d", "e", "f"],
+        calls: 20,
+        distinct: 6,
+        topShare: 0.5,
+      }),
+    ).toBe("declare-enum mcp.render.format (a, b, c, d, ...)");
+    expect(
+      formatEntropyReviewSignal({
+        kind: "modal-rename",
+        level: "key",
+        ref: "memory.expand",
+        from: "sessionId",
+        to: "session",
+        note: "test",
+      }),
+    ).toBe("modal-rename key sessionId -> session");
   });
 });
