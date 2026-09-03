@@ -207,6 +207,75 @@ describe("proposeEntropyReductions", () => {
     ).toEqual([]);
   });
 
+  it("keeps a gate-proven enum as a floor: pre-birth observations never widen", () => {
+    const incumbent = surfaceOf([
+      {
+        ref: "mcp.render",
+        inputSchema: {
+          type: "object",
+          properties: { format: { type: "string", enum: ["pdf", "html"] } },
+          required: ["format"],
+          additionalProperties: false,
+        },
+      },
+    ]);
+    const traces = [
+      trace([
+        ...Array.from({ length: 5 }, () => op("mcp.render", { format: "pdf" })),
+        op("mcp.render", { format: "html" }),
+        op("mcp.render", { format: "html" }),
+        op("mcp.render", { format: "docx" }),
+      ]),
+    ];
+    const valueObservations = [
+      ...Array.from({ length: 5 }, () => ({ ref: "mcp.render", key: "format", value: "pdf" })),
+      { ref: "mcp.render", key: "format", value: "html" },
+      { ref: "mcp.render", key: "format", value: "html" },
+      { ref: "mcp.render", key: "format", value: "docx" },
+    ];
+    const report = measureEntropy({ traces, surface: incumbent });
+    expect(
+      proposeEntropyReductions({ report, traces, surface: incumbent, valueObservations }),
+    ).toEqual([]);
+  });
+
+  it("still tightens beneath a floor when incumbent values age out", () => {
+    const incumbent = surfaceOf([
+      {
+        ref: "mcp.render",
+        inputSchema: {
+          type: "object",
+          properties: { format: { type: "string", enum: ["pdf", "html", "docx"] } },
+          required: ["format"],
+          additionalProperties: false,
+        },
+      },
+    ]);
+    const traces = [
+      trace([
+        ...Array.from({ length: 6 }, () => op("mcp.render", { format: "pdf" })),
+        op("mcp.render", { format: "html" }),
+        op("mcp.render", { format: "html" }),
+      ]),
+    ];
+    const valueObservations = [
+      ...Array.from({ length: 6 }, () => ({ ref: "mcp.render", key: "format", value: "pdf" })),
+      { ref: "mcp.render", key: "format", value: "html" },
+      { ref: "mcp.render", key: "format", value: "html" },
+    ];
+    const report = measureEntropy({ traces, surface: incumbent });
+    expect(
+      proposeEntropyReductions({ report, traces, surface: incumbent, valueObservations }),
+    ).toEqual([
+      expect.objectContaining({
+        kind: "enum-tighten",
+        ref: "mcp.render",
+        key: "format",
+        values: ["pdf", "html"],
+      }),
+    ]);
+  });
+
   it("applies proposals without mutating the input surface", () => {
     const surface = ratchetSurface();
     const snapshot = JSON.stringify(surface);

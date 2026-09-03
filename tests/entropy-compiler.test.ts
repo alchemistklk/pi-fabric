@@ -7,6 +7,7 @@ import {
   loadCompiledSurface,
   saveCompiledSurface,
   schemaDigest,
+  type CompiledSurfaceFile,
   type EntropyOperationInput,
   type EntropySurfaceSnapshot,
   type EntropyTraceInput,
@@ -178,6 +179,60 @@ describe("compileEntropySurface", () => {
       "mcp.report.render: recorded arguments no longer validate against the compiled schema",
     ]);
     expect(divergent.artifact).toBeUndefined();
+  });
+
+  it("treats a gate-proven enum as a floor and converges on pre-birth evidence", () => {
+    const declared = {
+      type: "object",
+      properties: { format: { type: "string" } },
+      required: ["format"],
+      additionalProperties: false,
+    };
+    const surface: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [{ ref: "mcp.render", inputSchema: declared }],
+    };
+    const incumbent: CompiledSurfaceFile = {
+      version: 1,
+      metricVersion: 2,
+      actions: [
+        {
+          ref: "mcp.render",
+          inputSchema: {
+            ...declared,
+            properties: { format: { type: "string", enum: ["pdf", "html"] } },
+          },
+          baseSchemaDigest: schemaDigest(declared),
+        },
+      ],
+      quarantined: [],
+      applied: [{ kind: "enum-tighten", ref: "mcp.render", detail: "format: 2 observed values" }],
+      gate: { passed: true, beforeScore: 0.02, afterScore: 0.01, reasons: [] },
+      evidenceDigest: "birth",
+    };
+    const traces = [
+      trace([
+        ...Array.from({ length: 5 }, () => op("mcp.render", { format: "pdf" })),
+        op("mcp.render", { format: "html" }),
+        op("mcp.render", { format: "html" }),
+        op("mcp.render", { format: "docx" }),
+      ]),
+    ];
+    const valueObservations = [
+      ...Array.from({ length: 5 }, () => ({ ref: "mcp.render", key: "format", value: "pdf" })),
+      { ref: "mcp.render", key: "format", value: "html" },
+      { ref: "mcp.render", key: "format", value: "html" },
+      { ref: "mcp.render", key: "format", value: "docx" },
+    ];
+    const outcome = compileEntropySurface({
+      traces,
+      surface,
+      artifact: incumbent,
+      valueObservations,
+    });
+    expect(outcome.status).toBe("converged");
+    expect(outcome.artifact).toBe(incumbent);
+    expect(outcome.gate).toBeUndefined();
   });
 });
 

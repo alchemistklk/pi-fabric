@@ -76,6 +76,41 @@ const contains = (outer: readonly string[], inner: readonly string[]): boolean =
   return false;
 };
 
+interface EnumCandidate {
+  entry: {
+    ref: string;
+    key: string;
+    counts: Map<string, { value: string | number | boolean; count: number }>;
+    total: number;
+  };
+  ranked: { value: string | number | boolean; count: number }[];
+  topShare: number;
+}
+
+// A gate-proven enum is a floor. Observed values outside an incumbent enum
+// are pre-birth evidence: calls recorded before the overlay existed (the
+// live session carries them for its whole life) or after a digest proof
+// fell. The fresh derivation drops them instead of re-proposing a wider
+// enum the ratchet must then reject every turn. Tightening beneath the
+// floor still proposes; a derivation identical to the incumbent enum
+// converges. Widening resets only when the base schema drifts (the digest
+// proof drops the overlay and the enum re-derives from the live surface)
+// or through review.
+const floorIncumbentEnum = (
+  candidate: EnumCandidate,
+  surfaceByRef: Map<string, unknown>,
+  hasSurface: boolean,
+): EnumCandidate | undefined => {
+  if (!hasSurface) return candidate;
+  const properties = schemaProperties(surfaceByRef.get(candidate.entry.ref));
+  const target = properties ? properties[candidate.entry.key] : undefined;
+  const existing = enumKeys(target);
+  if (!existing) return candidate;
+  const ranked = candidate.ranked.filter((item) => existing.has(valueKey(item.value)));
+  if (ranked.length === 0 || ranked.length === existing.size) return undefined;
+  return { ...candidate, ranked };
+};
+
 export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyProposal[] => {
   const calledRefs = new Map<string, EntropyRefReport>();
   for (const ref of input.report.refs) calledRefs.set(ref.ref, ref);
@@ -142,7 +177,7 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
   const enumCandidates = [...observations.values()]
     .filter((entry) => entry.total >= ENUM_MIN_OBSERVATIONS)
     .filter((entry) => entry.counts.size >= 2 && entry.counts.size <= ENUM_MAX_DISTINCT)
-    .map((entry) => {
+    .map((entry): EnumCandidate => {
       const ranked = [...entry.counts.values()].sort(
         (left, right) =>
           right.count - left.count || compareCodeUnits(valueKey(left.value), valueKey(right.value)),
@@ -150,16 +185,10 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
       return { entry, ranked, topShare: roundMetric(ranked[0]!.count / entry.total) };
     })
     .filter((candidate) => candidate.topShare >= ENUM_MIN_TOP_SHARE)
-    .filter((candidate) => {
-      // Idempotence: skip when the live schema's enum already covers every
-      // observed value, so a compiled surface stops re-proposing.
-      if (!input.surface) return true;
-      const properties = schemaProperties(surfaceByRef.get(candidate.entry.ref));
-      const target = properties ? properties[candidate.entry.key] : undefined;
-      const existing = enumKeys(target);
-      if (!existing) return true;
-      return [...candidate.entry.counts.keys()].some((observed) => !existing.has(observed));
-    })
+    .map((candidate) =>
+      floorIncumbentEnum(candidate, surfaceByRef, input.surface !== undefined),
+    )
+    .filter((candidate) => candidate !== undefined)
     .sort((left, right) =>
       compareCodeUnits(`${left.entry.ref}\u0000${left.entry.key}`, `${right.entry.ref}\u0000${right.entry.key}`),
     )

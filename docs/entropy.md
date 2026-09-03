@@ -107,8 +107,13 @@ reviewable, evidence-carrying proposals with fixed thresholds:
   and a ≥ 50% top share compiles into an enum. Value observations come from
   the verbatim audits when supplied
   (`entropyValueObservationsFromSessionJsonl`); the projected trace args
-  are the fallback. Skipped when the live schema's enum already covers
-  every observed value.
+  are the fallback. A gate-proven enum is a floor: observed values outside
+  it are pre-birth evidence (recorded before the overlay existed, or after
+  a digest proof fell) and are dropped, never re-proposed, so a
+  converged surface stops contesting its own tightness every turn. Later
+  compiles may tighten beneath the floor but never widen past it;
+  widening resets only when the base schema drifts (the digest proof drops
+  the overlay) or through review.
 - `modal-rename`: a repair row whose target ref is called: compile the
   modal spilled spelling into the schema (rename the declared key or
   action) and retire the row. Skipped when the rename is already compiled
