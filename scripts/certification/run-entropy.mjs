@@ -290,6 +290,12 @@ const ingestionJsonl = () => {
       type: "message",
       message: { role: "user", content: "hi" },
     }),
+    JSON.stringify({
+      id: "entry-model-1",
+      type: "model_change",
+      provider: "zro",
+      modelId: "kimi-k3",
+    }),
     sessionLine(
       "entry-1",
       envelope,
@@ -298,6 +304,12 @@ const ingestionJsonl = () => {
         { ref: "pi.bash", args: { command: "ls" } },
       ],
     ),
+    JSON.stringify({
+      id: "entry-model-2",
+      type: "model_change",
+      provider: "coralbricks",
+      modelId: "glm-5.3-fp4",
+    }),
     sessionLine("entry-2", renderEnvelope, renderAudits),
     "",
   ].join("\n");
@@ -476,6 +488,23 @@ export const runEntropyCertification = async (options = {}) => {
     `traces ${ingestedTraces.length} ops ${ingestionReport.totals.operations}`,
   );
 
+// Per-model attribution: traces stamp the producing model from the session
+  // scan, and each model's behavioral terms measure against the same
+  // surface. The attribution names which model exercised the freedom.
+  check(
+    "session-model-attribution",
+    ingestionReport.byModel.length === 2 &&
+      ingestionReport.byModel[0].model === "coralbricks/glm-5.3-fp4" &&
+      ingestionReport.byModel[0].operations === 8 &&
+      ingestionReport.byModel[0].succeeded === 8 &&
+      ingestionReport.byModel[0].behavioralScore === 0 &&
+      ingestionReport.byModel[1].model === "zro/kimi-k3" &&
+      ingestionReport.byModel[1].operations === 2 &&
+      ingestionReport.byModel[1].succeeded === 1 &&
+      ingestionReport.byModel[1].behavioralScore === 0,
+    `models ${ingestionReport.byModel.map((entry) => `${entry.model}:${entry.operations}`).join(",")}`,
+  );
+
   // Verbatim audit observations: the value corpus for refs whose trace
   // projection drops values. The render calls keep empty trace args, so the
   // enum-tighten proposal can only come from the audits.
@@ -602,6 +631,7 @@ export const runEntropyCertification = async (options = {}) => {
         traces: ingestedTraces.length,
         operations: ingestionReport.totals.operations,
         valueObservations: valueObservations.length,
+        byModel: ingestionReport.byModel,
       },
     },
     ...(corpus ? { corpus } : {}),

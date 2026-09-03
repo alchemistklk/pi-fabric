@@ -23,7 +23,10 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 // One Fabric execution trace becomes one meter trace. The first persisted
 // workflow phase is the deterministic task key for flow entropy.
-export const entropyTraceFromFabricTrace = (trace: FabricExecutionTraceV1): EntropyTraceInput => ({
+export const entropyTraceFromFabricTrace = (
+  trace: FabricExecutionTraceV1,
+  model?: string,
+): EntropyTraceInput => ({
   operations: trace.operations.map((operation) => ({
     ref: operation.ref,
     args: operation.args,
@@ -31,16 +34,48 @@ export const entropyTraceFromFabricTrace = (trace: FabricExecutionTraceV1): Entr
     ...(operation.failureStage !== undefined ? { failureStage: operation.failureStage } : {}),
   })),
   taskKey: trace.phases[0] ?? DEFAULT_TASK_KEY,
+  ...(model ? { model } : {}),
 });
 
-const sessionDetailsRecords = (lines: readonly string[]): Record<string, unknown>[] => {
-  const records: Record<string, unknown>[] = [];
+const MODEL_CHANGE_FILTER = '"type":"model_change"';
+const ASSISTANT_FILTER = '"role":"assistant"';
+
+// Model identity for one parsed session record: `model_change` entries name
+// the provider/model from that point on, and assistant messages carry the
+// provider/model that produced the turn. A toolResult's producing model is
+// the one active at its line, so the scan tracks it in order.
+const modelFromRecord = (parsed: Record<string, unknown>): string | undefined => {
+  if (parsed.type === "model_change") {
+    const provider = typeof parsed.provider === "string" ? parsed.provider : "";
+    const modelId = typeof parsed.modelId === "string" ? parsed.modelId : "";
+    return provider && modelId ? `${provider}/${modelId}` : undefined;
+  }
+  const message = isRecord(parsed.message) ? parsed.message : undefined;
+  if (!message || message.role !== "assistant") return undefined;
+  const provider = typeof message.provider === "string" ? message.provider : "";
+  const modelId = typeof message.model === "string" ? message.model : "";
+  return provider && modelId ? `${provider}/${modelId}` : undefined;
+};
+
+interface ScannedSessionRecord {
+  details: Record<string, unknown>;
+  model?: string;
+}
+
+// Cheap pre-filters keep on-demand multi-session scans fast on large logs:
+// only lines that can carry a trace envelope or a model identity get parsed.
+// The substring gates are lossy by design; the guarded parse decides.
+const sessionRecords = (lines: readonly string[]): ScannedSessionRecord[] => {
+  const records: ScannedSessionRecord[] = [];
+  let currentModel: string | undefined;
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === "") continue;
-    // Cheap pre-filter: only lines that can carry a trace envelope get
-    // parsed. This keeps on-demand multi-session scans fast on large logs.
-    if (!trimmed.includes(FABRIC_EXECUTION_TRACE_KIND)) continue;
+    const traceLine = trimmed.includes(FABRIC_EXECUTION_TRACE_KIND);
+    const modelLine =
+      !traceLine &&
+      (trimmed.includes(MODEL_CHANGE_FILTER) || trimmed.includes(ASSISTANT_FILTER));
+    if (!traceLine && !modelLine) continue;
     let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);
@@ -48,12 +83,19 @@ const sessionDetailsRecords = (lines: readonly string[]): Record<string, unknown
       continue;
     }
     if (!isRecord(parsed)) continue;
+    if (modelLine) {
+      const model = modelFromRecord(parsed);
+      if (model) currentModel = model;
+      continue;
+    }
     const details = isRecord(parsed.details)
       ? parsed.details
       : isRecord(parsed.message) && isRecord(parsed.message.details)
         ? parsed.message.details
         : undefined;
-    if (isRecord(details)) records.push(details);
+    if (isRecord(details)) {
+      records.push({ details, ...(currentModel ? { model: currentModel } : {}) });
+    }
   }
   return records;
 };
@@ -63,9 +105,9 @@ const sessionDetailsRecords = (lines: readonly string[]): Record<string, unknown
 // throwing; only typed, guarded trace V1 envelopes count.
 export const entropyTracesFromSessionJsonl = (lines: readonly string[]): EntropyTraceInput[] => {
   const traces: EntropyTraceInput[] = [];
-  for (const details of sessionDetailsRecords(lines)) {
-    const trace = readFabricExecutionTraceV1(details.trace);
-    if (trace) traces.push(entropyTraceFromFabricTrace(trace));
+  for (const record of sessionRecords(lines)) {
+    const trace = readFabricExecutionTraceV1(record.details.trace);
+    if (trace) traces.push(entropyTraceFromFabricTrace(trace, record.model));
   }
   return traces;
 };
@@ -78,7 +120,8 @@ export const entropyValueObservationsFromSessionJsonl = (
   lines: readonly string[],
 ): EntropyValueObservation[] => {
   const observations: EntropyValueObservation[] = [];
-  for (const details of sessionDetailsRecords(lines)) {
+  for (const record of sessionRecords(lines)) {
+    const details = record.details;
     if (!Array.isArray(details.audits)) continue;
     for (const audit of details.audits) {
       if (!isRecord(audit)) continue;

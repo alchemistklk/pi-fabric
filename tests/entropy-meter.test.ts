@@ -256,3 +256,50 @@ describe("measureEntropy", () => {
     expect(report.totals.operations).toBe(0);
   });
 });
+
+describe("per-model attribution", () => {
+  it("attributes behavioral terms per producing model with exact scores", () => {
+    const wobbleA: EntropyTraceInput = {
+      ...trace(
+        [op("pi.read", { path: "a" }), op("pi.read", { path: "a", limit: 5 })],
+        "ta",
+      ),
+      model: "p/alpha",
+    };
+    const stillB: EntropyTraceInput = {
+      ...trace(
+        [op("pi.edit", { path: "a" }), op("pi.edit", { path: "a" })],
+        "tb",
+      ),
+      model: "p/beta",
+    };
+    const unstamped = trace([op("pi.bash", { command: "x" })], "tc");
+    const report = measureEntropy({ traces: [wobbleA, stillB, unstamped] });
+    expect(report.metricVersion).toBe(2);
+    expect(report.totals.operations).toBe(5);
+    expect(report.byModel.map((entry) => entry.model)).toEqual(["p/alpha", "p/beta"]);
+    expect(report.byModel[0]).toMatchObject({
+      model: "p/alpha",
+      operations: 2,
+      actionOperations: 2,
+      succeeded: 2,
+      behavioralScore: 0.5,
+    });
+    expect(report.byModel[1]).toMatchObject({
+      model: "p/beta",
+      operations: 2,
+      succeeded: 2,
+      behavioralScore: 0,
+    });
+    // The global report keeps every call: 1 bit of shape over 5 successes.
+    expect(report.score).toBe(0.2);
+    expect(report.behavioralScore).toBe(0.2);
+  });
+
+  it("leaves byModel empty for unstamped corpora", () => {
+    const report = measureEntropy({
+      traces: [trace([op("pi.read", { path: "a" })], "t")],
+    });
+    expect(report.byModel).toEqual([]);
+  });
+});

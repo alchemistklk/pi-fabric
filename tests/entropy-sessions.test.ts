@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  entropyTracesFromSessionJsonl,
   measureSessionCorpus,
   projectSessionFiles,
   trendFromScores,
@@ -147,5 +148,106 @@ describe("trendFromScores", () => {
     });
     expect(trendFromScores([])).toEqual({ count: 0, slopePerStep: 0 });
     expect(trendFromScores([5])).toEqual({ count: 1, first: 5, last: 5, slopePerStep: 0 });
+  });
+});
+
+const traceEnvelope = (ref: string, args: Record<string, unknown>): unknown => ({
+  kind: "pi-fabric.execution",
+  version: 1,
+  outcome: "succeeded",
+  phases: ["build"],
+  operations: [{ type: "call", sequence: 0, ref, args, outcome: "succeeded" }],
+  counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 },
+});
+
+const toolResultLine = (id: string, envelope: unknown): string =>
+  JSON.stringify({
+    id,
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolCallId: `c-${id}`,
+      toolName: "fabric_exec",
+      content: [{ type: "text", text: "ok" }],
+      details: { success: true, trace: envelope, phases: ["build"] },
+    },
+  });
+
+const assistantLine = (id: string, provider: string, model: string): string =>
+  JSON.stringify({
+    id,
+    type: "message",
+    message: { role: "assistant", provider, model, content: [] },
+  });
+
+const modelChangeLine = (id: string, provider: string, modelId: string): string =>
+  JSON.stringify({ id, type: "model_change", provider, modelId });
+
+const wobbleEnvelope = {
+  kind: "pi-fabric.execution",
+  version: 1,
+  outcome: "succeeded",
+  phases: ["build"],
+  operations: [
+    { type: "call", sequence: 0, ref: "pi.read", args: { path: "a" }, outcome: "succeeded" },
+    { type: "call", sequence: 1, ref: "pi.read", args: { path: "a", limit: 5 }, outcome: "succeeded" },
+  ],
+  counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 },
+};
+
+describe("per-model session attribution", () => {
+  it("stamps traces with the producing model across a mid-session switch", () => {
+    const content = [
+      modelChangeLine("m1", "zro", "kimi-k3"),
+      toolResultLine("t1", traceEnvelope("pi.read", { path: "a" })),
+      assistantLine("a1", "coralbricks", "glm-5.3-fp4"),
+      toolResultLine("t2", traceEnvelope("pi.read", { path: "b" })),
+      // A user line quoting assistant-shaped text must not update the model.
+      JSON.stringify({
+        id: "u1",
+        type: "message",
+        message: {
+          role: "user",
+          content: 'quoted {"role":"assistant","provider":"evil","model":"poison"}',
+        },
+      }),
+      toolResultLine("t3", traceEnvelope("pi.read", { path: "c" })),
+    ].join("\n");
+    const traces = entropyTracesFromSessionJsonl(content.split("\n"));
+    expect(traces.map((trace) => trace.model)).toEqual([
+      "zro/kimi-k3",
+      "coralbricks/glm-5.3-fp4",
+      "coralbricks/glm-5.3-fp4",
+    ]);
+  });
+
+  it("aggregates per-model trends across the session window", () => {
+    const agentDir = makeTempDir();
+    const dir = path.join(agentDir, "sessions", encodeCwdDir("/repo"));
+    fs.mkdirSync(dir, { recursive: true });
+    const write = (name: string, mtime: Date, content: string): void => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `${content}\n`);
+      fs.utimesSync(file, mtime, mtime);
+    };
+    write(
+      "old.jsonl",
+      new Date(2020, 0, 1),
+      [assistantLine("a1", "p", "alpha"), toolResultLine("t1", traceEnvelope("pi.read", { path: "z" }))].join("\n"),
+    );
+    write(
+      "new.jsonl",
+      new Date(2021, 0, 1),
+      [assistantLine("a2", "p", "alpha"), toolResultLine("t2", wobbleEnvelope)].join("\n"),
+    );
+    const result = measureSessionCorpus({ files: projectSessionFiles(agentDir, "/repo") });
+    expect(result.models).toHaveLength(1);
+    expect(result.models[0]).toMatchObject({
+      model: "p/alpha",
+      sessions: 2,
+      latestBehavioralScore: 0.5,
+      slopePerSession: 0.5,
+      latestRejectionsPer1k: 0,
+    });
   });
 });

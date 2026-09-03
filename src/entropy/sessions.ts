@@ -9,8 +9,13 @@ import path from "node:path";
 import { sessionDirForCwd } from "../memory/discovery.js";
 import { entropyTracesFromSessionJsonl } from "./corpus.js";
 import { measureEntropy } from "./meter.js";
-import { trendFromScores } from "./fingerprint.js";
-import type { EntropyReport, EntropySurfaceSnapshot, EntropyTrend } from "./types.js";
+import { compareCodeUnits, trendFromScores } from "./fingerprint.js";
+import type {
+  EntropyModelReport,
+  EntropyReport,
+  EntropySurfaceSnapshot,
+  EntropyTrend,
+} from "./types.js";
 
 const DEFAULT_SESSION_WINDOW = 8;
 
@@ -20,11 +25,22 @@ export interface SessionCorpusEntry {
   report: EntropyReport;
 }
 
+// Per-model trend across the session window: the attribution that names
+// which model's behavior moved, with the surface share staying global.
+export interface SessionModelTrend {
+  model: string;
+  sessions: number;
+  latestBehavioralScore: number;
+  slopePerSession: number;
+  latestRejectionsPer1k: number;
+}
+
 export interface SessionCorpusResult {
   files: readonly string[];
   sessions: SessionCorpusEntry[];
   latest?: EntropyReport;
   trend: EntropyTrend;
+  models: SessionModelTrend[];
 }
 
 // Newest-first session JSONL files for one project cwd, bounded by `limit`.
@@ -87,10 +103,29 @@ export const measureSessionCorpus = (input: {
     sessions.push({ file, operations: report.totals.operations, report });
   }
   const chronological = [...sessions].reverse();
+  const modelScores = new Map<string, { behavioral: number[]; latest: EntropyModelReport }>();
+  for (const session of chronological) {
+    for (const model of session.report.byModel) {
+      const entry = modelScores.get(model.model) ?? { behavioral: [], latest: model };
+      entry.behavioral.push(model.behavioralScore);
+      entry.latest = model;
+      modelScores.set(model.model, entry);
+    }
+  }
+  const models: SessionModelTrend[] = [...modelScores.entries()]
+    .sort(([left], [right]) => compareCodeUnits(left, right))
+    .map(([model, entry]) => ({
+      model,
+      sessions: entry.behavioral.length,
+      latestBehavioralScore: entry.latest.behavioralScore,
+      slopePerSession: trendFromScores(entry.behavioral).slopePerStep,
+      latestRejectionsPer1k: entry.latest.invocationRejectionsPer1k,
+    }));
   return {
     files: input.files,
     sessions,
     ...(sessions.length > 0 ? { latest: sessions[0]!.report } : {}),
     trend: trendFromScores(chronological.map((session) => session.report.score)),
+    models,
   };
 };

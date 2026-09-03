@@ -30,7 +30,7 @@ same report, which is what makes the score bisectable and CI-gateable.
   while audits carry every argument the call used. They stay local to the
   session record.
 
-## The metric (v1)
+## The metric
 
 `measureEntropy({ traces, surface?, repairs?, catalogDigest? })` returns a
 report with per-ref and global terms, all rounded to 1e-6:
@@ -57,6 +57,16 @@ Additional totals: `invocationRejections` counts failures at `resolve`,
 fingerprints. `invocationRejectionsPer1k` is that rate per 1,000 action
 operations and is the entropy production signal: it should trend to zero as
 the surface converges, and it spikes when a new model or tool arrives.
+
+Reports also carry `byModel`: per-model behavioral attribution. Traces stamp
+the producing model from the session scan (`model_change` records and the
+assistant turn's provider/model), and each model's behavioral terms measure
+against the same surface. The surface share is global truth about the
+schema, while behavioral entropy is attributable to the model that
+exercised it: a slipping ratchet with every model's slope up means the
+surface regressed, while one model's slope up names the entropy producer.
+Unstamped traces (older corpora, synthetic fixtures) contribute to the
+global report only.
 
 ### Fingerprints
 
@@ -178,6 +188,8 @@ commit.
 - No clocks, randomness, or model calls inside measured values.
 - Only typed records are consumed; prose is never classified, the same
   discipline as [schema enforcement](schema-enforcement.md).
+- Metric v2 adds `byModel` attribution; every v1 weight and formula is
+  unchanged.
 - The report hashes stably (`entropyReportHash`), so per-commit scores are
   bisectable.
 

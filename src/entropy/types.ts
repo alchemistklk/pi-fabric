@@ -6,7 +6,7 @@
 // table, live JSON schemas). No model judges anything; the same inputs and
 // the same metric version always produce the same report.
 
-export const ENTROPY_METRIC_VERSION = 1 as const;
+export const ENTROPY_METRIC_VERSION = 2 as const;
 
 // Fixed weights per metric version. Changing any weight bumps
 // ENTROPY_METRIC_VERSION so trend lines never mix formulas.
@@ -46,6 +46,8 @@ export interface EntropyOperationInput {
 export interface EntropyTraceInput {
   operations: EntropyOperationInput[];
   taskKey?: string;
+  /** Producing model, stamped from the session scan as `provider/modelId`. */
+  model?: string;
 }
 
 // Normalized catalog-repair row: `ref` is the target the row repairs toward.
@@ -98,6 +100,18 @@ export interface EntropyTotals {
   invocationRejectionsPer1k: number;
 }
 
+// Per-model behavioral attribution: each stamped trace measures against the
+// same surface, so the breakdown names which model exercised the freedom.
+export interface EntropyModelReport {
+  model: string;
+  operations: number;
+  actionOperations: number;
+  succeeded: number;
+  invocationRejections: number;
+  invocationRejectionsPer1k: number;
+  behavioralScore: number;
+}
+
 export interface EntropyReport {
   metricVersion: typeof ENTROPY_METRIC_VERSION;
   catalogDigest: string;
@@ -115,6 +129,8 @@ export interface EntropyReport {
   behavioralScore: number;
   score: number;
   refs: EntropyRefReport[];
+  /** Behavioral attribution per producing model; empty when no trace carries one. */
+  byModel: EntropyModelReport[];
 }
 
 export type EntropyProposal =

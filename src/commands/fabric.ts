@@ -916,12 +916,22 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
                     ? "ratchet holding"
                     : "ratchet slipping"
                 }`;
+          const modelsLine =
+            corpus.models.length > 1
+              ? `models: ${corpus.models
+                  .map(
+                    (model) =>
+                      `${model.model} behavioral ${format(model.latestBehavioralScore)} · slope ${format(model.slopePerSession)}`,
+                  )
+                  .join(" · ")}`
+              : undefined;
           context.ui.notify(
             [
               `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
               `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
               `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
+              ...(modelsLine ? [modelsLine] : []),
               "export: /fabric entropy export [path]   # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
             ].join("\n"),
             "info",

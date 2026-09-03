@@ -2,6 +2,7 @@ import {
   ENTROPY_INVOCATION_STAGES,
   ENTROPY_METRIC_VERSION,
   ENTROPY_WEIGHTS,
+  type EntropyModelReport,
   type EntropyRefReport,
   type EntropyRepairRowInput,
   type EntropyReport,
@@ -47,7 +48,12 @@ interface RefAccumulator {
   churnSum: number;
 }
 
-export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
+// The core pass without per-model attribution; measureEntropy wraps it so
+// each model's behavioral terms come from the same formula over its own
+// traces, measured against the same surface.
+type EntropyReportCore = Omit<EntropyReport, "byModel">;
+
+const measureOnce = (input: EntropyMeterInput): EntropyReportCore => {
   const surfaceByRef = new Map<string, unknown>();
   if (input.surface) {
     for (const action of input.surface.actions) surfaceByRef.set(action.ref, action.inputSchema);
@@ -251,4 +257,32 @@ export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
     score,
     refs: sortedRefs,
   };
+};
+
+export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
+  const report = measureOnce(input);
+  const groups = new Map<string, EntropyTraceInput[]>();
+  for (const sourceTrace of input.traces) {
+    if (!sourceTrace.model) continue;
+    const group = groups.get(sourceTrace.model) ?? [];
+    group.push(sourceTrace);
+    groups.set(sourceTrace.model, group);
+  }
+  // Only stamped traces attribute; everything else stays in the global
+  // report. Sorted iteration keeps the breakdown order stable.
+  const byModel: EntropyModelReport[] = [...groups.entries()]
+    .sort(([left], [right]) => compareCodeUnits(left, right))
+    .map(([model, traces]) => {
+      const scoped = measureOnce({ ...input, traces });
+      return {
+        model,
+        operations: scoped.totals.operations,
+        actionOperations: scoped.totals.actionOperations,
+        succeeded: scoped.totals.succeeded,
+        invocationRejections: scoped.totals.invocationRejections,
+        invocationRejectionsPer1k: scoped.totals.invocationRejectionsPer1k,
+        behavioralScore: scoped.behavioralScore,
+      };
+    });
+  return { ...report, byModel };
 };
