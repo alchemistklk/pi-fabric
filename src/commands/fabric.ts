@@ -856,17 +856,15 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         const exportIndex = argumentsList.indexOf("export");
         if (exportIndex >= 0) {
           const target = argumentsList[exportIndex + 1];
-          if (!target) {
-            context.ui.notify("Usage: /fabric entropy export <path>", "warning");
-            return;
-          }
           try {
             const snapshot = await liveSurfaceSnapshot({
               registry: state.registry,
               extensionContext: context,
               cwd: state.cwd ?? context.cwd,
             });
-            const dest = path.resolve(target);
+            const dest = path.resolve(
+              target ?? path.join(resolveAgentDir(), "fabric", "entropy", "surface.json"),
+            );
             fs.mkdirSync(path.dirname(dest), { recursive: true });
             fs.writeFileSync(dest, `${JSON.stringify(snapshot, null, 2)}\n`, {
               encoding: "utf8",
@@ -885,7 +883,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           return;
         }
         if (argumentsList[0] !== undefined) {
-          context.ui.notify("Usage: /fabric entropy [export <path>]", "warning");
+          context.ui.notify("Usage: /fabric entropy [export [path]]", "warning");
           return;
         }
         try {
@@ -911,16 +909,20 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
             .join(" · ");
           const latest = corpus.latest;
           const sessionsLine =
-            corpus.sessions.length === 0
+            corpus.sessions.length === 0 || latest === undefined
               ? `session entropy (observed): no fabric_exec traces in the latest ${files.length} project sessions`
-              : `session entropy (observed): ${corpus.sessions.length} sessions measured · latest ${latest?.totals.operations ?? 0} ops · score ${format(latest?.score ?? 0)} · slope ${format(corpus.trend.slopePerStep)}/session`;
+              : `session entropy (observed): ${corpus.sessions.length} sessions · latest ${latest.totals.operations} ops · behavioral ${format(latest.behavioralScore)} + surface ${format(latest.staticScore)} = ${format(latest.behavioralScore + latest.staticScore)} · slope ${format(corpus.trend.slopePerStep)}/session · ${
+                  latest.totals.invocationRejectionsPer1k === 0 && corpus.trend.slopePerStep <= 0
+                    ? "ratchet holding"
+                    : "ratchet slipping"
+                }`;
           context.ui.notify(
             [
               `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
               `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
               `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
-              "export: /fabric entropy export <path>   # snapshot the live surface",
+              "export: /fabric entropy export [path]   # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
             ].join("\n"),
             "info",
           );

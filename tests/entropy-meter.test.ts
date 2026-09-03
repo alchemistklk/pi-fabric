@@ -207,6 +207,8 @@ describe("measureEntropy", () => {
     expect(report.flowEntropyBits).toBe(0);
     expect(report.totals.succeeded).toBe(4);
     expect(report.totals.actionOperations).toBe(4);
+    expect(report.staticScore).toBe(0.21875);
+    expect(report.behavioralScore).toBe(0);
   });
 
   it("computes every wobble species exactly", () => {
@@ -222,6 +224,8 @@ describe("measureEntropy", () => {
     expect(report.totals.operations).toBe(14);
     expect(report.totals.discoveryOperations).toBe(1);
     expect(report.totals.workflowOperations).toBe(1);
+    expect(report.staticScore).toBe(0);
+    expect(report.behavioralScore).toBe(report.score);
   });
 
   it("sorts refs by score descending", () => {

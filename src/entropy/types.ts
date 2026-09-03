@@ -109,6 +109,10 @@ export interface EntropyReport {
   flowEntropyBits: number;
   lexiconRows: number;
   staticFreedom: number;
+  /** Surface share of the score: static freedom of the refs the corpus used. */
+  staticScore: number;
+  /** Everything models exercised: wobble, churn, rejections, navigation, flow, lexicon. */
+  behavioralScore: number;
   score: number;
   refs: EntropyRefReport[];
 }

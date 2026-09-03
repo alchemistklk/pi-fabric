@@ -416,6 +416,20 @@ export const runEntropyCertification = async (options = {}) => {
     `round-2 proposals ${roundTwo.map((proposal) => proposal.kind).join(",")}`,
   );
 
+  // Score decomposition: the surface share prices the potential the corpus
+  // used; everything else is freedom models exercised.
+  check(
+    "score-decomposition",
+    converged.staticScore === 0.21875 &&
+      converged.behavioralScore === 0 &&
+      wobble.staticScore === 0 &&
+      wobble.behavioralScore === wobble.score &&
+      before.staticScore === 0.046875 &&
+      before.behavioralScore === 0.28656 &&
+      Math.abs(before.staticScore + before.behavioralScore - before.score) < 1e-6,
+    `static ${before.staticScore} + behavioral ${before.behavioralScore} vs score ${before.score}`,
+  );
+
   // Structure proposals: sequence fusion and overload splitting.
   const structureReport = measureEntropy({ traces: structureTraces() });
   const structureProposals = proposeEntropyReductions({

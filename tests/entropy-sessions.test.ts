@@ -125,6 +125,8 @@ describe("measureSessionCorpus", () => {
     expect(result.latest?.catalogDigest).toBe("deadbeef");
     expect(result.latest?.staticFreedom).toBe(1.5);
     expect(result.latest?.score).toBe(0.375);
+    expect(result.latest?.staticScore).toBe(0.375);
+    expect(result.latest?.behavioralScore).toBe(0);
   });
 
   it("handles an empty corpus", () => {

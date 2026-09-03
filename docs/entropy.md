@@ -47,7 +47,10 @@ report with per-ref and global terms, all rounded to 1e-6:
 
 The global `score` is `(Σ per-ref scores + navigation + flow) / max(1,
 succeeded action operations)`. Lower is better; the compiler's contract is
-that it never increases.
+that it never increases. The report decomposes it into `staticScore` (the
+surface share: static freedom of the refs the corpus used) and
+`behavioralScore` (everything models exercised: wobble, churn, rejections,
+navigation, flow, lexicon tax).
 
 Additional totals: `invocationRejections` counts failures at `resolve`,
 `prepare`, or `validate`: the offline residue class behind repair
@@ -66,6 +69,24 @@ the surface converges, and it spikes when a new model or tool arrives.
   `additionalProperties !== false` adds 0.5, free-form objects score 1.0.
   Computable with an empty corpus, which is what lets the compiler score
   candidate surfaces before deployment.
+
+### What good means
+
+- **Behavioral entropy → 0.** The bits of freedom models exercised, per
+  successful call. Zero means no call in the corpus needed correcting. This
+  is the primary target and the general form of the repairs KPI (repeat
+  invocation fingerprints → 0).
+- **Surface share shrinks by compilation, never by behavior.** It is the
+  priced potential of the refs the corpus used. It falls only when
+  a compiled surface (enum-tighten, renames, splits, quarantines) removes
+  real freedom; track it across surface releases, bounded by function.
+- **Slope ≤ 0.** The per-session least-squares slope is the ratchet line:
+  flat means the surface converged, negative means it is compiling down,
+  positive means something regressed (a new model, a new tool, or a schema
+  change).
+- `/fabric entropy` prints `ratchet holding` when the latest session logged
+  zero invocation rejections and the slope is at or below zero, and
+  `ratchet slipping` otherwise.
 
 ## Proposals
 
@@ -120,7 +141,7 @@ is the only one that changes runtime behavior.
 
 ```text
 /fabric entropy                     # live surface freedom + observed session entropy trend
-/fabric entropy export <path>       # write the live surface snapshot as JSON
+/fabric entropy export [path]      # write the live surface snapshot (default <agent dir>/fabric/entropy/surface.json)
 ```
 
 Repo-side only (development and CI; these scripts are not part of the
@@ -133,8 +154,9 @@ bun run certify:entropy --sessions <dir> --surface <snap>   # measure an arbitra
 
 `/fabric entropy` measures on demand: the newest project sessions are read
 from the session logs, measured against the live surface, and the trend is
-the per-session slope. `/fabric entropy export <path>` snapshots the live
-registry through the discovery path (read-only, authorization-free) as
+the per-session slope. `/fabric entropy export [path]` snapshots the live
+registry through the discovery path (read-only, authorization-free), defaulting
+to `<agent dir>/fabric/entropy/surface.json` beside the repair table, as
 `{ version: 1, actions: [{ ref, inputSchema }] }`, sorted by ref so it
 hashes stably. Pass an exported snapshot with `--surface` to measure a
 copied corpus against the surface it ran on; the report then carries the

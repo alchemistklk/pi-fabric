@@ -312,6 +312,10 @@ describe("evaluateGate", () => {
     const gate = evaluateGate(before, after);
     expect(gate.passed).toBe(true);
     expect(gate.delta).toBe(-0.153646);
+    expect(before.staticScore).toBe(0.046875);
+    expect(before.behavioralScore).toBe(0.28656);
+    expect(after.staticScore).toBe(0.018229);
+    expect(after.behavioralScore).toBe(0.16156);
     const regress = evaluateGate(after, before);
     expect(regress.passed).toBe(false);
     expect(regress.reasons[0]).toContain("score increased");

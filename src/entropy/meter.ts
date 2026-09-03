@@ -154,6 +154,7 @@ export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
   const refEntries = [...refs.entries()].sort(([left], [right]) => compareCodeUnits(left, right));
   const refReports: EntropyRefReport[] = [];
   let staticFreedomTotal = 0;
+  let staticWeighted = 0;
   let shapeWeighted = 0;
   let failureStageWeighted = 0;
   let scoreSum = 0;
@@ -166,6 +167,7 @@ export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
       ? staticFreedomFromSchema(surfaceByRef.get(ref))
       : 0;
     staticFreedomTotal += staticFreedom;
+    staticWeighted += ENTROPY_WEIGHTS.staticFreedom * staticFreedom;
     shapeWeighted += shapeEntropyBits * acc.calls;
     failureStageWeighted += failureStageEntropyBits * acc.failed;
     const score = roundMetric(
@@ -221,6 +223,12 @@ export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
       ENTROPY_WEIGHTS.flow * flowEntropyBits) /
       Math.max(1, totals.succeeded),
   );
+  // Decomposition: the surface share prices the potential the corpus used;
+  // everything else is freedom models actually exercised. Good is
+  // behavioralScore → 0 with staticScore shrinking only through compiled
+  // surface changes.
+  const staticScore = roundMetric(staticWeighted / Math.max(1, totals.succeeded));
+  const behavioralScore = roundMetric(score - staticScore);
 
   const sortedRefs = [...refReports].sort(
     (left, right) => right.score - left.score || compareCodeUnits(left.ref, right.ref),
@@ -238,6 +246,8 @@ export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
     flowEntropyBits,
     lexiconRows,
     staticFreedom: roundMetric(staticFreedomTotal),
+    staticScore,
+    behavioralScore,
     score,
     refs: sortedRefs,
   };
