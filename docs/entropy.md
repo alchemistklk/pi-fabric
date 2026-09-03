@@ -130,11 +130,52 @@ sequence-fuse author new composite definitions, so they stay review-only.
 ## The gate (ratchet)
 
 `evaluateGate(before, after)` passes only when the compiled surface does not
-increase the score and preserves every successful call. The compile step is
-measure → propose → apply → re-measure → gate; a gate failure rejects the
-diff. Monotonicity is measured, never argued. A converged surface stops
-proposing, which the certification proves by requiring an empty second
-round.
+increase the score. `compileEntropySurface` adds the second half of the
+contract: replay preservation. Every successful call to a ref the compile
+touched must still parse against the candidate surface, checked with the
+same TypeBox validation the registry's validate stage runs. The compile step
+is measure → propose → apply → re-measure → gate; a gate failure keeps the
+old surface and records the rejection. Monotonicity and preservation are
+measured, never argued. A converged surface stops proposing, which the
+certification proves by requiring an empty second round.
+
+The autonomous loop applies only the mechanically safe kinds
+(`enum-tighten` and `noise-quarantine`). `overload-split` and `sequence-fuse`
+author new composite definitions, and a pure `modal-rename` drops the
+declared key that every successful call recorded, so all three stay
+surfaced for review and never auto-apply.
+
+## The compile loop
+
+The reducer is autonomous, mirroring the repair loop: no command, no
+approval, machine-checked bounds replace review. Every turn that invoked
+`fabric_exec` may have produced new action evidence, so at `turn_end` the
+compiler reads the live session window, snapshots the live surface through
+the discovery path, and runs measure → propose → apply → gate against it.
+The compile is fire-and-forget (the next prompt never waits on it), and a
+session shutdown flushes a final compile while the window is richest.
+
+A passing compile persists the compiled surface to
+`<agent dir>/fabric/entropy/compiled.json` beside the repair table: overlay
+entries and quarantines, the applied-proposal ledger, the gate record, and
+the evidence digest. The artifact is clock-free, so identical evidence
+compiles to identical bytes and saving them is a no-op. The runtime loads it
+at session start and enforces it live:
+
+- the compiled schema overlays the declared schema at the registry's prepare
+  and validate stages, so enum-tightened parameters reject off-modal
+  values;
+- quarantined refs resolve as unknown actions and disappear from the
+  model-facing catalog, exactly like retired actions;
+- every consult re-proves the recorded base digest against the live declared
+  schema, so a surface that changed underneath a compile drops its overlay
+  and never mis-enforces.
+
+Failure modes stay visible, never silent: a gate rejection keeps the old
+surface and notifies once per distinct reason set; a damaged
+`compiled.json` surfaces in `/fabric entropy`, blocks compiles from
+overwriting it, and keeps enforcement off. `entropy.compile: false` in the
+Fabric config disables the loop and the enforcement entirely.
 
 ## On-demand measurement
 
@@ -144,8 +185,9 @@ by mtime), measures each against the live surface snapshot, and reports the
 latest session's score plus the least-squares slope across the window's
 session scores (`trendFromScores`). Lines without a trace envelope are
 skipped by a cheap substring filter before parsing, so large logs stay
-fast. The repair table remains the only durable derived artifact because it
-is the only one that changes runtime behavior.
+fast. The repair table and the compiled entropy surface remain the only durable
+derived artifacts because they are the only ones that change runtime
+behavior.
 
 ## Commands and certification
 
@@ -163,8 +205,10 @@ bun run certify:entropy --sessions <dir> --surface <snap>   # measure an arbitra
 ```
 
 `/fabric entropy` measures on demand: the newest project sessions are read
-from the session logs, measured against the live surface, and the trend is
-the per-session slope. `/fabric entropy export [path]` snapshots the live
+from the session logs, measured against the effective surface (live plus
+the compiled overlay), and the trend is the per-session slope; the display
+carries a `compiled:` line with the artifact's applied proposals and last
+gate outcome. `/fabric entropy export [path]` snapshots the live
 registry through the discovery path (read-only, authorization-free), defaulting
 to `<agent dir>/fabric/entropy/surface.json` beside the repair table, as
 `{ version: 1, actions: [{ ref, inputSchema }] }`, sorted by ref so it
@@ -174,7 +218,8 @@ surface hash as its catalog digest, so scores compare like against like.
 
 The certification harness exits nonzero on any failed check, mirroring
 `certify:context`: determinism (double-run hash equality), exact metric math
-on fixed corpora, the full ratchet loop with convergence, surface-apply
+on fixed corpora, the full ratchet loop with convergence, the compile loop
+with a gate-rejected round and a converged second pass, surface-apply
 purity, synthetic session-JSONL ingestion, and audit-derived value
 observations. The `Entropy` GitHub workflow runs the certification on every
 push to `main` and weekly, uploading the JSON report as an artifact; a red
@@ -209,3 +254,6 @@ commit.
 - The on-demand trend covers the newest project sessions only (mtime
   ordered): sessions the user prunes leave the trend, and the slope is only
   as strong as the window.
+- The compile trigger is per-turn, so evidence that aged out of the window
+  stops proposing; the compiled artifact keeps its own provenance and stays
+  enforced until the live schema beneath it changes.

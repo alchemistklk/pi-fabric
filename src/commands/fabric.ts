@@ -26,6 +26,8 @@ import {
   surfaceFreedomReport,
 } from "../entropy/surface.js";
 import { measureSessionCorpus, projectSessionFiles } from "../entropy/sessions.js";
+import { applyCompiledSurface } from "../entropy/compiled-surface.js";
+import { loadCompiledSurface } from "../entropy/compiled-store.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -888,11 +890,15 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         }
         try {
           const status = state.repairs.status();
-          const snapshot = await liveSurfaceSnapshot({
+          const loadedCompiled = loadCompiledSurface(resolveAgentDir());
+          const live = await liveSurfaceSnapshot({
             registry: state.registry,
             extensionContext: context,
             cwd: state.cwd ?? context.cwd,
           });
+          const snapshot = loadedCompiled.file
+            ? applyCompiledSurface(live, loadedCompiled.file)
+            : live;
           const freedom = surfaceFreedomReport(snapshot);
           const surfaceDigest = entropySurfaceHash(snapshot);
           const files = projectSessionFiles(resolveAgentDir(), state.cwd ?? context.cwd);
@@ -925,10 +931,16 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
                   )
                   .join(" · ")}`
               : undefined;
+          const compiledLine = loadedCompiled.error
+            ? `compiled: unavailable — ${loadedCompiled.error}`
+            : loadedCompiled.file
+              ? `compiled: v${loadedCompiled.file.metricVersion} · ${loadedCompiled.file.actions.length} tightened · ${loadedCompiled.file.quarantined.length} quarantined · ${loadedCompiled.file.applied.length} applied · gate ${loadedCompiled.file.gate.passed ? "pass" : "REJECTED"} (${format(loadedCompiled.file.gate.beforeScore)} → ${format(loadedCompiled.file.gate.afterScore)})`
+              : "compiled: none";
           context.ui.notify(
             [
               `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
               `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
+              compiledLine,
               `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
               ...(modelsLine ? [modelsLine] : []),

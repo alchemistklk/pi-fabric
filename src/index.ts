@@ -12,6 +12,17 @@ import { registerFabricActorHostEventObservers } from "./actors/host-event-obser
 import { CapturedToolCatalog } from "./capture/catalog.js";
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
+import { resolveAgentDir } from "./core/agent-dir.js";
+import {
+  AUTO_APPLY_PROPOSAL_KINDS,
+  compileEntropySurface,
+  entropyRepairRows,
+  liveSurfaceSnapshot,
+  loadCompiledSurface,
+  projectSessionFiles,
+  saveCompiledSurface,
+  sessionWindowEvidence,
+} from "./entropy/index.js";
 import {
   filterPrewalkContinuationMessages,
   settleInPlacePrewalk,
@@ -366,6 +377,94 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     installHaltOnEscape(context);
   }, cleanupActivationSideEffects);
 
+  // Continual entropy reduction: the compiler runs measure → propose → apply
+  // → gate against the live session window at every turn boundary that
+  // produced new action evidence, then persists the compiled surface beside
+  // the repair table. Compiles never fail the session; a gate rejection
+  // keeps the old surface and is surfaced once per distinct reason set.
+  let entropyEvidenceThisTurn = false;
+  let entropyCompileInFlight = false;
+  let entropyCompilePending = false;
+  let entropyLastRejection = "";
+
+  const compileEntropyNow = async (context: ExtensionContext): Promise<void> => {
+    if (!state.initialized || !state.config.entropy.compile) return;
+    const agentDir = resolveAgentDir();
+    const cwd = state.cwd ?? context.cwd;
+    const files = projectSessionFiles(agentDir, cwd);
+    if (files.length === 0) return;
+    const loaded = loadCompiledSurface(agentDir);
+    // Damage surfaces in /fabric entropy and blocks compiles; never overwrite.
+    if (loaded.error) return;
+    const evidence = sessionWindowEvidence(files);
+    if (evidence.traces.length === 0) return;
+    const snapshot = await liveSurfaceSnapshot({
+      registry: state.registry,
+      extensionContext: context,
+      cwd,
+    });
+    const outcome = compileEntropySurface({
+      traces: evidence.traces,
+      surface: snapshot,
+      repairs: entropyRepairRows(state.repairs.repairs),
+      valueObservations: evidence.valueObservations,
+      ...(loaded.file ? { artifact: loaded.file } : {}),
+    });
+    if (outcome.status === "compiled" && outcome.artifact) {
+      const saved = saveCompiledSurface(agentDir, outcome.artifact);
+      if (saved.written) {
+        const applied = outcome.proposals
+          .filter((proposal) =>
+            (AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
+          )
+          .map((proposal) => proposal.kind);
+        const before = outcome.report.score.toFixed(2);
+        const after = (outcome.after?.score ?? outcome.report.score).toFixed(2);
+        context.ui.notify(
+          `entropy: compiled surface · ${applied.join(" · ")} · gate pass (${before} → ${after})`,
+          "info",
+        );
+      }
+    } else if (outcome.status === "rejected" && outcome.gate) {
+      const key = outcome.gate.reasons.join(";");
+      if (key !== entropyLastRejection) {
+        entropyLastRejection = key;
+        context.ui.notify(
+          `entropy: compile rejected — surface unchanged (${outcome.gate.reasons[0] ?? "gate"})`,
+          "warning",
+        );
+      }
+    }
+  };
+
+  const scheduleEntropyCompile = (context: ExtensionContext): void => {
+    if (entropyCompileInFlight) {
+      entropyCompilePending = true;
+      return;
+    }
+    entropyCompileInFlight = true;
+    void (async () => {
+      try {
+        // Let Pi finish persisting the turn's tool results before the
+        // window scan reads them.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await compileEntropyNow(context);
+      } catch (error) {
+        console.warn(
+          `[pi-fabric] entropy compile failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      } finally {
+        entropyCompileInFlight = false;
+        if (entropyCompilePending) {
+          entropyCompilePending = false;
+          scheduleEntropyCompile(context);
+        }
+      }
+    })();
+  };
+
   pi.on("session_start", async (_event, context) => {
     pendingHandoffs.clear();
     directToolApproval.clear();
@@ -424,6 +523,13 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     // the program never executed (type errors, aborts).
     if (state.initialized) state.resetSpeculation();
     if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
+    // The entropy compiler runs as hot as the evidence allows: a turn that
+    // invoked fabric_exec may have produced new action operations. The
+    // compile is fire-and-forget, so the next prompt never waits on it.
+    if (entropyEvidenceThisTurn) {
+      entropyEvidenceThisTurn = false;
+      scheduleEntropyCompile(context);
+    }
   });
 
   pi.on("agent_settled", async (event, context) => {
@@ -563,6 +669,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
 
   pi.on("tool_execution_end", async (event, context) => {
     if (!state.initialized) return;
+    if (event.toolName === "fabric_exec") entropyEvidenceThisTurn = true;
     state.noteMainActivity(context);
     if (event.isError) {
       const classified = classifyToolResult({
@@ -747,7 +854,17 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     state.dispatchHostEvent(eventName, event, context);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, context) => {
+    // Flush the final compile while the runtime is still initialized; it
+    // never blocks shutdown and the window is at its richest right here.
+    if (entropyEvidenceThisTurn) {
+      entropyEvidenceThisTurn = false;
+      try {
+        await compileEntropyNow(context);
+      } catch {
+        // Compiles never fail the session.
+      }
+    }
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
     pendingHandoffs.clear();

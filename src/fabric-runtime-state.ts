@@ -52,6 +52,11 @@ import {
   clearActiveRepairCompiler,
   setActiveRepairCompiler,
 } from "./repairs/active.js";
+import { loadCompiledSurface } from "./entropy/compiled-store.js";
+import {
+  clearActiveCompiledSurface,
+  setActiveCompiledSurface,
+} from "./entropy/active.js";
 import {
   isSpeculationEligible,
   mcpAllowlistMatch,
@@ -958,6 +963,13 @@ export class FabricRuntimeState {
     // committed yet must never persist under a mid-reconcile catalog.
     this.#refreshRepairCatalog();
     setActiveRepairCompiler(this.#repairs);
+    // The compiled entropy surface loads beside the repair table: every
+    // enforcement consult re-proves the recorded base digest against the
+    // live declared schema, so the overlay follows the live surface. A
+    // damaged artifact keeps enforcement off and surfaces in /fabric entropy.
+    setActiveCompiledSurface(
+      this.#config.entropy.compile ? loadCompiledSurface(resolveAgentDir()).file : undefined,
+    );
   }
 
   async ensure(context: ExtensionContext): Promise<void> {
@@ -1227,6 +1239,7 @@ export class FabricRuntimeState {
   async shutdown(): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
     this.#deactivateRepairs();
+    clearActiveCompiledSurface();
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();
     await Promise.allSettled([...this.#componentTransitionPublications]);

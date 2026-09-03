@@ -1,20 +1,26 @@
 // On-demand session measurement. Session JSONL is the source of truth, so
 // entropy is never recorded: the newest project sessions are read live,
 // measured against the current surface, and the trend is the per-session
-// slope. The repair table stays the only durable derived artifact because
-// it is the only one that changes runtime behavior.
+// slope. The repair table and the compiled entropy surface are the only
+// durable derived artifacts, because they are the only ones that change
+// runtime behavior.
 
 import fs from "node:fs";
 import path from "node:path";
 import { sessionDirForCwd } from "../memory/discovery.js";
-import { entropyTracesFromSessionJsonl } from "./corpus.js";
+import {
+  entropyTracesFromSessionJsonl,
+  entropyValueObservationsFromSessionJsonl,
+} from "./corpus.js";
 import { measureEntropy } from "./meter.js";
 import { compareCodeUnits, trendFromScores } from "./fingerprint.js";
 import type {
   EntropyModelReport,
   EntropyReport,
   EntropySurfaceSnapshot,
+  EntropyTraceInput,
   EntropyTrend,
+  EntropyValueObservation,
 } from "./types.js";
 
 const DEFAULT_SESSION_WINDOW = 8;
@@ -128,4 +134,31 @@ export const measureSessionCorpus = (input: {
     trend: trendFromScores(chronological.map((session) => session.report.score)),
     models,
   };
+};
+
+// One read per file yields both meter traces and the verbatim audit value
+// corpus, so the autonomous compile and the command share a single window
+// scan.
+export interface SessionWindowEvidence {
+  traces: EntropyTraceInput[];
+  valueObservations: EntropyValueObservation[];
+}
+
+export const sessionWindowEvidence = (
+  files: readonly string[],
+): SessionWindowEvidence => {
+  const traces: EntropyTraceInput[] = [];
+  const valueObservations: EntropyValueObservation[] = [];
+  for (const file of files) {
+    let text: string;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = text.split("\n");
+    traces.push(...entropyTracesFromSessionJsonl(lines));
+    valueObservations.push(...entropyValueObservationsFromSessionJsonl(lines));
+  }
+  return { traces, valueObservations };
 };

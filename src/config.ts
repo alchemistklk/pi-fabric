@@ -227,6 +227,10 @@ interface FabricRepairsConfig {
   enabled: boolean;
 }
 
+interface FabricEntropyConfig {
+  compile: boolean;
+}
+
 export interface FabricMemoryConfig {
   enabled: boolean;
   indexDir?: string;
@@ -288,6 +292,7 @@ export interface FabricConfig {
   retention: FabricRetentionConfig;
   mesh: FabricMeshConfig;
   memory: FabricMemoryConfig;
+  entropy: FabricEntropyConfig;
   repairs: FabricRepairsConfig;
   schema: FabricSchemaConfig;
   speculation: FabricSpeculationConfig;
@@ -440,6 +445,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     regexMaxHaystackTerms: 20_000,
     regexMaxHaystackBytes: 2 * 1024 * 1024,
     regexTimeoutMs: 250,
+  },
+  entropy: {
+    compile: true,
   },
   repairs: {
     enabled: true,
@@ -632,6 +640,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const retention = objectValue(input.retention);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
+  const entropy = objectValue(input.entropy);
   const repairs = objectValue(input.repairs);
   const modelsSection = objectValue(input.models);
   const schema = objectValue(input.schema);
@@ -1114,6 +1123,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         10,
         10_000,
       ),
+    },
+    entropy: {
+      compile: booleanValue(entropy.compile, DEFAULT_FABRIC_CONFIG.entropy.compile),
     },
     repairs: {
       enabled: booleanValue(repairs.enabled, DEFAULT_FABRIC_CONFIG.repairs.enabled),

@@ -13,6 +13,8 @@ import type {
 } from "../src/protocol.js";
 import { setActiveRepairCompiler } from "../src/repairs/active.js";
 import { RepairCompiler } from "../src/repairs/compiler.js";
+import { setActiveCompiledSurface } from "../src/entropy/active.js";
+import { schemaDigest, type CompiledSurfaceFile } from "../src/entropy/index.js";
 
 const provider = (): FabricProvider => ({
   name: "demo",
@@ -754,5 +756,84 @@ describe("ActionRegistry", () => {
     });
     await acquired.dispose();
     expect(dispose).toHaveBeenCalledOnce();
+  });
+});
+
+const liveEchoSchema = () => ({
+  type: "object",
+  properties: { value: { type: "string" } },
+  required: ["value"],
+  additionalProperties: false,
+});
+
+const overlayArtifact = (baseSchema: unknown): CompiledSurfaceFile => ({
+  version: 1,
+  metricVersion: 2,
+  actions: [
+    {
+      ref: "demo.echo",
+      inputSchema: {
+        type: "object",
+        properties: { value: { type: "string", enum: ["alpha", "beta"] } },
+        required: ["value"],
+        additionalProperties: false,
+      },
+      baseSchemaDigest: schemaDigest(baseSchema),
+    },
+  ],
+  quarantined: [],
+  applied: [
+    { kind: "enum-tighten", ref: "demo.echo", detail: "value: 2 observed values" },
+  ],
+  gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+  evidenceDigest: "test",
+});
+
+describe("compiled entropy surface enforcement", () => {
+  afterEach(() => {
+    setActiveCompiledSurface(undefined);
+  });
+
+  it("enforces the compiled enum at the validate stage", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    await registry.invoke("demo.echo", { value: "free-form" }, invokeContext());
+    setActiveCompiledSurface(overlayArtifact(liveEchoSchema()));
+    await registry.invoke("demo.echo", { value: "alpha" }, invokeContext());
+    await expect(
+      registry.invoke("demo.echo", { value: "off-modal" }, invokeContext()),
+    ).rejects.toThrow(/Invalid arguments for demo\.echo/);
+  });
+
+  it("drops the overlay when the live schema changed underneath the compile", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    setActiveCompiledSurface(
+      overlayArtifact({ type: "object", properties: { other: { type: "string" } } }),
+    );
+    await registry.invoke("demo.echo", { value: "still free" }, invokeContext());
+  });
+
+  it("hides quarantined refs from the catalog and denies resolution", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    expect((await registry.list({ limit: 10 }, context)).map((a) => a.ref)).toEqual([
+      "demo.echo",
+    ]);
+    setActiveCompiledSurface({
+      version: 1,
+      metricVersion: 2,
+      actions: [],
+      quarantined: [{ ref: "demo.echo", baseSchemaDigest: schemaDigest(liveEchoSchema()) }],
+      applied: [
+        { kind: "noise-quarantine", ref: "demo.echo", detail: "2 failed vs 1 succeeded" },
+      ],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    expect(await registry.list({ limit: 10 }, context)).toEqual([]);
+    await expect(
+      registry.invoke("demo.echo", { value: "x" }, invokeContext()),
+    ).rejects.toThrow(/demo\.echo/);
   });
 });

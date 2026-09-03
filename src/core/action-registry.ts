@@ -38,6 +38,11 @@ import {
   applyActiveArgRepairs,
   getActiveRepairCompiler,
 } from "../repairs/active.js";
+import {
+  activeQuarantinedRefNames,
+  effectiveInputSchema,
+  isActiveQuarantine,
+} from "../entropy/active.js";
 import { formatFabricEffectConflict } from "./effect-conflict.js";
 import { stableJsonHash } from "./stable-hash.js";
 import type {
@@ -580,6 +585,7 @@ export class ActionRegistry {
     if (context.capabilityView) {
       const refs = Object.keys(context.capabilityView.bindings)
         .filter((ref) => !request.provider || ref.startsWith(`${request.provider}.`))
+        .filter((ref) => !activeQuarantinedRefNames().has(ref))
         .sort();
       const actions = await Promise.all(refs.map((ref) => this.describe(ref, context)));
       const query = request.query?.normalize("NFKC").trim().toLowerCase();
@@ -596,7 +602,12 @@ export class ActionRegistry {
     const lists = await Promise.all(
       providers.map(async (provider) => {
         const descriptors = await provider.list(request, context);
-        return descriptors.map((descriptor) => resolveDescriptor(provider, descriptor));
+        return descriptors
+          .filter(
+            (descriptor) =>
+              !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
+          )
+          .map((descriptor) => resolveDescriptor(provider, descriptor));
       }),
     );
     const limit = Math.max(1, Math.min(request.limit ?? 100, 1_000));
@@ -630,6 +641,10 @@ export class ActionRegistry {
         actions: context.capabilityView
           ? await this.list({ provider: provider.name, limit: 1_000 }, context)
           : (await provider.list({}, context))
+              .filter(
+                (descriptor) =>
+                  !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
+              )
               .map((descriptor) => resolveDescriptor(provider, descriptor)),
       })),
     );
@@ -845,7 +860,11 @@ export class ActionRegistry {
       if (!provider.acquire) {
         throw new Error(`Fabric provider does not implement scoped acquisition: ${provider.name}`);
       }
-      const catalogInput = repairCatalogInput(action.ref, action.inputSchema, args);
+      const effectiveSchema = effectiveInputSchema(
+        action.ref,
+        action.inputSchema,
+      ) as Record<string, unknown>;
+      const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
             provider.prepareArguments!(providerActionName, catalogInput.args, context),
@@ -856,7 +875,7 @@ export class ActionRegistry {
       }
       const catalog = validateCatalogArgs(
         action.ref,
-        action.inputSchema,
+        effectiveSchema,
         preparedArgs,
         catalogInput.observedUnexpected,
       );
@@ -931,7 +950,11 @@ export class ActionRegistry {
       }
 
       failureStage = "prepare";
-      const catalogInput = repairCatalogInput(action.ref, action.inputSchema, args);
+      const effectiveSchema = effectiveInputSchema(
+        action.ref,
+        action.inputSchema,
+      ) as Record<string, unknown>;
+      const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
             provider.prepareArguments!(providerActionName, catalogInput.args, context),
@@ -944,7 +967,7 @@ export class ActionRegistry {
       failureStage = "validate";
       const catalog = validateCatalogArgs(
         action.ref,
-        action.inputSchema,
+        effectiveSchema,
         preparedArgs,
         catalogInput.observedUnexpected,
       );
@@ -1362,14 +1385,19 @@ export class ActionRegistry {
     const descriptor = await runAbortable(context.signal, () =>
       provider.describe(actionName, context),
     );
-    if (descriptor) {
+    // A quarantined ref resolves as unknown: the model-facing catalog never
+    // shows it, and a direct call gets the standard not-found message with
+    // suggestions, exactly like any retired action.
+    if (descriptor && !isActiveQuarantine(provider.name, actionName, descriptor.inputSchema)) {
       return {
         action: resolveDescriptor(provider, descriptor),
         suggestions: [],
       };
     }
     if (!allowRepair) return { suggestions: [] };
-    const declared = await this.#declaredActionNames(provider, context);
+    const declared = (await this.#declaredActionNames(provider, context)).filter(
+      (name) => !activeQuarantinedRefNames().has(`${provider.name}.${name}`),
+    );
     const catalogName = applyActiveActionName(provider.name, actionName, declared);
     if (catalogName !== actionName) {
       const catalogDescriptor = await runAbortable(context.signal, () =>

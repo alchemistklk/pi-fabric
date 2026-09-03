@@ -6,6 +6,7 @@ import {
   entropyTracesFromSessionJsonl,
   measureSessionCorpus,
   projectSessionFiles,
+  sessionWindowEvidence,
   trendFromScores,
   type EntropySurfaceSnapshot,
 } from "../src/entropy/index.js";
@@ -249,5 +250,29 @@ describe("per-model session attribution", () => {
       slopePerSession: 0.5,
       latestRejectionsPer1k: 0,
     });
+  });
+
+  it("merges window traces in one read, newest first", () => {
+    const agentDir = makeTempDir();
+    const dir = path.join(agentDir, "sessions", encodeCwdDir("/repo"));
+    fs.mkdirSync(dir, { recursive: true });
+    const write = (name: string, mtime: Date, content: string): void => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `${content}\n`);
+      fs.utimesSync(file, mtime, mtime);
+    };
+    write(
+      "old.jsonl",
+      new Date(2020, 0, 1),
+      [assistantLine("a1", "p", "alpha"), toolResultLine("t1", traceEnvelope("pi.read", { path: "a" }))].join("\n"),
+    );
+    write("new.jsonl", new Date(2021, 0, 1), [toolResultLine("t2", wobbleEnvelope)].join("\n"));
+    const evidence = sessionWindowEvidence(projectSessionFiles(agentDir, "/repo"));
+    expect(evidence.traces).toHaveLength(2);
+    expect(evidence.traces.map((trace) => trace.model)).toEqual([undefined, "p/alpha"]);
+    expect(evidence.traces.map((trace) => trace.operations[0]?.ref)).toEqual([
+      "pi.read",
+      "pi.read",
+    ]);
   });
 });

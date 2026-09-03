@@ -436,6 +436,16 @@ describe("Fabric configuration", () => {
     });
   });
 
+  it("enables entropy compilation by default and accepts an explicit disable", () => {
+    expect(DEFAULT_FABRIC_CONFIG.entropy).toEqual({ compile: true });
+    expect(normalizeFabricConfig({ entropy: { compile: false } }).entropy).toEqual({
+      compile: false,
+    });
+    expect(normalizeFabricConfig({ entropy: { compile: "no" } }).entropy).toEqual({
+      compile: true,
+    });
+  });
+
   it("normalizes strict Schema mode, transaction bounds, and trusted command definitions", () => {
     const config = normalizeFabricConfig({
       schema: {
