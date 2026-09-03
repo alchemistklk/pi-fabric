@@ -608,7 +608,7 @@ class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request);
+        const actor = await this.actors.create(command.request, { asRegistryOwner: true });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

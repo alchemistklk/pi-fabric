@@ -25,6 +25,8 @@ import type {
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
+import { RESIDENT_HOST_FORMAT, residentRoot } from "../src/residency/protocol.js";
+import type { ResidencyClient } from "../src/residency/client.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
@@ -169,7 +171,20 @@ const setup = (
     undefined,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
   );
-  return { root, actors, agents, globalActors, provider, mainDeliveries };
+  return {
+    root,
+    mesh,
+    identity,
+    mainAgent,
+    participants,
+    control,
+    lifecycle,
+    actors,
+    agents,
+    globalActors,
+    provider,
+    mainDeliveries,
+  };
 };
 
 afterEach(async () => {
@@ -357,6 +372,119 @@ describe("AgentsProvider runner support", () => {
       ),
     ).rejects.toThrow("trusted project");
     expect(actors.list()).toEqual([]);
+  });
+
+  it("routes a durable create through the resident host when the local registry is already owned", async () => {
+    const state = setup();
+    const rootId = state.identity.id;
+    const meshRoot = state.mesh.root;
+    // Simulate the transferred registry: a live foreign actor over the shared
+    // registry makes the local manager's create guard throw.
+    const peerIdentity: MeshIdentity = {
+      id: "session:foreign-owner",
+      name: "main",
+      kind: "main",
+      sessionId: "foreign-owner",
+    };
+    const peer = new ActorManager(
+      "foreign-owner",
+      peerIdentity,
+      state.mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
+      state.agents,
+      () => {},
+      {
+        actorRoot: path.join(state.root, "actors"),
+        persistent: true,
+        claimResidency: "session",
+        rootId: peerIdentity.id,
+      },
+    );
+    actorManagers.push(peer);
+    const foreign = await peer.create({
+      name: "first-durable",
+      instructions: "Ceded to the resident host.",
+      residency: "durable",
+    });
+    // A manager that sees every live actor as owned by another host, like
+    // Main after the registry transferred to the resident host.
+    const guardedActors = new ActorManager(
+      "guarded-main",
+      state.identity,
+      state.mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
+      state.agents,
+      () => {},
+      {
+        actorRoot: path.join(state.root, "actors"),
+        persistent: true,
+        claimResidency: "session",
+        rootId: state.identity.id,
+        canManageActor: () => false,
+      },
+    );
+    actorManagers.push(guardedActors);
+    await waitFor(() => guardedActors.list().some((entry) => entry.id === foreign.id));
+
+    // Fake resident host over the real file protocol.
+    const hostDir = residentRoot(meshRoot, rootId);
+    fs.mkdirSync(path.join(hostDir, "responses"), { recursive: true });
+    fs.writeFileSync(path.join(hostDir, "owner.json"), JSON.stringify({ pid: process.pid }));
+    const seen: Array<{ operation?: string; requestId: string }> = [];
+    const poller = setInterval(() => {
+      for (const file of fs.readdirSync(path.join(hostDir, "requests"))) {
+        if (!file.endsWith(".json")) continue;
+        const command = JSON.parse(
+          fs.readFileSync(path.join(hostDir, "requests", file), "utf8"),
+        ) as { operation?: string; requestId: string };
+        if (seen.some((item) => item.requestId === command.requestId)) continue;
+        seen.push(command);
+        fs.writeFileSync(
+          path.join(hostDir, "responses", file),
+          JSON.stringify({
+            format: RESIDENT_HOST_FORMAT,
+            requestId: command.requestId,
+            ok: true,
+            actor: { id: "resident-actor-1", name: "second-durable", status: "idle" },
+            completedAt: Date.now(),
+          }),
+        );
+      }
+    }, 25);
+
+    const residency = {
+      ensureHost: async () => {},
+      options: { config: { meshRoot, rootId } },
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(
+      state.agents,
+      guardedActors,
+      state.globalActors,
+      state.mainAgent,
+      state.participants,
+      state.control,
+      state.lifecycle,
+      undefined,
+      residency,
+      undefined,
+      () => DEFAULT_FABRIC_CONFIG.models,
+    );
+
+    try {
+      const actor = (await provider.invoke(
+        "create",
+        { name: "second-durable", instructions: "Created via the resident host.", residency: "durable" },
+        context,
+      )) as { id: string; name: string };
+      expect(actor.id).toBe("resident-actor-1");
+      expect(actor.name).toBe("second-durable");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.operation).toBe("createActor");
+    } finally {
+      clearInterval(poller);
+      fs.rmSync(path.join(hostDir, "requests"), { recursive: true, force: true });
+      fs.rmSync(path.join(hostDir, "responses"), { recursive: true, force: true });
+    }
   });
   it("lists live peer sessions separately from Main", async () => {
     const peer: FabricPeerInfo = {

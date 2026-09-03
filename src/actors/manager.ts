@@ -372,9 +372,21 @@ export class ActorManager {
     });
   }
 
-  async create(request: FabricActorRequest): Promise<FabricActorInfo> {
+  /**
+   * Create an actor. The asRegistryOwner option is reserved for the resident
+   * host control channel (residency file protocol): that host already IS the
+   * authoritative registry owner, so the foreign-live-actor guard - which
+   * protects against concurrent local starters - must not veto creates that
+   * arrive over that channel (e.g. while a ceded-but-not-yet-adopted durable
+   * still carries its creating root lineage).
+   */
+  async create(
+    request: FabricActorRequest,
+    { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
+  ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
     if (
+      !asRegistryOwner &&
       [...this.#actors.values()].some(
         (actor) => actor.status !== "stopped" && !this.#canManage(actor.id),
       )
