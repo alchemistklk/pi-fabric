@@ -1,13 +1,15 @@
 // On-demand session measurement. Session JSONL is the source of truth, so
-// entropy is never recorded: the newest project sessions are read live,
-// measured against the current surface, and the trend is the per-session
-// slope. The repair table and the compiled entropy surface are the only
-// durable derived artifacts, because they are the only ones that change
-// runtime behavior.
+// entropy is never recorded: the newest machine sessions are read live
+// across every project under the agent dir, measured against the current
+// surface, and the trend is the per-session slope. Evidence breadth matches
+// enforcement breadth: the compiled surface governs the whole machine, so
+// it learns from the whole machine. The repair table and the compiled
+// entropy surface are the only durable derived artifacts, because they are
+// the only ones that change runtime behavior.
 
 import fs from "node:fs";
 import path from "node:path";
-import { sessionDirForCwd } from "../memory/discovery.js";
+import { sessionDirForCwd, sessionsDirRoot } from "../memory/discovery.js";
 import {
   entropyTracesFromSessionJsonl,
   entropyValueObservationsFromSessionJsonl,
@@ -80,6 +82,75 @@ export const projectSessionFiles = (
       right.mtime - left.mtime || (left.file < right.file ? -1 : left.file > right.file ? 1 : 0),
   );
   return stamped.slice(0, Math.max(1, limit)).map((entry) => entry.file);
+};
+
+// Machine-wide session window: newest sessions across every project under
+// the agent dir, bounded by `limit` in total. The current project's newest
+// session is always included even when quieter projects would crowd it
+// out, because the live session produced this turn's evidence. Ordering
+// matches projectSessionFiles: mtime descending, path tiebreak, stable.
+export const machineSessionFiles = (
+  agentDir: string,
+  cwd: string | undefined,
+  limit = DEFAULT_SESSION_WINDOW,
+): string[] => {
+  const root = sessionsDirRoot(agentDir);
+  let projectDirs: fs.Dirent[] = [];
+  try {
+    projectDirs = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const byNewest = (
+    left: { file: string; mtime: number },
+    right: { file: string; mtime: number },
+  ) =>
+    right.mtime - left.mtime ||
+    (left.file < right.file ? -1 : left.file > right.file ? 1 : 0);
+  const stamped: { file: string; mtime: number }[] = [];
+  const directories = projectDirs
+    .filter((entry) => entry.isDirectory())
+    .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  for (const directory of directories) {
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(path.join(root, directory.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries.filter(
+      (candidate) => candidate.isFile() && candidate.name.endsWith(".jsonl"),
+    )) {
+      const file = path.join(root, directory.name, entry.name);
+      let mtime = 0;
+      try {
+        mtime = fs.statSync(file).mtimeMs;
+      } catch {
+        mtime = 0;
+      }
+      stamped.push({ file, mtime });
+    }
+  }
+  stamped.sort(byNewest);
+  const window = Math.max(1, limit);
+  let selected = stamped.slice(0, window);
+  if (cwd) {
+    const current = projectSessionFiles(agentDir, cwd, 1)[0];
+    if (current !== undefined && !selected.some((entry) => entry.file === current)) {
+      const kept = [...selected];
+      if (kept.length >= window) kept.length = window - 1;
+      let mtime = 0;
+      try {
+        mtime = fs.statSync(current).mtimeMs;
+      } catch {
+        mtime = 0;
+      }
+      kept.push({ file: current, mtime });
+      kept.sort(byNewest);
+      selected = kept;
+    }
+  }
+  return selected.map((entry) => entry.file);
 };
 
 // Measure each session file independently against the same surface; sessions

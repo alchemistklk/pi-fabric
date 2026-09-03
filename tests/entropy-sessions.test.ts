@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   entropyTracesFromSessionJsonl,
+  machineSessionFiles,
   measureSessionCorpus,
   projectSessionFiles,
   sessionWindowEvidence,
@@ -77,6 +78,42 @@ describe("projectSessionFiles", () => {
     expect(projectSessionFiles(agentDir, "/repo")).toEqual([newer, older]);
     expect(projectSessionFiles(agentDir, "/repo", 1)).toEqual([newer]);
     expect(projectSessionFiles(agentDir, "/missing")).toEqual([]);
+  });
+});
+
+describe("machineSessionFiles", () => {
+  it("merges the newest sessions across projects, bounded in total", () => {
+    const agentDir = makeTempDir();
+    const repoA = writeSession(agentDir, "/repo", "a.jsonl", new Date(2020, 0, 1));
+    const repoB = writeSession(agentDir, "/repo", "b.jsonl", new Date(2021, 0, 1));
+    const otherA = writeSession(agentDir, "/other", "a.jsonl", new Date(2022, 0, 1));
+    const otherB = writeSession(agentDir, "/other", "b.jsonl", new Date(2019, 0, 1));
+    expect(machineSessionFiles(agentDir, "/repo")).toEqual([
+      otherA,
+      repoB,
+      repoA,
+      otherB,
+    ]);
+    expect(machineSessionFiles(agentDir, "/repo", 2)).toEqual([otherA, repoB]);
+  });
+
+  it("guarantees the current project's newest session even when crowded out", () => {
+    const agentDir = makeTempDir();
+    const quiet = writeSession(agentDir, "/repo", "quiet.jsonl", new Date(2020, 0, 1));
+    writeSession(agentDir, "/busy", "busy.jsonl", new Date(2021, 0, 1));
+    expect(machineSessionFiles(agentDir, "/repo", 1)).toEqual([quiet]);
+  });
+
+  it("returns no files when the sessions root is absent", () => {
+    expect(machineSessionFiles(makeTempDir(), "/repo")).toEqual([]);
+  });
+
+  it("breaks mtime ties by path for stable ordering", () => {
+    const agentDir = makeTempDir();
+    const same = new Date(2020, 0, 1);
+    const b = writeSession(agentDir, "/b", "b.jsonl", same);
+    const a = writeSession(agentDir, "/a", "a.jsonl", same);
+    expect(machineSessionFiles(agentDir, undefined)).toEqual([a, b]);
   });
 });
 

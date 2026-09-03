@@ -19,7 +19,7 @@ import {
   entropyRepairRows,
   liveSurfaceSnapshot,
   loadCompiledSurface,
-  projectSessionFiles,
+  machineSessionFiles,
   saveCompiledSurface,
   sessionWindowEvidence,
 } from "./entropy/index.js";
@@ -379,21 +379,21 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   }, cleanupActivationSideEffects);
 
   // Continual entropy reduction: the compiler runs measure → propose → apply
-  // → gate against the live session window at every turn boundary that
-  // produced new action evidence, then persists the compiled surface beside
-  // the repair table. Compiles never fail the session; a gate rejection
-  // keeps the old surface and is surfaced once per distinct reason set.
+  // → gate against the live machine session window at every turn boundary
+  // that produced new action evidence, then persists the compiled surface
+  // beside the repair table. Compiles never fail the session; a gate
+  // rejection keeps the old surface silently: the ratchet is holding
+  // the line, and /fabric entropy shows the compiled state.
   let entropyEvidenceThisTurn = false;
   let entropyCompileInFlight = false;
   let entropyCompilePending = false;
-  let entropyLastRejection = "";
   let entropyLastReview = "";
 
   const compileEntropyNow = async (context: ExtensionContext): Promise<void> => {
     if (!state.initialized || !state.config.entropy.compile) return;
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
-    const files = projectSessionFiles(agentDir, cwd);
+    const files = machineSessionFiles(agentDir, cwd);
     if (files.length === 0) return;
     const loaded = loadCompiledSurface(agentDir);
     // Damage surfaces in /fabric entropy and blocks compiles; never overwrite.
@@ -454,16 +454,6 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
           `entropy: ${review.length} review-only proposal${review.length === 1 ? "" : "s"} (${kinds})`,
           "info",
         );
-      }
-      if (outcome.status === "rejected" && outcome.gate) {
-        const key = outcome.gate.reasons.join(";");
-        if (key !== entropyLastRejection) {
-          entropyLastRejection = key;
-          context.ui.notify(
-            `entropy: compile rejected — surface unchanged (${outcome.gate.reasons[0] ?? "gate"})`,
-            "warning",
-          );
-        }
       }
     }
   };

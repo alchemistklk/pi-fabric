@@ -11,6 +11,8 @@ try {
   const report = await runEntropyCertification({
     sessionsDir: argumentValue("--sessions"),
     surfacePath: argumentValue("--surface"),
+    trial: process.argv.includes("--trial"),
+    artifactPath: argumentValue("--artifact"),
   });
   const json = `${JSON.stringify(report, null, 2)}\n`;
   const jsonPath = argumentValue("--json");

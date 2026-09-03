@@ -128,6 +128,14 @@ const parseCompiledSurfaceFile = (value: unknown): CompiledSurfaceFile | undefin
   };
 };
 
+// Public guarded parse for artifact files that did not come from this
+// agent dir: exported artifacts being imported, or certification fixtures.
+// The same validation the store applies to its own file, so nothing trusts
+// an artifact shape the store would refuse to load.
+export const parseCompiledSurfaceArtifact = (
+  value: unknown,
+): CompiledSurfaceFile | undefined => parseCompiledSurfaceFile(value);
+
 export interface LoadedCompiledSurface {
   file?: CompiledSurfaceFile;
   error?: string;

@@ -551,7 +551,16 @@ export class ActionRegistry {
           tools = new Map();
           byServer.set(server, tools);
         }
-        tools.set(toolName, { name: toolName, inputSchema: descriptor.inputSchema });
+        // Teaching: the type gate checks programs against the compiled
+        // schema, the same shape invoke validates against, so shape
+        // mistakes surface before the sandbox runs.
+        tools.set(toolName, {
+          name: toolName,
+          inputSchema: effectiveInputSchema(
+            `mcp.${descriptor.name}`,
+            descriptor.inputSchema,
+          ) as Record<string, unknown>,
+        });
       }
       if (byServer.size > 0) {
         sources.mcpServers = [...byServer.entries()].map(([server, tools]) => ({
@@ -567,7 +576,10 @@ export class ActionRegistry {
         if (descriptors.length > 0) {
           sources.extensionTools = descriptors.map((descriptor) => ({
             name: descriptor.name,
-            inputSchema: descriptor.inputSchema,
+            inputSchema: effectiveInputSchema(
+              `extensions.${descriptor.name}`,
+              descriptor.inputSchema,
+            ) as Record<string, unknown>,
           }));
         }
       } catch {
@@ -578,10 +590,14 @@ export class ActionRegistry {
     return sources;
   }
 
-  // The model-facing discovery view: quarantined refs hide here. Pass
-  // `declared: true` for the compile's base-surface truth, which keeps
-  // quarantined refs visible so base-digest proofs and artifact
-  // carry-forward can read the declared schema.
+  // The model-facing discovery view: quarantined refs hide here, and the
+  // compiled overlay teaches: listed schemas show the compiled shape so
+  // tightened enums are visible before the first call. Pass `declared: true`
+  // for the compile's base-surface truth, which keeps quarantined refs
+  // visible and schemas declared so base-digest proofs and artifact
+  // carry-forward read the live contract. Capability-view paths stay
+  // declared everywhere (see describe): committed views pin declared
+  // digests, and a surface activation must never invalidate them.
   async list(
     request: FabricProviderListRequest & { provider?: string; declared?: boolean },
     context: FabricInvocationContext,
@@ -612,7 +628,20 @@ export class ActionRegistry {
               request.declared ||
               !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
           )
-          .map((descriptor) => resolveDescriptor(provider, descriptor));
+          .map((descriptor) => {
+            const action = resolveDescriptor(provider, descriptor);
+            // Teaching: the listing carries the compiled schema. Declared
+            // requests (the compile snapshot) keep the live contract.
+            return request.declared
+              ? action
+              : {
+                  ...action,
+                  inputSchema: effectiveInputSchema(
+                    action.ref,
+                    action.inputSchema,
+                  ) as Record<string, unknown>,
+                };
+          });
       }),
     );
     const limit = Math.max(1, Math.min(request.limit ?? 100, 1_000));

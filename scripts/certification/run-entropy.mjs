@@ -19,7 +19,9 @@ import {
   evaluateGate,
   loadCompiledSurface,
   measureEntropy,
+  parseCompiledSurfaceArtifact,
   proposeEntropyReductions,
+  runEntropyTrial,
   saveCompiledSurface,
   schemaDigest,
   surfaceFreedomReport,
@@ -642,6 +644,7 @@ export const runEntropyCertification = async (options = {}) => {
   // the report to the surface hash.
   let corpus;
   let surfaceSummary;
+  let trialSummary;
   if (options.surfacePath && !options.sessionsDir) {
     check("corpus-mode", false, "--surface requires --sessions");
   }
@@ -694,6 +697,54 @@ export const runEntropyCertification = async (options = {}) => {
         corpus.totals.operations > 0,
         `files ${files.length} traces ${traces.length} operations ${corpus.totals.operations}`,
       );
+      // Counterfactual trial (opt-in with --trial): replay the corpus's
+      // recorded calls against the declared surface and the compiled
+      // artifact. The hard check is the falsifiable hypothesis: the
+      // compile never rejects a held-out successful call. Quarantine
+      // costs are reported, not failed, because retiring a ref that once
+      // succeeded is what a quarantine is allowed to do.
+      if (options.trial) {
+        if (!surface) {
+          check("trial-mode", false, "--trial requires --surface");
+        } else {
+          let artifact;
+          if (options.artifactPath) {
+            const raw = JSON.parse(fs.readFileSync(options.artifactPath, "utf8"));
+            artifact = parseCompiledSurfaceArtifact(raw);
+            if (!artifact) {
+              check("trial-mode", false, `artifact is invalid: ${options.artifactPath}`);
+            }
+          } else {
+            const agentDir =
+              process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+            const loaded = loadCompiledSurface(agentDir);
+            artifact = loaded.file;
+            if (!artifact) {
+              check(
+                "trial-mode",
+                false,
+                loaded.error ?? "no compiled surface in the agent dir (pass --artifact <path>)",
+              );
+            }
+          }
+          if (artifact) {
+            const trial = runEntropyTrial({ traces, live: surface, artifact });
+            trialSummary = {
+              verdict: trial.verdict,
+              declaredScore: trial.declaredScore,
+              effectiveScore: trial.effectiveScore,
+              delta: trial.delta,
+              totals: trial.totals,
+              divergences: trial.divergences,
+            };
+            check(
+              "trial-costs",
+              trial.totals.tighteningCost === 0,
+              `${trial.totals.tighteningCost} held-out successful calls rejected by the compiled schema`,
+            );
+          }
+        }
+      }
     }
   }
 
@@ -745,6 +796,7 @@ export const runEntropyCertification = async (options = {}) => {
     },
     ...(corpus ? { corpus } : {}),
     ...(surfaceSummary ? { surface: surfaceSummary } : {}),
+    ...(trialSummary ? { trial: trialSummary } : {}),
     evaluation,
   };
 };
@@ -764,6 +816,12 @@ export const formatEntropyHumanReport = (report) => {
   if (report.surface) {
     lines.push(
       `  surface: ${report.surface.actions} actions · freedom ${report.surface.freedomTotal} (mean ${report.surface.freedomMean}) · digest ${report.surface.digest.slice(0, 12)}`,
+    );
+  }
+  if (report.trial) {
+    const totals = report.trial.totals;
+    lines.push(
+      `  trial: ${report.trial.verdict} · score ${report.trial.declaredScore} → ${report.trial.effectiveScore} (delta ${report.trial.delta}) · wins ${totals.typedFailureWin + totals.quarantineWin} · costs ${totals.tighteningCost + totals.quarantineCost}`,
     );
   }
   for (const entry of report.evaluation.checks) {

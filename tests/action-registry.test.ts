@@ -836,6 +836,18 @@ describe("compiled entropy surface enforcement", () => {
       registry.invoke("demo.echo", { value: "x" }, invokeContext()),
     ).rejects.toThrow(/demo\.echo/);
   });
+  it("teaches the compiled schema in the model-facing listing", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    const artifact = overlayArtifact(liveEchoSchema());
+    setActiveCompiledSurface(artifact);
+    const listed = await registry.list({ limit: 10 }, context);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]!.inputSchema).toEqual(artifact.actions[0]!.inputSchema);
+    const declared = await registry.list({ limit: 10, declared: true }, context);
+    expect(declared[0]!.inputSchema).toEqual(liveEchoSchema());
+  });
+
   it("keeps quarantined refs in the declared view for compile snapshots", async () => {
     const registry = new ActionRegistry();
     registry.register(provider());

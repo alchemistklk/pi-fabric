@@ -59,7 +59,7 @@ const refFromFile = (file: string): SessionRef => {
   };
 };
 
-const sessionsDirRoot = (agentDir: string): string => path.join(agentDir, SESSIONS_SUBDIR);
+export const sessionsDirRoot = (agentDir: string): string => path.join(agentDir, SESSIONS_SUBDIR);
 
 const compareRefsByRecency = (left: SessionRef, right: SessionRef): number => {
   if (right.mtime !== left.mtime) return right.mtime - left.mtime;

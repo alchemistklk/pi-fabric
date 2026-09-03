@@ -112,6 +112,86 @@ export const isQuarantinedRef = (
   return schemaDigest(liveSchema) === entry.baseSchemaDigest;
 };
 
+export interface MergedCompiledSurface {
+  file: CompiledSurfaceFile;
+  droppedOverlays: number;
+  droppedQuarantines: number;
+}
+
+const byRefOrder = (left: { ref: string }, right: { ref: string }): number =>
+  left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0;
+
+// Federation merge: incoming entries earn a slot only where their recorded
+// base digest proves against the live declared surface and the local
+// artifact has nothing to say about that ref (conflicts skip, local wins).
+// Every consult re-proves merged entries against the live schema, so an
+// imported artifact can never enforce a schema the local surface does not
+// still declare. The applied ledger unions by identity, local first,
+// capped at the store's maximum.
+export const mergeCompiledSurfaces = (
+  local: CompiledSurfaceFile | undefined,
+  incoming: CompiledSurfaceFile,
+  live: EntropySurfaceSnapshot,
+): MergedCompiledSurface => {
+  const liveByRef = new Map(live.actions.map((action) => [action.ref, action.inputSchema]));
+  const liveDigestOf = (ref: string): string | undefined => {
+    const schema = liveByRef.get(ref);
+    return schema === undefined ? undefined : schemaDigest(schema);
+  };
+  const overlayRefs = new Set((local?.actions ?? []).map((entry) => entry.ref));
+  const quarantineRefs = new Set((local?.quarantined ?? []).map((entry) => entry.ref));
+  const actions = [...(local?.actions ?? [])];
+  const quarantined = [...(local?.quarantined ?? [])];
+  let droppedOverlays = 0;
+  let droppedQuarantines = 0;
+  for (const entry of incoming.actions) {
+    if (overlayRefs.has(entry.ref) || quarantineRefs.has(entry.ref)) continue;
+    if (liveDigestOf(entry.ref) !== entry.baseSchemaDigest) {
+      droppedOverlays++;
+      continue;
+    }
+    actions.push(entry);
+    overlayRefs.add(entry.ref);
+  }
+  for (const entry of incoming.quarantined) {
+    if (overlayRefs.has(entry.ref) || quarantineRefs.has(entry.ref)) continue;
+    if (liveDigestOf(entry.ref) !== entry.baseSchemaDigest) {
+      droppedQuarantines++;
+      continue;
+    }
+    quarantined.push(entry);
+    quarantineRefs.add(entry.ref);
+  }
+  actions.sort(byRefOrder);
+  quarantined.sort(byRefOrder);
+  const applied: CompiledSurfaceAppliedProposal[] = [];
+  const seenApplied = new Set<string>();
+  for (const source of [local?.applied ?? [], incoming.applied]) {
+    for (const entry of source) {
+      const identity = `${entry.kind}:${entry.ref}:${entry.detail}`;
+      if (seenApplied.has(identity)) continue;
+      seenApplied.add(identity);
+      if (applied.length >= MAX_COMPILED_SURFACE_PROPOSALS) break;
+      applied.push(entry);
+    }
+  }
+  const file: CompiledSurfaceFile = {
+    version: COMPILED_SURFACE_VERSION,
+    metricVersion: local?.metricVersion ?? incoming.metricVersion,
+    actions,
+    quarantined,
+    applied,
+    gate: local?.gate ?? incoming.gate,
+    evidenceDigest: stableJsonHash({
+      actions,
+      quarantined,
+      applied,
+      sources: [...(local ? [local.evidenceDigest] : []), incoming.evidenceDigest],
+    }),
+  };
+  return { file, droppedOverlays, droppedQuarantines };
+};
+
 export interface ReplayViolation {
   ref: string;
   reason: string;

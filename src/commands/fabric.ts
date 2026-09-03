@@ -25,9 +25,19 @@ import {
   liveSurfaceSnapshot,
   surfaceFreedomReport,
 } from "../entropy/surface.js";
-import { measureSessionCorpus, projectSessionFiles } from "../entropy/sessions.js";
+import {
+  machineSessionFiles,
+  measureSessionCorpus,
+  projectSessionFiles,
+} from "../entropy/sessions.js";
 import { applyCompiledSurface } from "../entropy/compiled-surface.js";
-import { loadCompiledSurface } from "../entropy/compiled-store.js";
+import {
+  loadCompiledSurface,
+  parseCompiledSurfaceArtifact,
+  saveCompiledSurface,
+} from "../entropy/compiled-store.js";
+import { mergeCompiledSurfaces } from "../entropy/compiled-surface.js";
+import { setActiveCompiledSurface } from "../entropy/active.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -855,6 +865,84 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         return;
       }
       if (command === "entropy") {
+        const exportArtifactIndex = argumentsList.indexOf("export-artifact");
+        if (exportArtifactIndex >= 0) {
+          const target = argumentsList[exportArtifactIndex + 1];
+          try {
+            const loaded = loadCompiledSurface(resolveAgentDir());
+            if (loaded.error) {
+              context.ui.notify(loaded.error, "error");
+              return;
+            }
+            if (!loaded.file) {
+              context.ui.notify(
+                "No compiled surface to export; wait for a compile to pass its gate",
+                "warning",
+              );
+              return;
+            }
+            const dest = path.resolve(
+              target ?? path.join(resolveAgentDir(), "fabric", "entropy", "artifact.json"),
+            );
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.writeFileSync(dest, `${JSON.stringify(loaded.file, null, 2)}\n`, {
+              encoding: "utf-8",
+              mode: 0o600,
+            });
+            context.ui.notify(
+              `Exported compiled surface (${loaded.file.actions.length} tightened · ${loaded.file.quarantined.length} quarantined) → ${dest}`,
+              "info",
+            );
+          } catch (error) {
+            context.ui.notify(
+              error instanceof Error ? error.message : String(error),
+              "error",
+            );
+          }
+          return;
+        }
+        const importIndex = argumentsList.indexOf("import");
+        if (importIndex >= 0) {
+          const source = argumentsList[importIndex + 1];
+          if (!source) {
+            context.ui.notify("Usage: /fabric entropy import <artifact.json>", "warning");
+            return;
+          }
+          try {
+            const raw: unknown = JSON.parse(
+              fs.readFileSync(path.resolve(source), "utf-8"),
+            );
+            const incoming = parseCompiledSurfaceArtifact(raw);
+            if (!incoming) {
+              context.ui.notify(`Artifact is invalid: ${source}`, "error");
+              return;
+            }
+            const agentDir = resolveAgentDir();
+            const localLoaded = loadCompiledSurface(agentDir);
+            if (localLoaded.error) {
+              context.ui.notify(localLoaded.error, "error");
+              return;
+            }
+            const live = await liveSurfaceSnapshot({
+              registry: state.registry,
+              extensionContext: context,
+              cwd: state.cwd ?? context.cwd,
+            });
+            const merged = mergeCompiledSurfaces(localLoaded.file, incoming, live);
+            const saved = saveCompiledSurface(agentDir, merged.file);
+            if (state.config.entropy.compile) setActiveCompiledSurface(saved.file);
+            context.ui.notify(
+              `Imported compiled surface: ${merged.file.actions.length} tightened · ${merged.file.quarantined.length} quarantined · ${merged.droppedOverlays + merged.droppedQuarantines} dropped (base digest mismatch)`,
+              "info",
+            );
+          } catch (error) {
+            context.ui.notify(
+              error instanceof Error ? error.message : String(error),
+              "error",
+            );
+          }
+          return;
+        }
         const exportIndex = argumentsList.indexOf("export");
         if (exportIndex >= 0) {
           const target = argumentsList[exportIndex + 1];
@@ -884,8 +972,13 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           }
           return;
         }
-        if (argumentsList[0] !== undefined) {
-          context.ui.notify("Usage: /fabric entropy [export [path]]", "warning");
+        const projectScope = argumentsList.includes("--project");
+        const scopedArguments = argumentsList.filter((argument) => argument !== "--project");
+        if (scopedArguments[0] !== undefined) {
+          context.ui.notify(
+            "Usage: /fabric entropy [--project] [export [path] | export-artifact [path] | import <path>]",
+            "warning",
+          );
           return;
         }
         try {
@@ -901,7 +994,10 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
             : live;
           const freedom = surfaceFreedomReport(snapshot);
           const surfaceDigest = entropySurfaceHash(snapshot);
-          const files = projectSessionFiles(resolveAgentDir(), state.cwd ?? context.cwd);
+          const scopeCwd = state.cwd ?? context.cwd;
+          const files = projectScope
+            ? projectSessionFiles(resolveAgentDir(), scopeCwd)
+            : machineSessionFiles(resolveAgentDir(), scopeCwd);
           const corpus = measureSessionCorpus({
             files,
             surface: snapshot,
@@ -916,7 +1012,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           const latest = corpus.latest;
           const sessionsLine =
             corpus.sessions.length === 0 || latest === undefined
-              ? `session entropy (observed): no fabric_exec traces in the latest ${files.length} project sessions`
+              ? `session entropy (observed): no fabric_exec traces in the latest ${files.length} ${projectScope ? "project" : "machine"} sessions`
               : `session entropy (observed): ${corpus.sessions.length} sessions · latest ${latest.totals.operations} ops · behavioral ${format(latest.behavioralScore)} + surface ${format(latest.staticScore)} = ${format(latest.behavioralScore + latest.staticScore)} · slope ${format(corpus.trend.slopePerStep)}/session · ${
                   latest.totals.invocationRejectionsPer1k === 0 && corpus.trend.slopePerStep <= 0
                     ? "ratchet holding"
@@ -944,7 +1040,9 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
               ...(modelsLine ? [modelsLine] : []),
-              "export: /fabric entropy export [path]   # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
+              "export: /fabric entropy export [path]          # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
+              "share: /fabric entropy export-artifact [path]     # write the compiled artifact (default <agent dir>/fabric/entropy/artifact.json)",
+              "merge: /fabric entropy import <path>             # merge a peer artifact (digest-proven entries only)",
             ].join("\n"),
             "info",
           );

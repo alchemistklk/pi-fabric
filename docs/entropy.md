@@ -154,7 +154,11 @@ approval, machine-checked bounds replace review. Every turn that invoked
 `fabric_exec` may have produced new action evidence, so at `turn_end` the
 compiler reads the live session window, snapshots the declared surface
 through the discovery path, and runs measure → propose → apply → gate
-against it. The snapshot keeps quarantined refs visible because digest
+against it. The window is machine-wide, covering the newest sessions
+across every project under the agent dir, so evidence breadth matches
+enforcement breadth: the artifact governs the whole machine, so it learns
+from the whole machine. The current project's newest session is always included so
+the live session that produced this turn's evidence is never crowded out. The snapshot keeps quarantined refs visible because digest
 proofs and artifact carry-forward read the declared schema; the
 model-facing catalog keeps hiding them.
 The compile is fire-and-forget (the next prompt never waits on it), and a
@@ -185,8 +189,10 @@ Fabric config disables the loop and the enforcement entirely.
 ## On-demand measurement
 
 Session JSONL is the source of truth, so nothing is recorded. `/fabric
-entropy` reads the newest project sessions (window of 8 files, newest first
-by mtime), measures each against the live surface snapshot, and reports the
+entropy` reads the newest machine sessions (window of 8 files total,
+newest first by mtime, spanning every project under the agent dir with the
+current project's newest session guaranteed), measures each against the live
+surface snapshot, and reports the
 latest session's score plus the least-squares slope across the window's
 session scores (`trendFromScores`). Lines without a trace envelope are
 skipped by a cheap substring filter before parsing, so large logs stay
@@ -197,8 +203,10 @@ behavior.
 ## Commands and certification
 
 ```text
-/fabric entropy                     # live surface freedom + observed session entropy trend
-/fabric entropy export [path]      # write the live surface snapshot (default <agent dir>/fabric/entropy/surface.json)
+/fabric entropy                          # live surface freedom + observed session entropy trend
+/fabric entropy export [path]             # write the live surface snapshot (default <agent dir>/fabric/entropy/surface.json)
+/fabric entropy export-artifact [path]    # write the compiled artifact (default <agent dir>/fabric/entropy/artifact.json)
+/fabric entropy import <path>             # merge a peer artifact (digest-proven entries only)
 ```
 
 Repo-side only (development and CI; these scripts are not part of the
@@ -207,19 +215,56 @@ installed package):
 ```text
 bun run certify:entropy                                     # offline fixtures, exact math, ratchet proof, ingestion
 bun run certify:entropy --sessions <dir> --surface <snap>   # measure an arbitrary session corpus
+bun run certify:entropy --sessions <dir> --surface <snap> --trial   # also run the held-out trial
 ```
 
-`/fabric entropy` measures on demand: the newest project sessions are read
-from the session logs, measured against the effective surface (live plus
+`/fabric entropy` measures on demand: the newest machine sessions are read
+from the session logs (all projects; `--project` scopes to the current
+project's window), measured against the effective surface (live plus
 the compiled overlay), and the trend is the per-session slope; the display
 carries a `compiled:` line with the artifact's applied proposals and last
-gate outcome. `/fabric entropy export [path]` snapshots the live
+gate outcome. Gate rejections are silent by design: the ratchet kept the
+old surface, and the display shows the compiled state on demand. `/fabric entropy export [path]` snapshots the live
 registry through the discovery path (read-only, authorization-free), defaulting
 to `<agent dir>/fabric/entropy/surface.json` beside the repair table, as
 `{ version: 1, actions: [{ ref, inputSchema }] }`, sorted by ref so it
 hashes stably. Pass an exported snapshot with `--surface` to measure a
 copied corpus against the surface it ran on; the report then carries the
 surface hash as its catalog digest, so scores compare like against like.
+
+## Federation
+
+The compiled artifact is the shareable unit of improvement:
+`/fabric entropy export-artifact [path]` writes the machine's compiled
+surface, and `/fabric entropy import <path>` merges a peer's artifact into
+the local one. Merging is digest-proven, never trusted: an incoming entry
+earns a slot only while its recorded base digest matches the live declared
+schema, and only where the local artifact has nothing to say about that ref
+(conflicts skip; local wins). Unproven entries are dropped and counted in
+the import notification. The applied ledgers union by identity, local
+first, capped at the store's maximum. A merged artifact saves through the
+locked store and activates immediately when compiles are enabled, and every
+consult keeps re-proving entries against the live schema, so an import can
+tighten the local surface but never reshape it. One machine's head start
+becomes every machine's.
+
+## Held-out trials
+
+The trial is the falsifiable half of the compiler: with `--trial` (plus
+`--sessions` and `--surface`), every recorded call in the corpus replays
+against both the declared surface and the compiled artifact (`--artifact
+<path>` overrides the agent dir's `compiled.json`), and each divergence is
+classified deterministically. Calls the declared schema already rejected
+credit nothing. Succeeded calls the compiled schema would reject count as
+tightening costs: the compile overfit its window, and the certification
+fails on any of them, because the in-loop replay gate promised exactly
+that. Calls that failed anyway count as wins when the artifact would have
+rejected them: a cheap typed rejection replaces an expensive failure. A
+quarantined ref's succeeded calls count as quarantine costs and are
+reported without failing, because retiring a ref that once succeeded is
+what a quarantine is allowed to do. The report carries the verdict
+(`clean`, `costly`, or `no-evidence`), both window scores, and the
+per-ref divergence counts.
 
 The certification harness exits nonzero on any failed check, mirroring
 `certify:context`: determinism (double-run hash equality), exact metric math
@@ -256,9 +301,11 @@ commit.
   successes) carry the replay-safety argument for retired refs.
 - Flow entropy groups executions by the persisted first workflow phase (or
   `(none)`), which is a coarse task key.
-- The on-demand trend covers the newest project sessions only (mtime
-  ordered): sessions the user prunes leave the trend, and the slope is only
-  as strong as the window.
+- The on-demand trend covers the newest machine sessions only (mtime
+  ordered, machine-wide window of 8): sessions the user prunes leave the
+  trend, and the slope is only as strong as the window. Widening the corpus
+  scope shifts measured scores, so certification baselines recorded against
+  a per-project corpus must be re-recorded once against the machine window.
 - The compile trigger is per-turn, so evidence that aged out of the window
   stops proposing; the compiled artifact keeps its own provenance and stays
   enforced until the live schema beneath it changes.
