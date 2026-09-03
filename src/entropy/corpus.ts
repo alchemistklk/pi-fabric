@@ -5,7 +5,12 @@
 import { readFabricExecutionTraceV1, type FabricExecutionTraceV1 } from "../audit/trace.js";
 import { stableJsonHash } from "../core/stable-hash.js";
 import type { CatalogRepair } from "../repairs/types.js";
-import type { EntropyReport, EntropyRepairRowInput, EntropyTraceInput } from "./types.js";
+import type {
+  EntropyReport,
+  EntropyRepairRowInput,
+  EntropyTraceInput,
+  EntropyValueObservation,
+} from "./types.js";
 
 const DEFAULT_TASK_KEY = "(none)";
 
@@ -24,11 +29,8 @@ export const entropyTraceFromFabricTrace = (trace: FabricExecutionTraceV1): Entr
   taskKey: trace.phases[0] ?? DEFAULT_TASK_KEY,
 });
 
-// Extract meter traces from Pi session JSONL lines. Malformed lines, non-trace
-// entries, and envelopes that fail the trace guard are skipped without
-// throwing; only typed, guarded trace V1 envelopes count.
-export const entropyTracesFromSessionJsonl = (lines: readonly string[]): EntropyTraceInput[] => {
-  const traces: EntropyTraceInput[] = [];
+const sessionDetailsRecords = (lines: readonly string[]): Record<string, unknown>[] => {
+  const records: Record<string, unknown>[] = [];
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === "") continue;
@@ -44,11 +46,46 @@ export const entropyTracesFromSessionJsonl = (lines: readonly string[]): Entropy
       : isRecord(parsed.message) && isRecord(parsed.message.details)
         ? parsed.message.details
         : undefined;
-    if (!isRecord(details)) continue;
+    if (isRecord(details)) records.push(details);
+  }
+  return records;
+};
+
+// Extract meter traces from Pi session JSONL lines. Malformed lines, non-trace
+// entries, and envelopes that fail the trace guard are skipped without
+// throwing; only typed, guarded trace V1 envelopes count.
+export const entropyTracesFromSessionJsonl = (lines: readonly string[]): EntropyTraceInput[] => {
+  const traces: EntropyTraceInput[] = [];
+  for (const details of sessionDetailsRecords(lines)) {
     const trace = readFabricExecutionTraceV1(details.trace);
     if (trace) traces.push(entropyTraceFromFabricTrace(trace));
   }
   return traces;
+};
+
+// Verbatim audit arguments are the authoritative value corpus for
+// enum-tighten: trace V1 projects values away per ref (external and MCP calls
+// keep none), while persisted audits carry every argument the call used. The
+// observations stay local to the session record, exactly like the audits.
+export const entropyValueObservationsFromSessionJsonl = (
+  lines: readonly string[],
+): EntropyValueObservation[] => {
+  const observations: EntropyValueObservation[] = [];
+  for (const details of sessionDetailsRecords(lines)) {
+    if (!Array.isArray(details.audits)) continue;
+    for (const audit of details.audits) {
+      if (!isRecord(audit)) continue;
+      const ref = typeof audit.ref === "string" ? audit.ref : undefined;
+      const args = isRecord(audit.args) ? audit.args : undefined;
+      if (!ref || !args) continue;
+      for (const [key, value] of Object.entries(args)) {
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          observations.push({ ref, key, value });
+        }
+      }
+    }
+  }
+  return observations;
 };
 
 // Normalize catalog repair rows for the meter. `ref` is the target the row

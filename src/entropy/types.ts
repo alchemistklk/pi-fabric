@@ -58,6 +58,15 @@ export interface EntropyRepairRowInput {
   to: string;
 }
 
+// One verbatim argument value observed in persisted audits: the value-level
+// corpus for enum-tighten. Trace V1 projects values away per ref; audits
+// carry every argument the call actually used.
+export interface EntropyValueObservation {
+  ref: string;
+  key: string;
+  value: string | number | boolean;
+}
+
 export interface EntropyShapeSignature {
   signature: string;
   count: number;

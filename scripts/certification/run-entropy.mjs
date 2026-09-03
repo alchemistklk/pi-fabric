@@ -14,12 +14,15 @@ import {
   applyProposalsToSurface,
   entropyDirectory,
   entropyReportHash,
+  entropySurfaceHash,
   entropyTracesFromSessionJsonl,
+  entropyValueObservationsFromSessionJsonl,
   entropyTrend,
   evaluateGate,
   loadEntropyLedger,
   measureEntropy,
   proposeEntropyReductions,
+  surfaceFreedomReport,
 } from "../../dist/entropy/index.js";
 
 const defaultAgentDir = () =>
@@ -244,6 +247,53 @@ const ingestionJsonl = () => {
       droppedOperations: 0,
     },
   };
+  // A second execution whose MCP calls keep no trace arguments but persist
+  // verbatim audit args: the enum-tighten value corpus must come from audits.
+  const renderFormats = [
+    "pdf",
+    "pdf",
+    "pdf",
+    "pdf",
+    "pdf",
+    "pdf",
+    "pdf",
+    "html",
+  ];
+  const renderEnvelope = {
+    kind: "pi-fabric.execution",
+    version: 1,
+    outcome: "succeeded",
+    phases: ["build"],
+    operations: renderFormats.map((format, index) => ({
+      type: "call",
+      sequence: index,
+      ref: "mcp.report.render",
+      args: {},
+      outcome: "succeeded",
+    })),
+    counts: {
+      droppedValues: 0,
+      truncatedValues: 0,
+      redactedValues: 0,
+      droppedOperations: 0,
+    },
+  };
+  const renderAudits = renderFormats.map((format) => ({
+    ref: "mcp.report.render",
+    args: { format },
+  }));
+  const sessionLine = (id, trace, audits) =>
+    JSON.stringify({
+      id,
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: `call-${id}`,
+        toolName: "fabric_exec",
+        content: [{ type: "text", text: "ok" }],
+        details: { success: true, trace, audits, phases: ["build"] },
+      },
+    });
   return [
     "{ not json",
     JSON.stringify({
@@ -251,17 +301,15 @@ const ingestionJsonl = () => {
       type: "message",
       message: { role: "user", content: "hi" },
     }),
-    JSON.stringify({
-      id: "entry-1",
-      type: "message",
-      message: {
-        role: "toolResult",
-        toolCallId: "call-1",
-        toolName: "fabric_exec",
-        content: [{ type: "text", text: "ok" }],
-        details: { success: true, trace: envelope, audits: [], phases: ["build"] },
-      },
-    }),
+    sessionLine(
+      "entry-1",
+      envelope,
+      [
+        { ref: "pi.read", args: { path: "src/a.ts", limit: 10 } },
+        { ref: "pi.bash", args: { command: "ls" } },
+      ],
+    ),
+    sessionLine("entry-2", renderEnvelope, renderAudits),
     "",
   ].join("\n");
 };
@@ -413,17 +461,45 @@ export const runEntropyCertification = async (options = {}) => {
 
   // Session JSONL ingestion: malformed and non-trace lines are skipped;
   // guarded trace envelopes become meter traces.
-  const ingestedTraces = entropyTracesFromSessionJsonl(
-    ingestionJsonl().split("\n"),
-  );
+  const ingestionLines = ingestionJsonl().split("\n");
+  const ingestedTraces = entropyTracesFromSessionJsonl(ingestionLines);
   const ingestionReport = measureEntropy({ traces: ingestedTraces });
   check(
     "session-jsonl-ingestion",
-    ingestedTraces.length === 1 &&
-      ingestionReport.totals.operations === 2 &&
-      ingestionReport.totals.succeeded === 1 &&
+    ingestedTraces.length === 2 &&
+      ingestionReport.totals.operations === 10 &&
+      ingestionReport.totals.succeeded === 9 &&
       ingestionReport.totals.failed === 1,
     `traces ${ingestedTraces.length} ops ${ingestionReport.totals.operations}`,
+  );
+
+  // Verbatim audit observations: the value corpus for refs whose trace
+  // projection drops values. The render calls keep empty trace args, so the
+  // enum-tighten proposal can only come from the audits.
+  const valueObservations = entropyValueObservationsFromSessionJsonl(ingestionLines);
+  const renderObservations = valueObservations.filter(
+    (observation) => observation.ref === "mcp.report.render",
+  );
+  const fromTraces = proposeEntropyReductions({
+    report: ingestionReport,
+    traces: ingestedTraces,
+  });
+  const fromAudits = proposeEntropyReductions({
+    report: ingestionReport,
+    traces: ingestedTraces,
+    valueObservations,
+  });
+  const auditProposal = fromAudits.find((proposal) => proposal.kind === "enum-tighten");
+  check(
+    "audit-value-observations",
+    valueObservations.length === 11 &&
+      renderObservations.length === 8 &&
+      !fromTraces.some((proposal) => proposal.kind === "enum-tighten") &&
+      Boolean(auditProposal) &&
+      auditProposal.ref === "mcp.report.render" &&
+      auditProposal.key === "format" &&
+      JSON.stringify(auditProposal.values) === JSON.stringify(["pdf", "html"]),
+    `observations ${valueObservations.length} renders ${renderObservations.length}`,
   );
 
   // Ledger: round trip, cap, exact trend slope, and damage behavior.
@@ -503,8 +579,14 @@ export const runEntropyCertification = async (options = {}) => {
     `error "${damageError}" appendThrew ${appendThrew} preserved ${damagePreserved}`,
   );
 
-  // Real session corpus (opt-in).
+  // Real session corpus (opt-in). A live surface snapshot
+  // (/fabric entropy export <path>) adds static freedom and keys the ledger
+  // entry to the surface hash, so trend lines compare like against like.
   let corpus;
+  let surfaceSummary;
+  if (options.surfacePath && !options.sessionsDir) {
+    check("corpus-mode", false, "--surface requires --sessions");
+  }
   if (options.sessionsDir) {
     const sessionsDir = options.sessionsDir;
     if (!fs.existsSync(sessionsDir)) {
@@ -521,7 +603,34 @@ export const runEntropyCertification = async (options = {}) => {
         );
       }
       const traces = entropyTracesFromSessionJsonl(lines);
-      corpus = measureEntropy({ traces, catalogDigest: "(sessions)" });
+      let surface;
+      let catalogDigest = "(sessions)";
+      if (options.surfacePath) {
+        const raw = JSON.parse(fs.readFileSync(options.surfacePath, "utf8"));
+        if (!raw || raw.version !== 1 || !Array.isArray(raw.actions)) {
+          throw new Error("surface snapshot must be { version: 1, actions: [...] }");
+        }
+        surface = {
+          version: 1,
+          actions: raw.actions.filter(
+            (action) => action && typeof action.ref === "string",
+          ),
+        };
+        catalogDigest = entropySurfaceHash(surface);
+        const freedom = surfaceFreedomReport(surface);
+        surfaceSummary = {
+          path: options.surfacePath,
+          actions: freedom.actions.length,
+          freedomTotal: freedom.total,
+          freedomMean: freedom.mean,
+          digest: catalogDigest,
+        };
+      }
+      corpus = measureEntropy({
+        traces,
+        ...(surface ? { surface } : {}),
+        catalogDigest,
+      });
       check(
         "corpus-mode",
         corpus.totals.operations > 0,
@@ -581,9 +690,11 @@ export const runEntropyCertification = async (options = {}) => {
       ingestion: {
         traces: ingestedTraces.length,
         operations: ingestionReport.totals.operations,
+        valueObservations: valueObservations.length,
       },
     },
     ...(corpus ? { corpus } : {}),
+    ...(surfaceSummary ? { surface: surfaceSummary } : {}),
     evaluation,
   };
 };
@@ -598,6 +709,11 @@ export const formatEntropyHumanReport = (report) => {
   if (report.corpus) {
     lines.push(
       `  corpus: ${report.corpus.totals.operations} operations · score ${report.corpus.score} · rejections/1k ${report.corpus.totals.invocationRejectionsPer1k}`,
+    );
+  }
+  if (report.surface) {
+    lines.push(
+      `  surface: ${report.surface.actions} actions · freedom ${report.surface.freedomTotal} (mean ${report.surface.freedomMean}) · digest ${report.surface.digest.slice(0, 12)}`,
     );
   }
   for (const entry of report.evaluation.checks) {

@@ -4,3 +4,4 @@ export * from "./meter.js";
 export * from "./passes.js";
 export * from "./corpus.js";
 export * from "./ledger.js";
+export * from "./surface.js";

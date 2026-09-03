@@ -25,6 +25,10 @@ same report, which is what makes the score bisectable and CI-gateable.
   behavioral terms only.
 - **Repairs**: the normalized catalog repair table (`keyAlias` /
   `actionAlias` rows). Each row is a standing lexicon tax on its target ref.
+- **Audits**: persisted verbatim call arguments (`details.audits`). They are
+  the value corpus for enum-tighten: trace V1 projects values away per ref,
+  while audits carry every argument the call used. They stay local to the
+  session record.
 
 ## The metric (v1)
 
@@ -69,8 +73,11 @@ the surface converges, and it spikes when a new model or tool arrives.
 reviewable, evidence-carrying proposals with fixed thresholds:
 
 - `enum-tighten`: a parameter with ≥ 8 observations, 2–8 distinct values,
-  and a ≥ 50% top share compiles into an enum. Skipped when the live
-  schema's enum already covers every observed value.
+  and a ≥ 50% top share compiles into an enum. Value observations come from
+  the verbatim audits when supplied
+  (`entropyValueObservationsFromSessionJsonl`); the projected trace args
+  are the fallback. Skipped when the live schema's enum already covers
+  every observed value.
 - `modal-rename`: a repair row whose target ref is called: compile the
   modal spilled spelling into the schema (rename the declared key or
   action) and retire the row. Skipped when the rename is already compiled
@@ -110,16 +117,28 @@ contract.
 ## Commands and certification
 
 ```text
-/fabric entropy                                        # live counters and ledger trend
+/fabric entropy                                        # live counters, surface freedom, ledger trend
+/fabric entropy export <path>                          # write the live surface snapshot as JSON
 bun run certify:entropy                                # offline fixtures, exact math, ratchet, ledger, ingestion
 bun run certify:entropy --sessions <dir> --record      # measure a real session corpus into the ledger
+bun run certify:entropy --sessions <dir> --surface <snap> --record
 ```
+
+`/fabric entropy export <path>` snapshots the live registry through the
+discovery path (read-only, authorization-free) as `{ version: 1, actions:
+[{ ref, inputSchema }] }`, sorted by ref so it hashes stably. Pass it with
+`--surface` to measure a session corpus against the live surface; the
+ledger entry then carries the surface hash as its catalog digest, so trend
+lines compare like against like.
 
 The certification harness exits nonzero on any failed check, mirroring
 `certify:context`: determinism (double-run hash equality), exact metric math
 on fixed corpora, the full ratchet loop with convergence, surface-apply
-purity, ledger round trip, cap, and damage behavior, and synthetic
-session-JSONL ingestion.
+purity, ledger round trip, cap, and damage behavior, synthetic
+session-JSONL ingestion, and audit-derived value observations. The
+`Entropy` GitHub workflow runs the certification on every push to `main`
+and weekly, uploading the JSON report as an artifact; a red certification
+fails the build, so the ratchet line stays visible per commit.
 
 ## Determinism contract
 
@@ -135,9 +154,11 @@ session-JSONL ingestion.
 ## Limitations
 
 - Trace V1 projects arguments per ref (grep patterns, edit contents, and
-  external arguments are dropped), so value-level passes see only what the
-  projection retains. Enum-tighten on dropped parameters would need the
-  verbatim audits, which stay local to the session record.
+  external arguments are dropped), so shape signatures see the projected
+  key sets. Value-level passes read the verbatim audits through
+  `entropyValueObservationsFromSessionJsonl`, which keeps enum-tighten
+  working for value-dropped parameters as long as the session record (or an
+  exported corpus) travels with the measurement.
 - The gate proves score monotonicity on the retained corpus, not equivalence
   of future behavior. Quarantine preconditions (more failures than
   successes) carry the replay-safety argument for retired refs.

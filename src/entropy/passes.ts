@@ -7,6 +7,7 @@ import type {
   EntropySurfaceAction,
   EntropySurfaceSnapshot,
   EntropyTraceInput,
+  EntropyValueObservation,
 } from "./types.js";
 import { compareCodeUnits, roundMetric } from "./fingerprint.js";
 
@@ -23,6 +24,7 @@ export interface EntropyProposalInput {
   traces: readonly EntropyTraceInput[];
   surface?: EntropySurfaceSnapshot;
   repairs?: readonly EntropyRepairRowInput[];
+  valueObservations?: readonly EntropyValueObservation[];
 }
 
 const ENUM_MIN_OBSERVATIONS = 8;
@@ -100,27 +102,40 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
       total: number;
     }
   >();
-  for (const sourceTrace of input.traces) {
-    for (const operation of sourceTrace.operations) {
-      if (operation.ref.startsWith("fabric.")) continue;
-      for (const [key, value] of Object.entries(operation.args)) {
-        if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
-          continue;
+  const observeValue = (ref: string, key: string, value: string | number | boolean): void => {
+    const id = `${ref}\u0000${key}`;
+    const entry =
+      observations.get(id) ??
+      {
+        ref,
+        key,
+        counts: new Map<string, { value: string | number | boolean; count: number }>(),
+        total: 0,
+      };
+    const valueId = valueKey(value);
+    const existing = entry.counts.get(valueId);
+    entry.counts.set(valueId, { value, count: (existing?.count ?? 0) + 1 });
+    entry.total += 1;
+    observations.set(id, entry);
+  };
+  // Verbatim audit observations are the authoritative value corpus when
+  // supplied: audits carry every argument, including the parameters the
+  // trace projection drops. Without them the scan uses the projected trace
+  // args.
+  if (input.valueObservations) {
+    for (const observation of input.valueObservations) {
+      observeValue(observation.ref, observation.key, observation.value);
+    }
+  } else {
+    for (const sourceTrace of input.traces) {
+      for (const operation of sourceTrace.operations) {
+        if (operation.ref.startsWith("fabric.")) continue;
+        for (const [key, value] of Object.entries(operation.args)) {
+          if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+            continue;
+          }
+          observeValue(operation.ref, key, value);
         }
-        const id = `${operation.ref}\u0000${key}`;
-        const entry =
-          observations.get(id) ??
-          {
-            ref: operation.ref,
-            key,
-            counts: new Map<string, { value: string | number | boolean; count: number }>(),
-            total: 0,
-          };
-        const valueId = valueKey(value);
-        const existing = entry.counts.get(valueId);
-        entry.counts.set(valueId, { value, count: (existing?.count ?? 0) + 1 });
-        entry.total += 1;
-        observations.set(id, entry);
       }
     }
   }

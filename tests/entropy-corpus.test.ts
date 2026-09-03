@@ -3,7 +3,9 @@ import {
   entropyRepairRows,
   entropyTraceFromFabricTrace,
   entropyTracesFromSessionJsonl,
+  entropyValueObservationsFromSessionJsonl,
   measureEntropy,
+  proposeEntropyReductions,
 } from "../src/entropy/index.js";
 import type { FabricExecutionTraceV1 } from "../src/audit/trace.js";
 import type { CatalogRepair } from "../src/repairs/types.js";
@@ -95,5 +97,65 @@ describe("entropyRepairRows", () => {
       { kind: "keyAlias", ref: "memory.expand", from: "sessionId", to: "session" },
       { kind: "actionAlias", ref: "memory.expand", from: "expandEntry", to: "expand" },
     ]);
+  });
+});
+
+describe("entropyValueObservationsFromSessionJsonl", () => {
+  it("extracts verbatim audit values for value-dropped params and drives enum-tighten", () => {
+    const formats = ["pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "html"];
+    const envelope: FabricExecutionTraceV1 = {
+      kind: "pi-fabric.execution",
+      version: 1,
+      outcome: "succeeded",
+      phases: ["build"],
+      operations: formats.map((_, index) => ({
+        type: "call" as const,
+        sequence: index,
+        ref: "mcp.report.render",
+        args: {},
+        outcome: "succeeded" as const,
+      })),
+      counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 },
+    };
+    const audits = formats.map((format) => ({
+      ref: "mcp.report.render",
+      args: { format },
+    }));
+    const lines = JSON.stringify({
+      id: "e1",
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "fabric_exec",
+        content: [{ type: "text", text: "ok" }],
+        details: { success: true, trace: envelope, audits, phases: ["build"] },
+      },
+    }).split("\n");
+    const traces = entropyTracesFromSessionJsonl(lines);
+    const observations = entropyValueObservationsFromSessionJsonl(lines);
+    expect(observations).toHaveLength(8);
+    expect(observations[0]).toEqual({
+      ref: "mcp.report.render",
+      key: "format",
+      value: "pdf",
+    });
+    const report = measureEntropy({ traces });
+    expect(proposeEntropyReductions({ report, traces })).toEqual([]);
+    const proposals = proposeEntropyReductions({
+      report,
+      traces,
+      valueObservations: observations,
+    });
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({
+      kind: "enum-tighten",
+      ref: "mcp.report.render",
+      key: "format",
+      values: ["pdf", "html"],
+      calls: 8,
+      distinct: 2,
+      topShare: 0.875,
+    });
   });
 });
