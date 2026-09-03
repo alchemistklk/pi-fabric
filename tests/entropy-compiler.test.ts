@@ -371,3 +371,97 @@ describe("entropyReviewSignals", () => {
     ).toBe("modal-rename key sessionId -> session");
   });
 });
+
+describe("validate-rejected attempts and reset completeness", () => {
+  const roleSurface = (): EntropySurfaceSnapshot => ({
+    version: 1,
+    actions: [
+      {
+        ref: "memory.recall",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["role"],
+          properties: {
+            role: {
+              type: "string",
+              enum: [
+                "assistant",
+                "bashExecution",
+                "branchCustomMessage",
+                "branchSummary",
+                "branchUser",
+                "compaction",
+                "compactionSummary",
+                "custom",
+                "fabricOperation",
+                "fabricPhase",
+                "fabricRun",
+                "toolResult",
+                "user",
+              ],
+            },
+          },
+        },
+      },
+    ],
+  });
+
+  const attemptObservations = [
+    { ref: "memory.recall", key: "role", value: "user", count: 9 },
+    { ref: "memory.recall", key: "role", value: "assistant", count: 5 },
+    // A validate-rejected attempt: inside the author's declared domain,
+    // refused by the held overlay, pooled through the audit feed.
+    { ref: "memory.recall", key: "role", value: "toolResult", count: 2 },
+  ];
+
+  const roleEnumOf = (artifact?: CompiledSurfaceFile): string[] | undefined =>
+    (
+      artifact?.actions.find((entry) => entry.ref === "memory.recall")?.inputSchema
+        .properties as Record<string, { enum?: string[] }> | undefined
+    )?.role?.enum;
+
+  it("includes an attempted value on a fresh derivation: resets re-derive with full evidence", () => {
+    const outcome = compileEntropySurface({
+      traces: [],
+      surface: roleSurface(),
+      valueObservations: attemptObservations,
+    });
+    expect(outcome.status).toBe("compiled");
+    expect(roleEnumOf(outcome.artifact)).toEqual(["user", "assistant", "toolResult"]);
+  });
+
+  it("never self-widens a held overlay: the ratchet only subtracts", () => {
+    const live = roleSurface();
+    const artifact: CompiledSurfaceFile = {
+      version: 1,
+      metricVersion: 2,
+      actions: [
+        {
+          ref: "memory.recall",
+          inputSchema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["role"],
+            properties: { role: { type: "string", enum: ["user", "assistant"] } },
+          },
+          baseSchemaDigest: schemaDigest(
+            live.actions.find((action) => action.ref === "memory.recall")?.inputSchema,
+          ),
+        },
+      ],
+      quarantined: [],
+      applied: [],
+      gate: { passed: true, beforeScore: 0.5, afterScore: 0.3, reasons: [] },
+      evidenceDigest: "held",
+    };
+    const outcome = compileEntropySurface({
+      traces: [],
+      surface: live,
+      artifact,
+      valueObservations: attemptObservations,
+    });
+    expect(outcome.status).toBe("converged");
+    expect(roleEnumOf(outcome.artifact)).toEqual(["user", "assistant"]);
+  });
+});

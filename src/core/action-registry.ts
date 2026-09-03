@@ -1009,6 +1009,60 @@ export class ActionRegistry {
       // TypeBox validator messages describe schema expectations only — they
       // never echo argument values — so they are safe for durable traces.
       if (catalog.invalid) {
+        // A validate-rejected attempt is in-domain evidence against the
+        // effective surface, but rejected argument values are untrusted
+        // input and never enter the durable record. The trace-safe feed
+        // persists only values the live schema's own enums declare: for a
+        // closed-domain parameter the refused value is already the author's
+        // public vocabulary, so the observation pool can carry it and a
+        // later reset (base drift or review) re-derives with it included.
+        // Values outside the declared enums (typos, payloads) drop here,
+        // the same pre-birth rule the derivation applies.
+        const declaredSchema = action.inputSchema;
+        const declaredProperties =
+          typeof declaredSchema === "object" &&
+          declaredSchema !== null &&
+          !Array.isArray(declaredSchema) &&
+          typeof (declaredSchema as Record<string, unknown>).properties === "object" &&
+          (declaredSchema as Record<string, unknown>).properties !== null
+            ? ((declaredSchema as Record<string, unknown>).properties as Record<string, unknown>)
+            : undefined;
+        const attemptArgs: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(catalog.args)) {
+          const property = declaredProperties ? declaredProperties[key] : undefined;
+          const declaredEnum =
+            typeof property === "object" && property !== null
+              ? (property as Record<string, unknown>).enum
+              : undefined;
+          if (!Array.isArray(declaredEnum)) continue;
+          if (
+            typeof value !== "string" &&
+            typeof value !== "number" &&
+            typeof value !== "boolean"
+          ) {
+            continue;
+          }
+          if (String(value).length > MAX_AUDIT_VALUE_CHARS) continue;
+          if (!declaredEnum.includes(value)) continue;
+          attemptArgs[key] = value;
+        }
+        if (Object.keys(attemptArgs).length > 0) {
+          const attempt: FabricCallAudit = {
+            ref,
+            nestedToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}${randomUUID()}`,
+            startedAt: Date.now(),
+            tool: action.name,
+            provider: action.provider,
+            args: attemptArgs,
+            success: false,
+            error: `Invalid arguments for ${ref}: ${catalog.invalid}`,
+            endedAt: Date.now(),
+            ...(resolved.repairedFrom !== undefined
+              ? { repairedFrom: resolved.repairedFrom }
+              : {}),
+          };
+          context.audits.push(attempt);
+        }
         throw new FabricTraceSafeError(`Invalid arguments for ${ref}: ${catalog.invalid}`);
       }
 

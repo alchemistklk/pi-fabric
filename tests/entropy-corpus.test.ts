@@ -128,6 +128,37 @@ describe("entropyAuditCallsFromSessionJsonl", () => {
   });
 });
 
+describe("validate-rejected attempts", () => {
+  it("pools attempt audits like failed calls: args join the value corpus and the replay corpus", () => {
+    const lines = [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          details: {
+            trace: fabricTrace(["build"]),
+            audits: [
+              {
+                ref: "memory.recall",
+                args: { role: "toolResult" },
+                success: false,
+                error: "Invalid arguments for memory.recall: role must be equal to one of the allowed values",
+              },
+            ],
+            phases: ["build"],
+          },
+        },
+      }),
+    ];
+    expect(entropyValueObservationsFromSessionJsonl(lines)).toEqual([
+      { ref: "memory.recall", key: "role", value: "toolResult" },
+    ]);
+    expect(entropyAuditCallsFromSessionJsonl(lines)).toEqual([
+      { ref: "memory.recall", args: { role: "toolResult" } },
+    ]);
+  });
+});
+
 describe("entropyValueObservationsFromSessionJsonl", () => {
   it("extracts verbatim audit values for value-dropped params and surfaces declare-enum", () => {
     const formats = ["pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "html"];

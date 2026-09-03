@@ -805,6 +805,84 @@ describe("compiled entropy surface enforcement", () => {
     ).rejects.toThrow(/Invalid arguments for demo\.echo/);
   });
 
+  it("records a validate-rejected attempt as a failed-call audit for declared enum members", async () => {
+    const enumProvider = (): FabricProvider => ({
+      name: "demo",
+      description: "Demo provider",
+      async list() {
+        return [
+          {
+            name: "echo",
+            description: "Echo a string",
+            inputSchema: {
+              type: "object",
+              properties: { value: { type: "string", enum: ["alpha", "beta"] } },
+              required: ["value"],
+              additionalProperties: false,
+            },
+            risk: "read" as const,
+          },
+        ];
+      },
+      async describe(name) {
+        return name === "echo" ? (await this.list({}, context))[0] : undefined;
+      },
+      async invoke(_name, args) {
+        return (args as { value: string }).value;
+      },
+    });
+    const liveEnumSchema = () => ({
+      type: "object",
+      properties: { value: { type: "string", enum: ["alpha", "beta"] } },
+      required: ["value"],
+      additionalProperties: false,
+    });
+    const tightOverlay = (): CompiledSurfaceFile => ({
+      version: 1,
+      metricVersion: 2,
+      actions: [
+        {
+          ref: "demo.echo",
+          inputSchema: {
+            type: "object",
+            properties: { value: { type: "string", enum: ["alpha"] } },
+            required: ["value"],
+            additionalProperties: false,
+          },
+          baseSchemaDigest: schemaDigest(liveEnumSchema()),
+        },
+      ],
+      quarantined: [],
+      applied: [{ kind: "enum-tighten", ref: "demo.echo", detail: "value: 1 observed values" }],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    const registry = new ActionRegistry();
+    registry.register(enumProvider());
+    setActiveCompiledSurface(tightOverlay());
+    const audits: FabricCallAudit[] = [];
+    await registry.invoke("demo.echo", { value: "alpha" }, invokeContext(audits));
+    await expect(
+      registry.invoke("demo.echo", { value: "beta" }, invokeContext(audits)),
+    ).rejects.toThrow(/Invalid arguments for demo\.echo/);
+    await expect(
+      registry.invoke("demo.echo", { value: "untrusted-secret" }, invokeContext(audits)),
+    ).rejects.toThrow(/Invalid arguments for demo\.echo/);
+    expect(audits).toHaveLength(2);
+    expect(audits[0]).toMatchObject({ ref: "demo.echo", success: true });
+    expect(audits[1]).toMatchObject({
+      ref: "demo.echo",
+      tool: "echo",
+      provider: "demo",
+      success: false,
+      error: expect.stringContaining("Invalid arguments for demo.echo"),
+      args: { value: "beta" },
+    });
+    expect(audits[1]?.startedAt).toBeGreaterThan(0);
+    expect(audits[1]?.endedAt).toBeGreaterThanOrEqual(audits[1]?.startedAt ?? 0);
+    expect(JSON.stringify(audits)).not.toContain("untrusted-secret");
+  });
+
   it("drops the overlay when the live schema changed underneath the compile", async () => {
     const registry = new ActionRegistry();
     registry.register(provider());

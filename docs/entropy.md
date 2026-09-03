@@ -120,7 +120,14 @@ reviewable, evidence-carrying proposals with fixed thresholds:
   converged surface stops contesting its own tightness every turn. Later
   compiles may tighten beneath the floor but never widen past it; widening
   resets only when the base schema drifts (the digest proof drops the
-  overlay) or through review.
+  overlay) or through review. Validate-rejected attempts record as
+  failed-call audits carrying only values the live schema's own enums
+  declare, so nothing a validator refused enters the durable record: the
+  refused value is already the author's public vocabulary, and typos or
+  out-of-domain payloads drop at the boundary. The attempt stays pre-birth
+  while the overlay holds, and the reset re-derives with it included, so a
+  refused in-domain value un-locks at the first drift and survives in the
+  corpus.
 - `declare-enum`: the same observation shape on an open parameter (a free
   string or number, an undeclared key, or a ref absent from the surface
   entirely) is evidence about the author's domain, not the compiler's to
