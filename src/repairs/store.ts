@@ -146,7 +146,9 @@ const reapStaleLock = (lock: string, verify: (claimed: string) => boolean): bool
   return true;
 };
 
-const withRepairLock = <T>(directory: string, operation: () => T): T => {
+// Shared agent-dir store lock: the repairs table and the entropy ledger
+// both serialize their read-modify-write cycles through this directory lock.
+export const withRepairLock = <T>(directory: string, operation: () => T): T => {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const lock = lockPath(directory);
   const ownerPath = path.join(lock, "owner");

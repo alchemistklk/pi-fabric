@@ -13,6 +13,7 @@ const stable = [
   "residency/host.js",
   "compaction/hook.js",
   "core/action-registry.js",
+  "entropy/index.js",
   "memory/digest.js",
   "memory/search.js",
   "memory/discovery.js",

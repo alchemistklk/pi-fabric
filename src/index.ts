@@ -785,4 +785,5 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
 }
 
 export * from "./audit/index.js";
+export * from "./entropy/index.js";
 export * from "./protocol.js";

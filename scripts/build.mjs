@@ -12,6 +12,7 @@ const result = await build({
     "src/residency/actor-client.ts",
     "src/compaction/hook.ts",
     "src/core/action-registry.ts",
+    "src/entropy/index.ts",
     "src/memory/digest.ts",
     "src/memory/search.ts",
     "src/memory/discovery.ts",

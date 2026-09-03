@@ -31,6 +31,7 @@
     "test:related": "vitest run --related",
     "check:fast": "bun run typecheck && bun run test:changed",
     "certify:context": "bun run build && node scripts/certify-context.mjs",
+    "certify:entropy": "bun run build && node scripts/certify-entropy.mjs",
     "benchmark:real-resume": "bun run build && node scripts/benchmark-real-resume.mjs",
     "benchmark:memory-heads": "bun run build && node scripts/benchmark-memory-heads.mjs",
     "lint:dead": "knip --no-gitignore",

@@ -55,3 +55,5 @@ Two failure modes stay visible, never silent:
 ```
 
 Disable with `"enabled": false`. Promotion never edits execution guidance or Schema text.
+
+The repair table is the profiler for [tool entropy](entropy.md): the deterministic meter, ratchet gate, and `certify:entropy` compiler loop turn promoted rows into reviewable surface diffs.

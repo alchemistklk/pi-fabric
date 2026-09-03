@@ -19,6 +19,13 @@ import {
 } from "../protocol.js";
 import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
 import type { RepairStatus } from "../repairs/types.js";
+import {
+  entropyDirectory,
+  entropyTrend,
+  loadEntropyLedger,
+  type LoadedEntropyLedger,
+} from "../entropy/ledger.js";
+import { ENTROPY_METRIC_VERSION } from "../entropy/types.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -248,6 +255,21 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     ].join("\n");
   };
 
+  const formatEntropyStatus = (status: RepairStatus, loaded: LoadedEntropyLedger): string => {
+    const trend = entropyTrend(loaded.ledger);
+    const ledgerLine =
+      trend.count === 0
+        ? "ledger: (empty — run `bun run certify:entropy --record` against a session corpus)"
+        : `ledger: ${trend.count} entries · last score ${trend.lastScore ?? "n/a"} · slope ${trend.slopePerEntry}/entry`;
+    return [
+      `entropy: metric v${ENTROPY_METRIC_VERSION} · digest ${status.catalogDigest.slice(0, 12) || "none"}`,
+      `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
+      ledgerLine,
+      ...(loaded.error ? [`store: ${loaded.error}`] : []),
+      "certify: bun run certify:entropy   # offline corpus meter, ratchet gate, ledger append",
+    ].join("\n");
+  };
+
   pi.registerCommand("fabric", {
     description: "Open Fabric, arm prewalk, reload, or manage agents and actors",
     getArgumentCompletions: (argumentPrefix: string): AutocompleteItem[] | null => {
@@ -274,6 +296,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         "export",
         "kill",
         "repairs",
+        "entropy",
       ];
       const idCommands = new Set([
         "messages",
@@ -844,9 +867,18 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         context.ui.notify(formatRepairStatus(state.repairs.status()), "info");
         return;
       }
+      if (command === "entropy") {
+        if (argumentsList[0] !== undefined) {
+          context.ui.notify("Usage: /fabric entropy", "warning");
+          return;
+        }
+        const loaded = loadEntropyLedger(entropyDirectory(resolveAgentDir()));
+        context.ui.notify(formatEntropyStatus(state.repairs.status(), loaded), "info");
+        return;
+      }
       if (command !== "status") {
         context.ui.notify(
-          "Usage: /fabric [status|dashboard|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs]",
+          "Usage: /fabric [status|dashboard|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy]",
           "warning",
         );
         return;
