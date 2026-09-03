@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { resolveAgentCwd, validateAgentCwdRequest } from "../agents/manager.js";
+import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, processIsAlive, spawnDetached } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
@@ -406,11 +406,7 @@ export class ResidencyClient {
     ) {
       return undefined;
     }
-    if (
-      metadata.handle.worktree &&
-      path.resolve(metadata.handle.worktree) !==
-        path.resolve(os.tmpdir(), "pi-fabric-worktrees", id)
-    ) {
+    if (metadata.handle.worktree && !isFabricWorktreePath(metadata.handle.worktree, id)) {
       return undefined;
     }
     if (

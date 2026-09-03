@@ -3,6 +3,7 @@ dist/
 coverage/
 .pi/fabric-runs/
 .pi/fabric/mesh/
+.pi/fabric/worktrees/
 .veda/
 *.log
 .DS_Store
