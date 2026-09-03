@@ -67,6 +67,14 @@ export interface EntropyValueObservation {
   value: string | number | boolean;
 }
 
+// One verbatim call per persisted audit: the authoritative record of the
+// arguments a call actually used. Trace V1 projects values away per ref, so
+// replay validation consults these, never the projected trace args.
+export interface EntropyAuditCall {
+  ref: string;
+  args: Record<string, unknown>;
+}
+
 export interface EntropyShapeSignature {
   signature: string;
   count: number;

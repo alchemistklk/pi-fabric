@@ -11,12 +11,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { sessionDirForCwd, sessionsDirRoot } from "../memory/discovery.js";
 import {
+  entropySessionEvidenceFromJsonl,
   entropyTracesFromSessionJsonl,
-  entropyValueObservationsFromSessionJsonl,
 } from "./corpus.js";
 import { measureEntropy } from "./meter.js";
 import { compareCodeUnits, trendFromScores } from "./fingerprint.js";
 import type {
+  EntropyAuditCall,
   EntropyModelReport,
   EntropyReport,
   EntropySurfaceSnapshot,
@@ -207,12 +208,13 @@ export const measureSessionCorpus = (input: {
   };
 };
 
-// One read per file yields both meter traces and the verbatim audit value
-// corpus, so the autonomous compile and the command share a single window
-// scan.
+// One read per file yields the meter traces, the verbatim audit value
+// corpus, and the verbatim audit calls, so the autonomous compile and the
+// command share a single window scan.
 export interface SessionWindowEvidence {
   traces: EntropyTraceInput[];
   valueObservations: EntropyValueObservation[];
+  auditCalls: EntropyAuditCall[];
 }
 
 export const sessionWindowEvidence = (
@@ -220,6 +222,7 @@ export const sessionWindowEvidence = (
 ): SessionWindowEvidence => {
   const traces: EntropyTraceInput[] = [];
   const valueObservations: EntropyValueObservation[] = [];
+  const auditCalls: EntropyAuditCall[] = [];
   for (const file of files) {
     let text: string;
     try {
@@ -227,9 +230,10 @@ export const sessionWindowEvidence = (
     } catch {
       continue;
     }
-    const lines = text.split("\n");
-    traces.push(...entropyTracesFromSessionJsonl(lines));
-    valueObservations.push(...entropyValueObservationsFromSessionJsonl(lines));
+    const evidence = entropySessionEvidenceFromJsonl(text.split("\n"));
+    traces.push(...evidence.traces);
+    valueObservations.push(...evidence.valueObservations);
+    auditCalls.push(...evidence.auditCalls);
   }
-  return { traces, valueObservations };
+  return { traces, valueObservations, auditCalls };
 };

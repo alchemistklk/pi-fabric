@@ -410,6 +410,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
       surface: snapshot,
       repairs: entropyRepairRows(state.repairs.repairs),
       valueObservations: evidence.valueObservations,
+      auditCalls: evidence.auditCalls,
       ...(loaded.file ? { artifact: loaded.file } : {}),
     });
     const review = outcome.proposals.filter(

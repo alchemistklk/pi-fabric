@@ -312,4 +312,36 @@ describe("per-model session attribution", () => {
       "pi.read",
     ]);
   });
+
+  it("sessionWindowEvidence collects verbatim audit calls", () => {
+    const agentDir = makeTempDir();
+    const dir = path.join(agentDir, "sessions", encodeCwdDir("/repo"));
+    fs.mkdirSync(dir, { recursive: true });
+    const write = (name: string, mtime: Date, content: string): void => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `${content}\n`);
+      fs.utimesSync(file, mtime, mtime);
+    };
+    write(
+      "audits.jsonl",
+      new Date(2021, 0, 1),
+      JSON.stringify({
+        id: "t3",
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "c-t3",
+          toolName: "fabric_exec",
+          content: [{ type: "text", text: "ok" }],
+          details: {
+            success: true,
+            trace: traceEnvelope("pi.read", { path: "a" }),
+            audits: [{ ref: "mcp.render", args: { format: "pdf" } }],
+          },
+        },
+      }),
+    );
+    const evidence = sessionWindowEvidence(projectSessionFiles(agentDir, "/repo"));
+    expect(evidence.auditCalls).toEqual([{ ref: "mcp.render", args: { format: "pdf" } }]);
+  });
 });

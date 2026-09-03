@@ -10,6 +10,7 @@ import {
 import { stableJsonHash } from "../core/stable-hash.js";
 import type { CatalogRepair } from "../repairs/types.js";
 import type {
+  EntropyAuditCall,
   EntropyReport,
   EntropyRepairRowInput,
   EntropyTraceInput,
@@ -100,27 +101,25 @@ const sessionRecords = (lines: readonly string[]): ScannedSessionRecord[] => {
   return records;
 };
 
-// Extract meter traces from Pi session JSONL lines. Malformed lines, non-trace
-// entries, and envelopes that fail the trace guard are skipped without
-// throwing; only typed, guarded trace V1 envelopes count.
-export const entropyTracesFromSessionJsonl = (lines: readonly string[]): EntropyTraceInput[] => {
+// One scan of the session records yields all three evidence corpora: meter
+// traces, the verbatim audit value corpus, and the verbatim audit calls
+// themselves. The extractors below stay thin so every caller keeps its
+// public shape.
+export interface EntropySessionEvidence {
+  traces: EntropyTraceInput[];
+  valueObservations: EntropyValueObservation[];
+  auditCalls: EntropyAuditCall[];
+}
+
+export const entropySessionEvidenceFromJsonl = (
+  lines: readonly string[],
+): EntropySessionEvidence => {
   const traces: EntropyTraceInput[] = [];
+  const valueObservations: EntropyValueObservation[] = [];
+  const auditCalls: EntropyAuditCall[] = [];
   for (const record of sessionRecords(lines)) {
     const trace = readFabricExecutionTraceV1(record.details.trace);
     if (trace) traces.push(entropyTraceFromFabricTrace(trace, record.model));
-  }
-  return traces;
-};
-
-// Verbatim audit arguments are the authoritative value corpus for
-// enum-tighten: trace V1 projects values away per ref (external and MCP calls
-// keep none), while persisted audits carry every argument the call used. The
-// observations stay local to the session record, exactly like the audits.
-export const entropyValueObservationsFromSessionJsonl = (
-  lines: readonly string[],
-): EntropyValueObservation[] => {
-  const observations: EntropyValueObservation[] = [];
-  for (const record of sessionRecords(lines)) {
     const details = record.details;
     if (!Array.isArray(details.audits)) continue;
     for (const audit of details.audits) {
@@ -128,15 +127,36 @@ export const entropyValueObservationsFromSessionJsonl = (
       const ref = typeof audit.ref === "string" ? audit.ref : undefined;
       const args = isRecord(audit.args) ? audit.args : undefined;
       if (!ref || !args) continue;
+      auditCalls.push({ ref, args });
       for (const [key, value] of Object.entries(args)) {
         if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-          observations.push({ ref, key, value });
+          valueObservations.push({ ref, key, value });
         }
       }
     }
   }
-  return observations;
+  return { traces, valueObservations, auditCalls };
 };
+
+// Extract meter traces from Pi session JSONL lines. Malformed lines, non-trace
+// entries, and envelopes that fail the trace guard are skipped without
+// throwing; only typed, guarded trace V1 envelopes count.
+export const entropyTracesFromSessionJsonl = (lines: readonly string[]): EntropyTraceInput[] =>
+  entropySessionEvidenceFromJsonl(lines).traces;
+
+// Verbatim audit arguments are the authoritative value corpus for
+// enum-tighten. The observations stay local to the session record, exactly
+// like the audits.
+export const entropyValueObservationsFromSessionJsonl = (
+  lines: readonly string[],
+): EntropyValueObservation[] => entropySessionEvidenceFromJsonl(lines).valueObservations;
+
+// One verbatim call per persisted audit: the authoritative replay corpus.
+// Trace V1 projects values away per ref (external and MCP calls keep none),
+// so replay validation consults these whenever a touched ref has them.
+export const entropyAuditCallsFromSessionJsonl = (
+  lines: readonly string[],
+): EntropyAuditCall[] => entropySessionEvidenceFromJsonl(lines).auditCalls;
 
 // Normalize catalog repair rows for the meter. `ref` is the target the row
 // repairs toward: the declared key's action for key aliases, or

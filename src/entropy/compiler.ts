@@ -21,6 +21,7 @@ import {
 import { entropySurfaceHash } from "./surface.js";
 import { ENTROPY_METRIC_VERSION } from "./types.js";
 import type {
+  EntropyAuditCall,
   EntropyGateResult,
   EntropyProposal,
   EntropyRepairRowInput,
@@ -39,6 +40,7 @@ export interface CompileEntropyInput {
   surface: EntropySurfaceSnapshot;
   repairs?: readonly EntropyRepairRowInput[];
   valueObservations?: readonly EntropyValueObservation[];
+  auditCalls?: readonly EntropyAuditCall[];
   artifact?: CompiledSurfaceFile;
   catalogDigest?: string;
 }
@@ -163,8 +165,10 @@ export const compileEntropySurface = (input: CompileEntropyInput): CompileEntrop
   const scoreGate = evaluateGate(report, after);
   const violations = replaySuccessfulCalls(
     candidate,
+    effective,
     input.traces,
     touchedRefs(effective, candidate),
+    input.auditCalls,
   );
   const reasons = [
     ...scoreGate.reasons,

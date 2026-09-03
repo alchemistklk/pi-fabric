@@ -107,7 +107,9 @@ reviewable, evidence-carrying proposals with fixed thresholds:
   and a ≥ 50% top share compiles into an enum. Value observations come from
   the verbatim audits when supplied
   (`entropyValueObservationsFromSessionJsonl`); the projected trace args
-  are the fallback. A gate-proven enum is a floor: observed values outside
+  are the fallback. Boolean-typed parameters never propose: a two-value
+  enum prices above the declared boolean, so the tightening could only
+  raise freedom. A gate-proven enum is a floor: observed values outside
   it are pre-birth evidence (recorded before the overlay existed, or after
   a digest proof fell) and are dropped, never re-proposed, so a
   converged surface stops contesting its own tightness every turn. Later
@@ -138,7 +140,11 @@ sequence-fuse author new composite definitions, so they stay review-only.
 increase the score. `compileEntropySurface` adds the second half of the
 contract: replay preservation. Every successful call to a ref the compile
 touched must still parse against the candidate surface, checked with the
-same TypeBox validation the registry's validate stage runs. The compile step
+same TypeBox validation the registry's validate stage runs. When a
+touched ref has verbatim audit calls, they are the replay corpus: trace
+V1 projects values away per ref, so projected trace args cannot judge a
+candidate. Audits the declared surface already rejected are not
+protected, because those calls never executed. The compile step
 is measure → propose → apply → re-measure → gate; a gate failure keeps the
 old surface and records the rejection. Monotonicity and preservation are
 measured, never argued. A converged surface stops proposing, which the

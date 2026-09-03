@@ -152,10 +152,62 @@ describe("replay preservation", () => {
         ],
       },
     ];
-    const violations = replaySuccessfulCalls(effective, traces, touched);
+    const violations = replaySuccessfulCalls(effective, live, traces, touched);
     expect(violations).toEqual([
       { ref: "memory.recall", reason: "recorded arguments no longer validate against the compiled schema" },
       { ref: "mcp.flaky.run", reason: "absent from the candidate surface" },
     ]);
+  });
+
+  it("replays verbatim audit args when present and ignores projected trace args", () => {
+    const live: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [
+        {
+          ref: "mcp.render",
+          inputSchema: {
+            type: "object",
+            properties: { format: { type: "string" } },
+            required: ["format"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    };
+    const candidate: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [
+        {
+          ref: "mcp.render",
+          inputSchema: {
+            type: "object",
+            properties: { format: { type: "string", enum: ["pdf", "html"] } },
+            required: ["format"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    };
+    const touched = new Set(["mcp.render"]);
+    const traces: EntropyTraceInput[] = [{ operations: [op("mcp.render", {})] }];
+    expect(
+      replaySuccessfulCalls(candidate, live, traces, touched, [
+        { ref: "mcp.render", args: { format: "pdf" } },
+        { ref: "mcp.render", args: { format: "html" } },
+        { ref: "mcp.render", args: { format: 5 } },
+      ]),
+    ).toEqual([]);
+    expect(
+      replaySuccessfulCalls(candidate, live, [], touched, [
+        { ref: "mcp.render", args: { format: "docx" } },
+      ]),
+    ).toEqual([
+      { ref: "mcp.render", reason: "recorded arguments no longer validate against the compiled schema" },
+    ]);
+    expect(
+      replaySuccessfulCalls({ version: 1, actions: [] }, live, [], touched, [
+        { ref: "mcp.render", args: { format: "pdf" } },
+      ]),
+    ).toEqual([{ ref: "mcp.render", reason: "absent from the candidate surface" }]);
   });
 });

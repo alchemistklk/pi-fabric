@@ -276,6 +276,45 @@ describe("proposeEntropyReductions", () => {
     ]);
   });
 
+  it("never proposes enum-tighten for a declared boolean parameter", () => {
+    const surface = surfaceOf([
+      {
+        ref: "mcp.flags.set",
+        inputSchema: {
+          type: "object",
+          properties: { force: { type: "boolean" } },
+          required: ["force"],
+          additionalProperties: false,
+        },
+      },
+    ]);
+    const traces = [
+      trace([
+        ...Array.from({ length: 5 }, () => op("mcp.flags.set", { force: true })),
+        ...Array.from({ length: 3 }, () => op("mcp.flags.set", { force: false })),
+      ]),
+    ];
+    const valueObservations = [
+      ...Array.from({ length: 5 }, () => ({ ref: "mcp.flags.set", key: "force", value: true })),
+      ...Array.from({ length: 3 }, () => ({ ref: "mcp.flags.set", key: "force", value: false })),
+    ];
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces, surface }),
+        traces,
+        surface,
+        valueObservations,
+      }),
+    ).toEqual([]);
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces }),
+        traces,
+        valueObservations,
+      }),
+    ).toEqual([expect.objectContaining({ kind: "enum-tighten" })]);
+  });
+
   it("applies proposals without mutating the input surface", () => {
     const surface = ratchetSurface();
     const snapshot = JSON.stringify(surface);

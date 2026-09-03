@@ -8,7 +8,12 @@
 
 import { Value } from "typebox/value";
 import { stableJsonHash } from "../core/stable-hash.js";
-import type { EntropyProposal, EntropySurfaceSnapshot, EntropyTraceInput } from "./types.js";
+import type {
+  EntropyAuditCall,
+  EntropyProposal,
+  EntropySurfaceSnapshot,
+  EntropyTraceInput,
+} from "./types.js";
 
 export const COMPILED_SURFACE_VERSION = 1 as const;
 export const MAX_COMPILED_SURFACE_PROPOSALS = 256;
@@ -201,30 +206,68 @@ export interface ReplayViolation {
 // must still parse against the candidate surface — resolution plus the same
 // TypeBox check the registry's validate stage uses. Untouched refs keep
 // their schema by identity, so replay stays scoped to the touched set.
+// When a touched ref has verbatim audit calls, they are the replay corpus:
+// trace V1 projects values away per ref, so validating the projected trace
+// args would phantom-reject calls that actually parsed. Audits the declared
+// surface already rejected are not protected — those calls never executed,
+// so no compile can invalidate them.
 export const replaySuccessfulCalls = (
   surface: EntropySurfaceSnapshot,
+  before: EntropySurfaceSnapshot,
   traces: readonly EntropyTraceInput[],
   touchedRefs: ReadonlySet<string>,
+  auditCalls?: readonly EntropyAuditCall[],
 ): ReplayViolation[] => {
   const schemaByRef = new Map(surface.actions.map((action) => [action.ref, action.inputSchema]));
+  const beforeByRef = new Map(before.actions.map((action) => [action.ref, action.inputSchema]));
+  const accepts = (schema: unknown, args: Record<string, unknown>): boolean => {
+    try {
+      return isPlainRecord(schema) && Value.Check(schema, args);
+    } catch {
+      return false;
+    }
+  };
   const violations: ReplayViolation[] = [];
+  const auditedRefs = new Set<string>();
+  if (auditCalls) {
+    const auditArgsByRef = new Map<string, Record<string, unknown>[]>();
+    for (const call of auditCalls) {
+      if (!touchedRefs.has(call.ref)) continue;
+      const bucket = auditArgsByRef.get(call.ref) ?? [];
+      bucket.push(call.args);
+      auditArgsByRef.set(call.ref, bucket);
+    }
+    for (const [ref, argsList] of auditArgsByRef) {
+      auditedRefs.add(ref);
+      const schema = schemaByRef.get(ref);
+      if (schema === undefined) {
+        violations.push({ ref, reason: "absent from the candidate surface" });
+        continue;
+      }
+      const declared = beforeByRef.get(ref);
+      for (const args of argsList) {
+        if (declared !== undefined && !accepts(declared, args)) continue;
+        if (!accepts(schema, args)) {
+          violations.push({
+            ref,
+            reason: "recorded arguments no longer validate against the compiled schema",
+          });
+        }
+      }
+    }
+  }
   for (const sourceTrace of traces) {
     for (const operation of sourceTrace.operations) {
       if (operation.outcome !== "succeeded") continue;
       if (operation.ref.startsWith("fabric.")) continue;
       if (!touchedRefs.has(operation.ref)) continue;
+      if (auditedRefs.has(operation.ref)) continue;
       const schema = schemaByRef.get(operation.ref);
       if (schema === undefined) {
         violations.push({ ref: operation.ref, reason: "absent from the candidate surface" });
         continue;
       }
-      let valid = false;
-      try {
-        valid = isPlainRecord(schema) && Value.Check(schema, operation.args);
-      } catch {
-        valid = false;
-      }
-      if (!valid) {
+      if (!accepts(schema, operation.args)) {
         violations.push({
           ref: operation.ref,
           reason: "recorded arguments no longer validate against the compiled schema",

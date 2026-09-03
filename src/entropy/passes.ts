@@ -104,6 +104,11 @@ const floorIncumbentEnum = (
   if (!hasSurface) return candidate;
   const properties = schemaProperties(surfaceByRef.get(candidate.entry.ref));
   const target = properties ? properties[candidate.entry.key] : undefined;
+  // A declared boolean cannot tighten: a two-value enum prices at
+  // log2(2)/ENUM_SATURATION_BITS, above the boolean's 0.1, so the proposal
+  // could only raise freedom and the gate would reject it every turn. Skip
+  // at proposal time.
+  if ((target as Record<string, unknown> | undefined)?.type === "boolean") return undefined;
   const existing = enumKeys(target);
   if (!existing) return candidate;
   const ranked = candidate.ranked.filter((item) => existing.has(valueKey(item.value)));

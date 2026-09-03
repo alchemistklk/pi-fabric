@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  entropyAuditCallsFromSessionJsonl,
   entropyRepairRows,
   entropyTraceFromFabricTrace,
   entropyTracesFromSessionJsonl,
@@ -96,6 +97,33 @@ describe("entropyRepairRows", () => {
     expect(entropyRepairRows(repairs)).toEqual([
       { kind: "keyAlias", ref: "memory.expand", from: "sessionId", to: "session" },
       { kind: "actionAlias", ref: "memory.expand", from: "expandEntry", to: "expand" },
+    ]);
+  });
+});
+
+describe("entropyAuditCallsFromSessionJsonl", () => {
+  it("extracts one verbatim call per persisted audit and skips malformed entries", () => {
+    const lines = [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          details: {
+            trace: fabricTrace(["build"]),
+            audits: [
+              { ref: "pi.read", args: { path: "src/a.ts", limit: 10 } },
+              { ref: "mcp.render", args: { format: "pdf" } },
+              "not a record",
+              { ref: 5, args: {} },
+              { ref: "mcp.broken", args: "not a record" },
+            ],
+          },
+        },
+      }),
+    ];
+    expect(entropyAuditCallsFromSessionJsonl(lines)).toEqual([
+      { ref: "pi.read", args: { path: "src/a.ts", limit: 10 } },
+      { ref: "mcp.render", args: { format: "pdf" } },
     ]);
   });
 });

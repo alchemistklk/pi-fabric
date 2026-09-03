@@ -234,6 +234,39 @@ describe("compileEntropySurface", () => {
     expect(outcome.artifact).toBe(incumbent);
     expect(outcome.gate).toBeUndefined();
   });
+
+  it("replays verbatim audits so projected traces cannot poison the gate", () => {
+    const declared = {
+      type: "object",
+      properties: { format: { type: "string" } },
+      required: ["format"],
+      additionalProperties: false,
+    };
+    const surface: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [{ ref: "mcp.render", inputSchema: declared }],
+    };
+    const traces = [trace(Array.from({ length: 8 }, () => op("mcp.render", {})))];
+    const valueObservations = [
+      ...Array.from({ length: 6 }, () => ({ ref: "mcp.render", key: "format", value: "pdf" })),
+      { ref: "mcp.render", key: "format", value: "html" },
+      { ref: "mcp.render", key: "format", value: "html" },
+    ];
+    const auditCalls = [
+      ...Array.from({ length: 6 }, () => ({ ref: "mcp.render", args: { format: "pdf" } })),
+      { ref: "mcp.render", args: { format: "html" } },
+      { ref: "mcp.render", args: { format: "html" } },
+    ];
+    const outcome = compileEntropySurface({ traces, surface, valueObservations, auditCalls });
+    expect(outcome.status).toBe("compiled");
+    expect(outcome.gate?.passed).toBe(true);
+    const poisoned = compileEntropySurface({ traces, surface, valueObservations });
+    expect(poisoned.status).toBe("rejected");
+    expect(poisoned.gate?.reasons).toHaveLength(8);
+    expect(poisoned.gate?.reasons[0]).toBe(
+      "mcp.render: recorded arguments no longer validate against the compiled schema",
+    );
+  });
 });
 
 describe("compiled surface store", () => {
