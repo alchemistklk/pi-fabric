@@ -60,11 +60,14 @@ export interface EntropyRepairRowInput {
 
 // One verbatim argument value observed in persisted audits: the value-level
 // corpus for enum-tighten. Trace V1 projects values away per ref; audits
-// carry every argument the call actually used.
+// carry every argument the call actually used. Pooled observations carry
+// `count` multiplicity instead of one entry per call.
 export interface EntropyValueObservation {
   ref: string;
   key: string;
   value: string | number | boolean;
+  /** Observation multiplicity; window scans emit one entry per call, pools emit one per distinct value. */
+  count?: number;
 }
 
 // One verbatim call per persisted audit: the authoritative record of the
@@ -144,6 +147,15 @@ export interface EntropyReport {
 export type EntropyProposal =
   | {
       kind: "enum-tighten";
+      ref: string;
+      key: string;
+      values: (string | number | boolean)[];
+      calls: number;
+      distinct: number;
+      topShare: number;
+    }
+  | {
+      kind: "declare-enum";
       ref: string;
       key: string;
       values: (string | number | boolean)[];

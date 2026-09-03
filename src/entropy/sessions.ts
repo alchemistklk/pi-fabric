@@ -209,12 +209,19 @@ export const measureSessionCorpus = (input: {
 };
 
 // One read per file yields the meter traces, the verbatim audit value
-// corpus, and the verbatim audit calls, so the autonomous compile and the
-// command share a single window scan.
+// corpus, the verbatim audit calls, and the per-file observation windows
+// the machine-wide pool consumes with exact deltas, so the autonomous
+// compile and the command share a single window scan.
+export interface SessionObservationWindow {
+  file: string;
+  observations: EntropyValueObservation[];
+}
+
 export interface SessionWindowEvidence {
   traces: EntropyTraceInput[];
   valueObservations: EntropyValueObservation[];
   auditCalls: EntropyAuditCall[];
+  observationWindows: SessionObservationWindow[];
 }
 
 export const sessionWindowEvidence = (
@@ -223,6 +230,7 @@ export const sessionWindowEvidence = (
   const traces: EntropyTraceInput[] = [];
   const valueObservations: EntropyValueObservation[] = [];
   const auditCalls: EntropyAuditCall[] = [];
+  const observationWindows: SessionObservationWindow[] = [];
   for (const file of files) {
     let text: string;
     try {
@@ -234,6 +242,7 @@ export const sessionWindowEvidence = (
     traces.push(...evidence.traces);
     valueObservations.push(...evidence.valueObservations);
     auditCalls.push(...evidence.auditCalls);
+    observationWindows.push({ file, observations: evidence.valueObservations });
   }
-  return { traces, valueObservations, auditCalls };
+  return { traces, valueObservations, auditCalls, observationWindows };
 };

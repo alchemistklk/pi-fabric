@@ -13,13 +13,16 @@ import {
   applyProposalsToSurface,
   compileEntropySurface,
   entropyReportHash,
+  entropySessionEvidenceFromJsonl,
   entropySurfaceHash,
   entropyTracesFromSessionJsonl,
   entropyValueObservationsFromSessionJsonl,
   evaluateGate,
   loadCompiledSurface,
   measureEntropy,
+  mergeObservationWindow,
   parseCompiledSurfaceArtifact,
+  poolToValueObservations,
   proposeEntropyReductions,
   runEntropyTrial,
   saveCompiledSurface,
@@ -156,7 +159,7 @@ const ratchetSurface = () =>
         type: "object",
         additionalProperties: false,
         required: ["format"],
-        properties: { format: { type: "string" } },
+        properties: { format: { type: "string", enum: ["docx", "html", "pdf", "web"] } },
       },
     },
     {
@@ -419,9 +422,9 @@ export const runEntropyCertification = async (options = {}) => {
   check(
     "ratchet-monotone",
     gate.passed &&
-      before.score === 0.333435 &&
+      before.score === 0.323019 &&
       after.score === 0.179789 &&
-      gate.delta === -0.153646,
+      gate.delta === -0.14323,
     `score ${before.score} → ${after.score} delta ${gate.delta} reasons ${gate.reasons.join("; ")}`,
   );
   const roundTwo = proposeEntropyReductions({
@@ -453,10 +456,10 @@ export const runEntropyCertification = async (options = {}) => {
   check(
     "compiler-loop",
     compiledOutcome.status === "compiled" &&
-      compiledOutcome.report.score === 0.333435 &&
+      compiledOutcome.report.score === 0.323019 &&
       compiledOutcome.gate.passed === true &&
       compiledOutcome.after.score === 0.304789 &&
-      compiledOutcome.gate.delta === -0.028646 &&
+      compiledOutcome.gate.delta === -0.01823 &&
       compiledOutcome.artifact.actions.length === 1 &&
       compiledOutcome.artifact.actions[0].ref === "mcp.report.render" &&
       compiledOutcome.artifact.actions[0].baseSchemaDigest ===
@@ -541,8 +544,8 @@ export const runEntropyCertification = async (options = {}) => {
       converged.behavioralScore === 0 &&
       wobble.staticScore === 0 &&
       wobble.behavioralScore === wobble.score &&
-      before.staticScore === 0.046875 &&
-      before.behavioralScore === 0.28656 &&
+      before.staticScore === 0.036458 &&
+      before.behavioralScore === 0.286561 &&
       Math.abs(before.staticScore + before.behavioralScore - before.score) < 1e-6,
     `static ${before.staticScore} + behavioral ${before.behavioralScore} vs score ${before.score}`,
   );
@@ -626,17 +629,184 @@ export const runEntropyCertification = async (options = {}) => {
     traces: ingestedTraces,
     valueObservations,
   });
-  const auditProposal = fromAudits.find((proposal) => proposal.kind === "enum-tighten");
+  const auditProposal = fromAudits.find((proposal) => proposal.kind === "declare-enum");
   check(
     "audit-value-observations",
     valueObservations.length === 11 &&
       renderObservations.length === 8 &&
-      !fromTraces.some((proposal) => proposal.kind === "enum-tighten") &&
+      !fromTraces.some(
+        (proposal) => proposal.kind === "enum-tighten" || proposal.kind === "declare-enum",
+      ) &&
       Boolean(auditProposal) &&
       auditProposal.ref === "mcp.report.render" &&
       auditProposal.key === "format" &&
       JSON.stringify(auditProposal.values) === JSON.stringify(["pdf", "html"]),
     `observations ${valueObservations.length} renders ${renderObservations.length}`,
+  );
+
+  // Closed-domain guard: a stable vocabulary on a free parameter never
+  // auto-applies. The compile converges and the evidence surfaces as a
+  // declare-enum review signal for the surface author, because inventing a
+  // domain the schema never claimed is sharpening the wrong entropy.
+  const guardSurface = () =>
+    surfaceOf([
+      {
+        ref: "mcp.report.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string" } },
+        },
+      },
+    ]);
+  const guardTraces = [
+    trace(
+      [
+        ...Array.from({ length: 7 }, () => op("mcp.report.render", { format: "pdf" })),
+        op("mcp.report.render", { format: "html" }),
+      ],
+      "guard",
+    ),
+  ];
+  const guardOutcome = compileEntropySurface({
+    traces: guardTraces,
+    surface: guardSurface(),
+  });
+  const guardSignal = guardOutcome.proposals.find((proposal) => proposal.kind === "declare-enum");
+  check(
+    "closed-domain-guard",
+    guardOutcome.status === "converged" &&
+      guardOutcome.artifact === undefined &&
+      Boolean(guardSignal) &&
+      guardSignal.ref === "mcp.report.render" &&
+      guardSignal.key === "format" &&
+      JSON.stringify(guardSignal.values) === JSON.stringify(["pdf", "html"]) &&
+      !guardOutcome.proposals.some((proposal) => proposal.kind === "enum-tighten"),
+    `status ${guardOutcome.status} proposals ${guardOutcome.proposals.map((p) => p.kind).join(",")}`,
+  );
+
+  // Pooled evidence: windows below the observation threshold pool into
+  // counts that clear it, unchanged sessions merge nothing, and identical
+  // multisets never merge twice.
+  const poolSurface = () =>
+    surfaceOf([
+      {
+        ref: "mcp.flags.set",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["level"],
+          properties: {
+            level: { type: "string", enum: ["debug", "error", "info", "warn"] },
+          },
+        },
+      },
+    ]);
+  const poolWindowA = {
+    file: "a.jsonl",
+    observations: [
+      { ref: "mcp.flags.set", key: "level", value: "info", count: 4 },
+      { ref: "mcp.flags.set", key: "level", value: "warn" },
+    ],
+  };
+  const poolWindowB = {
+    file: "b.jsonl",
+    observations: [
+      { ref: "mcp.flags.set", key: "level", value: "info", count: 3 },
+      { ref: "mcp.flags.set", key: "level", value: "error" },
+    ],
+  };
+  const pooledOnce = mergeObservationWindow(undefined, [poolWindowA, poolWindowB]);
+  const pooledAgain = mergeObservationWindow(pooledOnce.file, [poolWindowA, poolWindowB]);
+  const poolTrace = [trace([op("mcp.flags.set", { level: "info" })])];
+  const poolReport = measureEntropy({ traces: poolTrace, surface: poolSurface() });
+  const pooledProposals = proposeEntropyReductions({
+    report: poolReport,
+    traces: poolTrace,
+    surface: poolSurface(),
+    valueObservations: poolToValueObservations(pooledOnce.file),
+  });
+  const pooledTighten = pooledProposals.find((proposal) => proposal.kind === "enum-tighten");
+  check(
+    "pooled-evidence",
+    pooledOnce.mergedSessions === 2 &&
+      pooledAgain.mergedSessions === 0 &&
+      pooledAgain.skippedSessions === 2 &&
+      JSON.stringify(pooledOnce.file) === JSON.stringify(pooledAgain.file) &&
+      Boolean(pooledTighten) &&
+      pooledTighten.ref === "mcp.flags.set" &&
+      pooledTighten.key === "level" &&
+      JSON.stringify(pooledTighten.values) === JSON.stringify(["info", "error", "warn"]) &&
+      pooledTighten.calls === 9,
+    `merged ${pooledOnce.mergedSessions}/${pooledAgain.mergedSessions} values ${pooledTighten?.values.join(",")}`,
+  );
+
+  // Audited trial replay: refs with verbatim audits classify from the
+  // audit args, never the projected trace args, and a compiled rejection
+  // of an audited call counts as a cost because the outcome is unknown.
+  const trialLive = () =>
+    surfaceOf([
+      {
+        ref: "mcp.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string", enum: ["docx", "html", "pdf"] } },
+        },
+      },
+    ]);
+  const trialArtifact = {
+    version: 1,
+    metricVersion: 2,
+    actions: [
+      {
+        ref: "mcp.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string", enum: ["pdf", "html"] } },
+        },
+        baseSchemaDigest: schemaDigest(
+          trialLive().actions.find((action) => action.ref === "mcp.render").inputSchema,
+        ),
+      },
+    ],
+    quarantined: [],
+    applied: [],
+    gate: { passed: true, beforeScore: 0.02, afterScore: 0.01, reasons: [] },
+    evidenceDigest: "trial",
+  };
+  const trialTraces = [
+    trace(
+      [
+        op("mcp.render", {}),
+        op("mcp.render", {}),
+        op("mcp.render", {}, "failed", "invoke"),
+      ],
+      "trial",
+    ),
+  ];
+  const trialAudits = [
+    { ref: "mcp.render", args: { format: "pdf" } },
+    { ref: "mcp.render", args: { format: "docx" } },
+    { ref: "mcp.render", args: { format: "html" } },
+  ];
+  const trialReport = runEntropyTrial({
+    traces: trialTraces,
+    live: trialLive(),
+    artifact: trialArtifact,
+    auditCalls: trialAudits,
+  });
+  check(
+    "trial-audit-replay",
+    trialReport.totals.operations === 3 &&
+      trialReport.totals.bothAccept === 2 &&
+      trialReport.totals.tighteningCost === 1 &&
+      trialReport.verdict === "costly",
+    `ops ${trialReport.totals.operations} both-accept ${trialReport.totals.bothAccept} costs ${trialReport.totals.tighteningCost}`,
   );
 
   // Real session corpus (opt-in, development and CI). A live surface
@@ -663,7 +833,8 @@ export const runEntropyCertification = async (options = {}) => {
           ...fs.readFileSync(path.join(sessionsDir, file), "utf8").split("\n"),
         );
       }
-      const traces = entropyTracesFromSessionJsonl(lines);
+      const evidence = entropySessionEvidenceFromJsonl(lines);
+      const traces = evidence.traces;
       let surface;
       let catalogDigest = "(sessions)";
       if (options.surfacePath) {
@@ -728,7 +899,12 @@ export const runEntropyCertification = async (options = {}) => {
             }
           }
           if (artifact) {
-            const trial = runEntropyTrial({ traces, live: surface, artifact });
+            const trial = runEntropyTrial({
+              traces,
+              live: surface,
+              artifact,
+              auditCalls: evidence.auditCalls,
+            });
             trialSummary = {
               verdict: trial.verdict,
               declaredScore: trial.declaredScore,

@@ -159,4 +159,33 @@ describe("runEntropyTrial", () => {
     };
     expect(JSON.stringify(runEntropyTrial(input))).toBe(JSON.stringify(runEntropyTrial(input)));
   });
+
+  it("replays audited refs verbatim and counts unknown outcomes as costs", () => {
+    const traces = [
+      trace([
+        op("mcp.report.render", {}),
+        op("mcp.report.render", {}),
+        op("mcp.report.render", {}, "failed", "invoke"),
+      ]),
+    ];
+    const auditCalls = [
+      { ref: "mcp.report.render", args: { format: "pdf" } },
+      { ref: "mcp.report.render", args: { format: "docx" } },
+      { ref: "mcp.report.render", args: { format: "html" } },
+    ];
+    const report = runEntropyTrial({ traces, live: live(), artifact: artifact(), auditCalls });
+    expect(report.totals).toEqual({
+      operations: 3,
+      bothAccept: 2,
+      bothReject: 0,
+      tighteningCost: 1,
+      typedFailureWin: 0,
+      quarantineWin: 0,
+      quarantineCost: 0,
+    });
+    expect(report.divergences).toEqual([
+      { ref: "mcp.report.render", trialClass: "tightening-cost", count: 1 },
+    ]);
+    expect(report.verdict).toBe("costly");
+  });
 });

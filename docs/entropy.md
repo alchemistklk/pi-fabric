@@ -28,7 +28,9 @@ same report, which is what makes the score bisectable and CI-gateable.
 - **Audits**: persisted verbatim call arguments (`details.audits`). They are
   the value corpus for enum-tighten: trace V1 projects values away per ref,
   while audits carry every argument the call used. They stay local to the
-  session record.
+  session record, and the machine-wide observation pool accumulates their
+  counts across windows with exact per-session deltas, so sparse parameters
+  still reach the derivation thresholds.
 
 ## The metric
 
@@ -103,19 +105,28 @@ global report only.
 `proposeEntropyReductions({ report, traces, surface?, repairs? })` emits
 reviewable, evidence-carrying proposals with fixed thresholds:
 
-- `enum-tighten`: a parameter with ≥ 8 observations, 2–8 distinct values,
-  and a ≥ 50% top share compiles into an enum. Value observations come from
-  the verbatim audits when supplied
+- `enum-tighten`: a closed-domain parameter with ≥ 8 observations, 2–8
+  distinct values, and a ≥ 50% top share tightens beneath the enum its
+  schema already declares, removing values the corpus never uses. The
+  closed-domain rule is the guard rail: the auto loop may only subtract
+  freedom the schema claimed is bounded, never invent a domain. Value
+  observations come from the verbatim audits when supplied
   (`entropyValueObservationsFromSessionJsonl`); the projected trace args
-  are the fallback. Boolean-typed parameters never propose: a two-value
-  enum prices above the declared boolean, so the tightening could only
-  raise freedom. A gate-proven enum is a floor: observed values outside
-  it are pre-birth evidence (recorded before the overlay existed, or after
-  a digest proof fell) and are dropped, never re-proposed, so a
+  are the fallback. Boolean-typed parameters never propose: they are
+  already closed, and a two-value enum prices above the declared boolean.
+  A declared or previously compiled enum is a floor: observed values
+  outside it are pre-birth evidence (recorded before the overlay existed,
+  or after a digest proof fell) and are dropped, never re-proposed, so a
   converged surface stops contesting its own tightness every turn. Later
-  compiles may tighten beneath the floor but never widen past it;
-  widening resets only when the base schema drifts (the digest proof drops
-  the overlay) or through review.
+  compiles may tighten beneath the floor but never widen past it; widening
+  resets only when the base schema drifts (the digest proof drops the
+  overlay) or through review.
+- `declare-enum`: the same observation shape on an open parameter (a free
+  string or number, an undeclared key, or a ref absent from the surface
+  entirely) is evidence about the author's domain, not the compiler's to
+  enforce. It surfaces as a review signal naming the observed vocabulary:
+  once the author declares the enum, later compiles tighten beneath it
+  automatically. The auto loop never applies it.
 - `modal-rename`: a repair row whose target ref is called: compile the
   modal spilled spelling into the schema (rename the declared key or
   action) and retire the row. Skipped when the rename is already compiled
@@ -151,10 +162,12 @@ measured, never argued. A converged surface stops proposing, which the
 certification proves by requiring an empty second round.
 
 The autonomous loop applies only the mechanically safe kinds
-(`enum-tighten` and `noise-quarantine`). `overload-split` and `sequence-fuse`
-author new composite definitions, and a pure `modal-rename` drops the
-declared key that every successful call recorded, so all three stay
-surfaced for review and never auto-apply. The compile notification names
+(`enum-tighten` and `noise-quarantine`), and only beneath a domain the
+declared schema already bounds. `overload-split` and `sequence-fuse`
+author new composite definitions, `declare-enum` suggests a domain the
+schema has not claimed, and a pure `modal-rename` drops the declared key
+that every successful call recorded, so all of them stay surfaced for
+review and never auto-apply. The compile notification names
 each distinct review-only set once, so the reviewer sees what the compiler
 found and declined to apply mechanically.
 
@@ -174,6 +187,19 @@ proofs and artifact carry-forward read the declared schema; the
 model-facing catalog keeps hiding them.
 The compile is fire-and-forget (the next prompt never waits on it), and a
 session shutdown flushes a final compile while the window is richest.
+
+Value observations pool machine-wide with exact per-session deltas:
+`<agent dir>/fabric/entropy/observation-pool.json` accumulates per-value
+counts across every window the compiler reads, so a sparse closed domain
+(a parameter used once or twice per session) still reaches the ≥ 8
+observation threshold without widening the gate-local window. A session
+contributes exactly once per content: unchanged files skip by digest,
+growing files contribute only their delta, and evicted sessions bake with
+their digest remembered, so no evidence can inflate by re-reading. The
+pool is bounded (16 tracked values per parameter, above the 8-value
+eligibility guard, so an overflowed domain stays provably open) and is
+pure derived evidence: damage surfaces and blocks the merge, never
+silently rebuilds.
 
 A passing compile persists the compiled surface to
 `<agent dir>/fabric/entropy/compiled.json` beside the repair table: overlay
@@ -207,9 +233,9 @@ surface snapshot, and reports the
 latest session's score plus the least-squares slope across the window's
 session scores (`trendFromScores`). Lines without a trace envelope are
 skipped by a cheap substring filter before parsing, so large logs stay
-fast. The repair table and the compiled entropy surface remain the only durable
-derived artifacts because they are the only ones that change runtime
-behavior.
+fast. The repair table, the compiled entropy surface, and the machine-wide
+observation pool remain the only durable derived artifacts; only the first
+two change runtime behavior, the pool only moves thresholds.
 
 ## Commands and certification
 
@@ -266,7 +292,11 @@ The trial is the falsifiable half of the compiler: with `--trial` (plus
 against both the declared surface and the compiled artifact (`--artifact
 <path>` overrides the agent dir's `compiled.json`), and each divergence is
 classified deterministically. Calls the declared schema already rejected
-credit nothing. Succeeded calls the compiled schema would reject count as
+credit nothing. Refs with verbatim audit calls replay from the audit
+arguments, never the projected trace args; audits record executed calls
+without outcomes, so a compiled rejection of an audited call counts as a
+tightening cost, never a win. The falsifier stays pessimistic where the
+record is silent. Succeeded calls the compiled schema would reject count as
 tightening costs: the compile overfit its window, and the certification
 fails on any of them, because the in-loop replay gate promised exactly
 that. Calls that failed anyway count as wins when the artifact would have
@@ -317,6 +347,7 @@ commit.
   trend, and the slope is only as strong as the window. Widening the corpus
   scope shifts measured scores, so certification baselines recorded against
   a per-project corpus must be re-recorded once against the machine window.
-- The compile trigger is per-turn, so evidence that aged out of the window
-  stops proposing; the compiled artifact keeps its own provenance and stays
-  enforced until the live schema beneath it changes.
+- The compile trigger is per-turn, but pooled observations outlive the
+  window: evidence stays eligible until the schema beneath it changes. The
+  gate and the replay stay scoped to the current window, so a pooled
+  proposal still has to keep every recorded call parsing.

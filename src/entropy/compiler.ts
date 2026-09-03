@@ -5,6 +5,10 @@
 // Overload-split and sequence-fuse author new composite definitions, and a
 // pure modal rename drops the declared key that every successful call
 // recorded, so all three stay surfaced for review and never auto-apply.
+// enum-tighten only ever tightens beneath a declared enum (the
+// closed-domain rule), so the auto loop subtracts freedom the schema
+// already claimed and never invents a domain: open vocabularies arrive as
+// declare-enum review signals instead.
 
 import { stableJsonHash } from "../core/stable-hash.js";
 import { measureEntropy } from "./meter.js";
@@ -189,6 +193,8 @@ export const compileEntropySurface = (input: CompileEntropyInput): CompileEntrop
       failed: report.totals.failed,
       surface: entropySurfaceHash(effective),
       repairs: input.repairs?.length ?? 0,
+      valueObservations: stableJsonHash(input.valueObservations ?? []),
+      auditCalls: stableJsonHash(input.auditCalls ?? []),
     });
     return {
       status: "compiled",

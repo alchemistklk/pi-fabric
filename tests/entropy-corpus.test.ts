@@ -129,7 +129,7 @@ describe("entropyAuditCallsFromSessionJsonl", () => {
 });
 
 describe("entropyValueObservationsFromSessionJsonl", () => {
-  it("extracts verbatim audit values for value-dropped params and drives enum-tighten", () => {
+  it("extracts verbatim audit values for value-dropped params and surfaces declare-enum", () => {
     const formats = ["pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "html"];
     const envelope: FabricExecutionTraceV1 = {
       kind: "pi-fabric.execution",
@@ -177,7 +177,7 @@ describe("entropyValueObservationsFromSessionJsonl", () => {
     });
     expect(proposals).toHaveLength(1);
     expect(proposals[0]).toMatchObject({
-      kind: "enum-tighten",
+      kind: "declare-enum",
       ref: "mcp.report.render",
       key: "format",
       values: ["pdf", "html"],

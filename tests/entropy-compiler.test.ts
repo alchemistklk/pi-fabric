@@ -53,7 +53,7 @@ const ratchetSurface = (): EntropySurfaceSnapshot => ({
         type: "object",
         additionalProperties: false,
         required: ["format"],
-        properties: { format: { type: "string" } },
+        properties: { format: { type: "string", enum: ["docx", "html", "pdf", "web"] } },
       },
     },
     {
@@ -121,9 +121,10 @@ describe("compileEntropySurface", () => {
   it("applies the mechanical subset through the gate and builds the artifact", () => {
     const outcome = compileEntropySurface(compileInput());
     expect(outcome.status).toBe("compiled");
-    expect(outcome.report.score).toBe(0.333435);
+    expect(outcome.report.score).toBe(0.323019);
     expect(outcome.gate?.passed).toBe(true);
-    expect(outcome.after!.score).toBeLessThan(outcome.report.score);
+    expect(outcome.after!.score).toBe(0.304789);
+    expect(outcome.gate!.delta).toBe(-0.01823);
     const artifact = outcome.artifact!;
     expect(artifact.actions).toHaveLength(1);
     expect(artifact.actions[0]!.ref).toBe("mcp.report.render");
@@ -238,7 +239,7 @@ describe("compileEntropySurface", () => {
   it("replays verbatim audits so projected traces cannot poison the gate", () => {
     const declared = {
       type: "object",
-      properties: { format: { type: "string" } },
+      properties: { format: { type: "string", enum: ["docx", "html", "pdf"] } },
       required: ["format"],
       additionalProperties: false,
     };

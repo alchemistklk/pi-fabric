@@ -19,8 +19,12 @@ import {
   entropyRepairRows,
   liveSurfaceSnapshot,
   loadCompiledSurface,
+  loadObservationPool,
   machineSessionFiles,
+  mergeObservationWindow,
+  poolToValueObservations,
   saveCompiledSurface,
+  saveObservationPool,
   sessionWindowEvidence,
 } from "./entropy/index.js";
 import { setActiveCompiledSurface } from "./entropy/active.js";
@@ -381,9 +385,14 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   // Continual entropy reduction: the compiler runs measure → propose → apply
   // → gate against the live machine session window at every turn boundary
   // that produced new action evidence, then persists the compiled surface
-  // beside the repair table. Compiles never fail the session; a gate
-  // rejection keeps the old surface silently: the ratchet is holding
-  // the line, and /fabric entropy shows the compiled state.
+  // beside the repair table. Value observations pool machine-wide with
+  // exact per-session deltas so sparse closed domains still reach the
+  // derivation thresholds, and auto enum-tighten only removes freedom the
+  // declared schema already bounds: open vocabularies surface as
+  // declare-enum review signals for the surface author. Compiles never
+  // fail the session; a gate rejection keeps the old surface silently:
+  // the ratchet is holding the line, and /fabric entropy shows the
+  // compiled state.
   let entropyEvidenceThisTurn = false;
   let entropyCompileInFlight = false;
   let entropyCompilePending = false;
@@ -400,6 +409,15 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     if (loaded.error) return;
     const evidence = sessionWindowEvidence(files);
     if (evidence.traces.length === 0) return;
+    // Machine-wide pooling: exact per-session deltas accumulate the value
+    // corpus across every window the compiler reads, so sparse closed
+    // domains reach the derivation thresholds without widening the
+    // gate-local window. Pool damage blocks the merge, never rebuilds.
+    const poolLoaded = loadObservationPool(agentDir);
+    if (poolLoaded.error) return;
+    const mergedPool = mergeObservationWindow(poolLoaded.file, evidence.observationWindows);
+    saveObservationPool(agentDir, mergedPool.file);
+    const pooledObservations = poolToValueObservations(mergedPool.file);
     const snapshot = await liveSurfaceSnapshot({
       registry: state.registry,
       extensionContext: context,
@@ -409,7 +427,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
       traces: evidence.traces,
       surface: snapshot,
       repairs: entropyRepairRows(state.repairs.repairs),
-      valueObservations: evidence.valueObservations,
+      valueObservations: pooledObservations,
       auditCalls: evidence.auditCalls,
       ...(loaded.file ? { artifact: loaded.file } : {}),
     });

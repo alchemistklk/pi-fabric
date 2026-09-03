@@ -3,6 +3,9 @@
 // each divergence. The classes count what the artifact would have changed
 // about calls models actually made; the falsifiable half of the entropy
 // compiler. No model judges anything; TypeBox decides, deterministically.
+// Refs with verbatim audit calls replay from the audits, never the
+// projected trace args; audits record executed calls without outcomes, so
+// a compiled rejection of an audited call counts as a cost, never a win.
 
 import { Value } from "typebox/value";
 import { applyCompiledSurface, type CompiledSurfaceFile } from "./compiled-surface.js";
@@ -10,6 +13,7 @@ import { compareCodeUnits } from "./fingerprint.js";
 import { measureEntropy } from "./meter.js";
 import { entropySurfaceHash } from "./surface.js";
 import type {
+  EntropyAuditCall,
   EntropyOperationInput,
   EntropySurfaceSnapshot,
   EntropyTraceInput,
@@ -96,6 +100,7 @@ export const runEntropyTrial = (input: {
   traces: readonly EntropyTraceInput[];
   live: EntropySurfaceSnapshot;
   artifact?: CompiledSurfaceFile;
+  auditCalls?: readonly EntropyAuditCall[];
 }): EntropyTrialReport => {
   const effective = applyCompiledSurface(input.live, input.artifact);
   const declaredByRef = new Map(
@@ -124,11 +129,23 @@ export const runEntropyTrial = (input: {
     quarantineCost: 0,
   };
   const divergenceCounts = new Map<string, number>();
+  const auditedArgsByRef = new Map<string, Record<string, unknown>[]>();
+  if (input.auditCalls) {
+    for (const call of input.auditCalls) {
+      if (declaredByRef.get(call.ref) === undefined) continue;
+      const bucket = auditedArgsByRef.get(call.ref) ?? [];
+      bucket.push(call.args);
+      auditedArgsByRef.set(call.ref, bucket);
+    }
+  }
   for (const trace of input.traces) {
     for (const operation of trace.operations) {
       if (operation.ref.startsWith("fabric.")) continue;
       const declared = declaredByRef.get(operation.ref);
       if (declared === undefined) continue;
+      // Audited refs classify below from the verbatim audit args; the
+      // projected trace args would phantom-reject calls that parsed.
+      if (auditedArgsByRef.has(operation.ref)) continue;
       const compiled = effectiveByRef.get(operation.ref);
       const quarantined = compiled === undefined;
       const trialClass = classify(
@@ -141,6 +158,27 @@ export const runEntropyTrial = (input: {
       totals[trialClassField(trialClass)]++;
       if (trialClass !== "both-accept" && trialClass !== "both-reject") {
         const key = `${operation.ref}\u0000${trialClass}`;
+        divergenceCounts.set(key, (divergenceCounts.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  for (const ref of [...auditedArgsByRef.keys()].sort(compareCodeUnits)) {
+    const declared = declaredByRef.get(ref)!;
+    const compiled = effectiveByRef.get(ref);
+    const quarantined = compiled === undefined;
+    for (const args of auditedArgsByRef.get(ref)!) {
+      const declaredAccepts = accepts(declared, args);
+      const trialClass: EntropyTrialClass = !declaredAccepts
+        ? "both-reject"
+        : quarantined
+          ? "quarantine-cost"
+          : accepts(compiled, args)
+            ? "both-accept"
+            : "tightening-cost";
+      totals.operations++;
+      totals[trialClassField(trialClass)]++;
+      if (trialClass !== "both-accept" && trialClass !== "both-reject") {
+        const key = `${ref}\u0000${trialClass}`;
         divergenceCounts.set(key, (divergenceCounts.get(key) ?? 0) + 1);
       }
     }

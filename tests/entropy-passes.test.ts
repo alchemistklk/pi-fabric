@@ -76,7 +76,7 @@ const ratchetSurface = (): EntropySurfaceSnapshot =>
         type: "object",
         additionalProperties: false,
         required: ["format"],
-        properties: { format: { type: "string" } },
+        properties: { format: { type: "string", enum: ["docx", "html", "pdf", "web"] } },
       },
     },
     {
@@ -312,7 +312,7 @@ describe("proposeEntropyReductions", () => {
         traces,
         valueObservations,
       }),
-    ).toEqual([expect.objectContaining({ kind: "enum-tighten" })]);
+    ).toEqual([expect.objectContaining({ kind: "declare-enum" })]);
   });
 
   it("applies proposals without mutating the input surface", () => {
@@ -407,6 +407,183 @@ describe("proposeEntropyReductions", () => {
     const compiled = applyProposalsToSurface(surface, proposals);
     expect(compiled.actions.map((action) => action.ref)).toEqual(["memory.expandEntry"]);
   });
+
+  it("routes open-domain vocabularies to declare-enum review, never auto", () => {
+    const surface = surfaceOf([
+      {
+        ref: "mcp.report.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string" } },
+        },
+      },
+    ]);
+    const traces: EntropyTraceInput[] = [
+      trace([
+        ...Array.from({ length: 7 }, () => op("mcp.report.render", { format: "pdf" })),
+        op("mcp.report.render", { format: "html" }),
+      ]),
+    ];
+    const proposals = proposeEntropyReductions({
+      report: measureEntropy({ traces, surface }),
+      traces,
+      surface,
+    });
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({
+      kind: "declare-enum",
+      ref: "mcp.report.render",
+      key: "format",
+      values: ["pdf", "html"],
+      calls: 8,
+      distinct: 2,
+      topShare: 0.875,
+    });
+  });
+
+  it("signals undeclared keys and unknown refs through declare-enum", () => {
+    const surface = surfaceOf([
+      {
+        ref: "mcp.report.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string", enum: ["docx", "html", "pdf"] } },
+        },
+      },
+    ]);
+    const traces: EntropyTraceInput[] = [
+      trace([
+        ...Array.from({ length: 4 }, () => op("mcp.report.render", { format: "pdf", dpi: 300 })),
+        ...Array.from({ length: 4 }, () => op("mcp.report.render", { format: "pdf", dpi: 600 })),
+      ]),
+      trace([
+        ...Array.from({ length: 6 }, () => op("mcp.ghost.run", { level: "info" })),
+        ...Array.from({ length: 2 }, () => op("mcp.ghost.run", { level: "debug" })),
+      ]),
+    ];
+    const proposals = proposeEntropyReductions({
+      report: measureEntropy({ traces, surface }),
+      traces,
+      surface,
+    });
+    expect(proposals).toHaveLength(2);
+    expect(proposals[0]).toMatchObject({
+      kind: "declare-enum",
+      ref: "mcp.ghost.run",
+      key: "level",
+      values: ["info", "debug"],
+      calls: 8,
+      distinct: 2,
+      topShare: 0.75,
+    });
+    expect(proposals[1]).toMatchObject({
+      kind: "declare-enum",
+      ref: "mcp.report.render",
+      key: "dpi",
+      values: [300, 600],
+      calls: 8,
+      distinct: 2,
+      topShare: 0.5,
+    });
+  });
+
+  it("converges when the observed vocabulary equals the declared enum", () => {
+    const surface = surfaceOf([
+      {
+        ref: "mcp.report.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string", enum: ["html", "pdf"] } },
+        },
+      },
+    ]);
+    const traces: EntropyTraceInput[] = [
+      trace([
+        ...Array.from({ length: 7 }, () => op("mcp.report.render", { format: "pdf" })),
+        op("mcp.report.render", { format: "html" }),
+      ]),
+    ];
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces, surface }),
+        traces,
+        surface,
+      }),
+    ).toEqual([]);
+  });
+
+  it("drops observations outside the declared domain and tightens to the remainder", () => {
+    const surface = surfaceOf([
+      {
+        ref: "mcp.report.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string", enum: ["html", "pdf", "web"] } },
+        },
+      },
+    ]);
+    const traces: EntropyTraceInput[] = [
+      trace([
+        ...Array.from({ length: 6 }, () => op("mcp.report.render", { format: "pdf" })),
+        op("mcp.report.render", { format: "html" }),
+        op("mcp.report.render", { format: "rtf" }),
+      ]),
+    ];
+    const proposals = proposeEntropyReductions({
+      report: measureEntropy({ traces, surface }),
+      traces,
+      surface,
+    });
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({
+      kind: "enum-tighten",
+      ref: "mcp.report.render",
+      key: "format",
+      values: ["pdf", "html"],
+      distinct: 2,
+    });
+  });
+
+  it("weights pooled observations by count multiplicity", () => {
+    const surface = surfaceOf([
+      {
+        ref: "mcp.report.render",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["format"],
+          properties: { format: { type: "string", enum: ["docx", "html", "pdf"] } },
+        },
+      },
+    ]);
+    const traces: EntropyTraceInput[] = [trace([op("mcp.report.render", { format: "pdf" })])];
+    const valueObservations = [
+      { ref: "mcp.report.render", key: "format", value: "pdf", count: 7 },
+      { ref: "mcp.report.render", key: "format", value: "html", count: 1 },
+    ];
+    const proposals = proposeEntropyReductions({
+      report: measureEntropy({ traces, surface }),
+      traces,
+      surface,
+      valueObservations,
+    });
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({
+      kind: "enum-tighten",
+      values: ["pdf", "html"],
+      calls: 8,
+      distinct: 2,
+      topShare: 0.875,
+    });
+  });
 });
 
 describe("evaluateGate", () => {
@@ -419,9 +596,9 @@ describe("evaluateGate", () => {
     });
     const gate = evaluateGate(before, after);
     expect(gate.passed).toBe(true);
-    expect(gate.delta).toBe(-0.153646);
-    expect(before.staticScore).toBe(0.046875);
-    expect(before.behavioralScore).toBe(0.28656);
+    expect(gate.delta).toBe(-0.14323);
+    expect(before.staticScore).toBe(0.036458);
+    expect(before.behavioralScore).toBe(0.286561);
     expect(after.staticScore).toBe(0.018229);
     expect(after.behavioralScore).toBe(0.16156);
     const regress = evaluateGate(after, before);

@@ -15,7 +15,8 @@ import { compareCodeUnits, roundMetric } from "./fingerprint.js";
 // same typed artifacts the meter reads, with fixed thresholds, and every
 // proposal carries the evidence that triggered it. `applyProposalsToSurface`
 // rewrites the surface for the mechanically applicable kinds; overload-split
-// and sequence-fuse author new composite definitions, so they stay
+// and sequence-fuse author new composite definitions, and declare-enum only
+// ever suggests a domain the schema has not claimed, so all three stay
 // review-only. The gate is the ratchet: a compiled surface must never
 // increase the measured score and must never drop successful calls.
 
@@ -87,32 +88,21 @@ interface EnumCandidate {
   topShare: number;
 }
 
-// A gate-proven enum is a floor. Observed values outside an incumbent enum
-// are pre-birth evidence: calls recorded before the overlay existed (the
-// live session carries them for its whole life) or after a digest proof
-// fell. The fresh derivation drops them instead of re-proposing a wider
-// enum the ratchet must then reject every turn. Tightening beneath the
-// floor still proposes; a derivation identical to the incumbent enum
-// converges. Widening resets only when the base schema drifts (the digest
-// proof drops the overlay and the enum re-derives from the live surface)
-// or through review.
-const floorIncumbentEnum = (
+// An enum the effective schema already declares is a floor. Observed
+// values outside it are pre-birth evidence: calls recorded before the
+// overlay existed (the live session carries them for its whole life) or
+// after a digest proof fell. The fresh derivation drops them instead of
+// re-proposing a wider enum the ratchet must then reject every turn.
+// Tightening beneath the floor still proposes; a derivation identical to
+// the declared enum converges. Widening resets only when the base schema
+// drifts (the digest proof drops the overlay and the enum re-derives from
+// the live surface) or through review.
+const tightenBeneathDeclaredEnum = (
   candidate: EnumCandidate,
-  surfaceByRef: Map<string, unknown>,
-  hasSurface: boolean,
+  declaredDomain: ReadonlySet<string>,
 ): EnumCandidate | undefined => {
-  if (!hasSurface) return candidate;
-  const properties = schemaProperties(surfaceByRef.get(candidate.entry.ref));
-  const target = properties ? properties[candidate.entry.key] : undefined;
-  // A declared boolean cannot tighten: a two-value enum prices at
-  // log2(2)/ENUM_SATURATION_BITS, above the boolean's 0.1, so the proposal
-  // could only raise freedom and the gate would reject it every turn. Skip
-  // at proposal time.
-  if ((target as Record<string, unknown> | undefined)?.type === "boolean") return undefined;
-  const existing = enumKeys(target);
-  if (!existing) return candidate;
-  const ranked = candidate.ranked.filter((item) => existing.has(valueKey(item.value)));
-  if (ranked.length === 0 || ranked.length === existing.size) return undefined;
+  const ranked = candidate.ranked.filter((item) => declaredDomain.has(valueKey(item.value)));
+  if (ranked.length === 0 || ranked.length === declaredDomain.size) return undefined;
   return { ...candidate, ranked };
 };
 
@@ -130,9 +120,11 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
 
   const proposals: EntropyProposal[] = [];
 
-  // enum-tighten: a parameter whose observed values are few and concentrated
-  // compiles into an enum, so future off-modal values fail (or repair)
-  // deterministically instead of slipping through a free string.
+  // enum-tighten: a closed-domain parameter whose observed values are few
+  // and concentrated tightens beneath its declared enum, so future
+  // off-modal values fail (or repair) deterministically instead of
+  // slipping through an unused declared value. Open-domain parameters with
+  // the same shape become declare-enum review signals below.
   const observations = new Map<
     string,
     {
@@ -142,7 +134,12 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
       total: number;
     }
   >();
-  const observeValue = (ref: string, key: string, value: string | number | boolean): void => {
+  const observeValue = (
+    ref: string,
+    key: string,
+    value: string | number | boolean,
+    weight = 1,
+  ): void => {
     const id = `${ref}\u0000${key}`;
     const entry =
       observations.get(id) ??
@@ -154,8 +151,8 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
       };
     const valueId = valueKey(value);
     const existing = entry.counts.get(valueId);
-    entry.counts.set(valueId, { value, count: (existing?.count ?? 0) + 1 });
-    entry.total += 1;
+    entry.counts.set(valueId, { value, count: (existing?.count ?? 0) + weight });
+    entry.total += weight;
     observations.set(id, entry);
   };
   // Verbatim audit observations are the authoritative value corpus when
@@ -164,7 +161,7 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
   // args.
   if (input.valueObservations) {
     for (const observation of input.valueObservations) {
-      observeValue(observation.ref, observation.key, observation.value);
+      observeValue(observation.ref, observation.key, observation.value, observation.count ?? 1);
     }
   } else {
     for (const sourceTrace of input.traces) {
@@ -179,7 +176,7 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
       }
     }
   }
-  const enumCandidates = [...observations.values()]
+  const eligibleCandidates = [...observations.values()]
     .filter((entry) => entry.total >= ENUM_MIN_OBSERVATIONS)
     .filter((entry) => entry.counts.size >= 2 && entry.counts.size <= ENUM_MAX_DISTINCT)
     .map((entry): EnumCandidate => {
@@ -189,18 +186,52 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
       );
       return { entry, ranked, topShare: roundMetric(ranked[0]!.count / entry.total) };
     })
-    .filter((candidate) => candidate.topShare >= ENUM_MIN_TOP_SHARE)
-    .map((candidate) =>
-      floorIncumbentEnum(candidate, surfaceByRef, input.surface !== undefined),
-    )
-    .filter((candidate) => candidate !== undefined)
-    .sort((left, right) =>
-      compareCodeUnits(`${left.entry.ref}\u0000${left.entry.key}`, `${right.entry.ref}\u0000${right.entry.key}`),
-    )
-    .slice(0, MAX_PROPOSALS_PER_KIND);
-  for (const candidate of enumCandidates) {
+    .filter((candidate) => candidate.topShare >= ENUM_MIN_TOP_SHARE);
+  // Closed-domain rule: auto enum-tighten may only remove freedom the
+  // effective schema already declares finite. A parameter whose schema
+  // carries an enum is a closed domain, so tightening beneath it is
+  // measured subtraction of declared freedom. A free parameter, an
+  // undeclared key, or a missing surface proves nothing about the domain:
+  // the same observations become a declare-enum review signal for the
+  // surface author instead, because inventing a domain the schema never
+  // claimed is how a compiler sharpens the wrong entropy. A declared
+  // boolean is already closed and priced below any enum, so it never
+  // proposes.
+  const closedCandidates: EnumCandidate[] = [];
+  const openCandidates: EnumCandidate[] = [];
+  for (const candidate of eligibleCandidates) {
+    const properties = input.surface
+      ? schemaProperties(surfaceByRef.get(candidate.entry.ref))
+      : undefined;
+    const target = properties ? properties[candidate.entry.key] : undefined;
+    if (isPlainRecord(target) && target.type === "boolean") continue;
+    const declaredDomain = target ? enumKeys(target) : undefined;
+    if (declaredDomain) {
+      const tightened = tightenBeneathDeclaredEnum(candidate, declaredDomain);
+      if (tightened) closedCandidates.push(tightened);
+    } else {
+      openCandidates.push(candidate);
+    }
+  }
+  const byRefKey = (left: EnumCandidate, right: EnumCandidate): number =>
+    compareCodeUnits(
+      `${left.entry.ref}\u0000${left.entry.key}`,
+      `${right.entry.ref}\u0000${right.entry.key}`,
+    );
+  for (const candidate of closedCandidates.sort(byRefKey).slice(0, MAX_PROPOSALS_PER_KIND)) {
     proposals.push({
       kind: "enum-tighten",
+      ref: candidate.entry.ref,
+      key: candidate.entry.key,
+      values: candidate.ranked.map((item) => item.value),
+      calls: candidate.entry.total,
+      distinct: candidate.ranked.length,
+      topShare: candidate.topShare,
+    });
+  }
+  for (const candidate of openCandidates.sort(byRefKey).slice(0, MAX_PROPOSALS_PER_KIND)) {
+    proposals.push({
+      kind: "declare-enum",
       ref: candidate.entry.ref,
       key: candidate.entry.key,
       values: candidate.ranked.map((item) => item.value),
@@ -378,9 +409,10 @@ const deepCloneJson = (value: unknown): unknown =>
 
 // Apply the mechanically applicable proposals as a pure surface rewrite.
 // The input surface is never mutated; enum-tighten injects the observed
-// enum, noise-quarantine removes the action, modal-rename renames the
-// declared key or action to the model's modal spelling. Overload-split and
-// sequence-fuse produce review-only proposals and are skipped here.
+// enum beneath the declared one, noise-quarantine removes the action,
+// modal-rename renames the declared key or action to the model's modal
+// spelling. Overload-split, sequence-fuse, and declare-enum produce
+// review-only proposals and are skipped here.
 export const applyProposalsToSurface = (
   surface: EntropySurfaceSnapshot,
   proposals: readonly EntropyProposal[],
