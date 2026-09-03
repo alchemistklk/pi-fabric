@@ -32,22 +32,28 @@ const schemaOf = (kind: "free" | "enum" | "const"): unknown =>
 
 const registryWith = (
   actions: Array<{ ref: string; inputSchema: unknown }>,
-): { registry: EntropySurfaceRegistry; context: () => FabricInvocationContext | undefined } => {
+): {
+  registry: EntropySurfaceRegistry;
+  context: () => FabricInvocationContext | undefined;
+  request: () => { limit?: number; declared?: boolean } | undefined;
+} => {
   let seen: FabricInvocationContext | undefined;
+  let lastRequest: { limit?: number; declared?: boolean } | undefined;
   const registry: EntropySurfaceRegistry = {
-    list: async (_request, context) => {
+    list: async (request, context) => {
       seen = context;
+      lastRequest = request;
       return actions;
     },
   };
-  return { registry, context: () => seen };
+  return { registry, context: () => seen, request: () => lastRequest };
 };
 
 const extensionContext = {} as ExtensionContext;
 
 describe("liveSurfaceSnapshot", () => {
   it("lists through the discovery path with a synthetic context, sorted by ref", async () => {
-    const { registry, context } = registryWith([
+    const { registry, context, request } = registryWith([
       { ref: "memory.expand", inputSchema: schemaOf("free") },
       { ref: "mcp.report.render", inputSchema: schemaOf("enum") },
     ]);
@@ -61,6 +67,7 @@ describe("liveSurfaceSnapshot", () => {
       "mcp.report.render",
       "memory.expand",
     ]);
+    expect(request()).toEqual({ limit: 1000, declared: true });
     expect(context()?.cwd).toBe("/repo");
     expect(context()?.parentToolCallId).toBe("fabric-entropy-surface");
     expect(typeof context()?.update).toBe("function");

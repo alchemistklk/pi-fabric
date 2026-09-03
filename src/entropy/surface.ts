@@ -19,7 +19,7 @@ export interface EntropySurfaceListAction {
 
 export interface EntropySurfaceRegistry {
   list(
-    request: { limit?: number },
+    request: { limit?: number; declared?: boolean },
     context: FabricInvocationContext,
   ): Promise<readonly EntropySurfaceListAction[]>;
 }
@@ -44,8 +44,12 @@ export const liveSurfaceSnapshot = async (input: {
   extensionContext: ExtensionContext;
   cwd: string;
 }): Promise<EntropySurfaceSnapshot> => {
+  // Declared truth, never the enforced view: the compile's base surface
+  // keeps quarantined refs visible so base-digest proofs and artifact
+  // carry-forward read the declared schema. The model-facing catalog keeps
+  // hiding them.
   const actions = await input.registry.list(
-    { limit: SURFACE_LIST_LIMIT },
+    { limit: SURFACE_LIST_LIMIT, declared: true },
     surfaceInvocationContext(input),
   );
   return {

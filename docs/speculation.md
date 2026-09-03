@@ -74,6 +74,19 @@ Observable differences show up only in observability surfaces: audits record
 the speculative invoke (`attachMedia`, `updateArguments`, `attachPreview`) are
 replayed into the real audit.
 
+## Entropy compile interplay
+
+The compiled entropy surface participates at both ends of the pipeline. On
+the launch side, speculate() consults it exactly like the invoke path: a
+quarantined ref never pre-launches, and prepared arguments validate against
+the overlaid schema, so the store never warms a call the serve path would
+reject. The serve side is unchanged and stays authoritative: the real call
+runs the full pipeline before the store may answer, so a surface activated
+between launch and serve (a compile landing mid-session) can never serve an
+entry the live surface would reject. Entries launched under an older
+surface remain take-once, TTL-bounded, and drop at turn end like any other
+waste.
+
 ## Tier B: MCP reads
 
 MCP tools are `risk: "network"` and excluded by default. Operators opt in per

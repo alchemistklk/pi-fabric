@@ -578,14 +578,18 @@ export class ActionRegistry {
     return sources;
   }
 
+  // The model-facing discovery view: quarantined refs hide here. Pass
+  // `declared: true` for the compile's base-surface truth, which keeps
+  // quarantined refs visible so base-digest proofs and artifact
+  // carry-forward can read the declared schema.
   async list(
-    request: FabricProviderListRequest & { provider?: string },
+    request: FabricProviderListRequest & { provider?: string; declared?: boolean },
     context: FabricInvocationContext,
   ): Promise<ResolvedFabricAction[]> {
     if (context.capabilityView) {
       const refs = Object.keys(context.capabilityView.bindings)
         .filter((ref) => !request.provider || ref.startsWith(`${request.provider}.`))
-        .filter((ref) => !activeQuarantinedRefNames().has(ref))
+        .filter((ref) => request.declared || !activeQuarantinedRefNames().has(ref))
         .sort();
       const actions = await Promise.all(refs.map((ref) => this.describe(ref, context)));
       const query = request.query?.normalize("NFKC").trim().toLowerCase();
@@ -605,6 +609,7 @@ export class ActionRegistry {
         return descriptors
           .filter(
             (descriptor) =>
+              request.declared ||
               !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
           )
           .map((descriptor) => resolveDescriptor(provider, descriptor));
@@ -1173,7 +1178,10 @@ export class ActionRegistry {
    * Prepare + pre-launch a speculative call discovered in a partially
    * streamed program (see src/speculation). Pure pipeline only: descriptor
    * resolution, the eligibility gate on the resolved action, argument
-   * preparation, and schema validation. authorize/approve/audits are skipped
+   * preparation, and schema validation. The compiled entropy surface gates
+   * launches too: quarantined refs never pre-launch and overlays validate
+   * prepared arguments, so the store never warms a call the serve path
+   * would reject. authorize/approve/audits are skipped
    * because the eligibility gate restricts this path to actions that never
    * prompt, and the real call re-runs the full pipeline on a serve miss.
    * Side-channel outputs are captured into `replay` so the serve path can
@@ -1205,8 +1213,15 @@ export class ActionRegistry {
       if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) {
         return undefined;
       }
+      if (isActiveQuarantine(provider.name, actionName, descriptor.inputSchema)) {
+        return undefined;
+      }
       if (!this.#speculationEligibility(action)) return undefined;
-      const catalogInput = applyActiveArgRepairs(action.ref, args, action.inputSchema);
+      const effectiveSchema = effectiveInputSchema(
+        action.ref,
+        action.inputSchema,
+      ) as Record<string, unknown>;
+      const catalogInput = applyActiveArgRepairs(action.ref, args, effectiveSchema);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
             provider.prepareArguments!(actionName, catalogInput, context))
@@ -1221,9 +1236,9 @@ export class ActionRegistry {
       const repairedArgs = applyActiveArgRepairs(
         action.ref,
         preparedArgs,
-        action.inputSchema,
+        effectiveSchema,
       );
-      if (validationMessage(action.inputSchema, repairedArgs)) return undefined;
+      if (validationMessage(effectiveSchema, repairedArgs)) return undefined;
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}spec-${randomUUID()}`;
       return {
         preparedArgs: repairedArgs,

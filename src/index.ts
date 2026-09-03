@@ -23,6 +23,7 @@ import {
   saveCompiledSurface,
   sessionWindowEvidence,
 } from "./entropy/index.js";
+import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
   settleInPlacePrewalk,
@@ -386,6 +387,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   let entropyCompileInFlight = false;
   let entropyCompilePending = false;
   let entropyLastRejection = "";
+  let entropyLastReview = "";
 
   const compileEntropyNow = async (context: ExtensionContext): Promise<void> => {
     if (!state.initialized || !state.config.entropy.compile) return;
@@ -410,9 +412,23 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
       valueObservations: evidence.valueObservations,
       ...(loaded.file ? { artifact: loaded.file } : {}),
     });
+    const review = outcome.proposals.filter(
+      (proposal) => !(AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
+    );
+    const reviewKey = review
+      .map((proposal) =>
+        proposal.kind === "sequence-fuse"
+          ? `${proposal.kind}:${proposal.sequence.join(">")}`
+          : `${proposal.kind}:${proposal.ref}`,
+      )
+      .join(";");
     if (outcome.status === "compiled" && outcome.artifact) {
       const saved = saveCompiledSurface(agentDir, outcome.artifact);
       if (saved.written) {
+        // Activate immediately: enforcement follows the compile, never
+        // waiting for the next session start.
+        setActiveCompiledSurface(outcome.artifact);
+        entropyLastReview = reviewKey;
         const applied = outcome.proposals
           .filter((proposal) =>
             (AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
@@ -420,19 +436,34 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
           .map((proposal) => proposal.kind);
         const before = outcome.report.score.toFixed(2);
         const after = (outcome.after?.score ?? outcome.report.score).toFixed(2);
+        const reviewNote = review.length > 0
+          ? ` · ${review.length} review-only proposal${review.length === 1 ? "" : "s"}`
+          : "";
         context.ui.notify(
-          `entropy: compiled surface · ${applied.join(" · ")} · gate pass (${before} → ${after})`,
+          `entropy: compiled surface · ${applied.join(" · ")} · gate pass (${before} → ${after})${reviewNote}`,
           "info",
         );
       }
-    } else if (outcome.status === "rejected" && outcome.gate) {
-      const key = outcome.gate.reasons.join(";");
-      if (key !== entropyLastRejection) {
-        entropyLastRejection = key;
+    } else {
+      // Review-only proposals never auto-apply; surface each distinct set
+      // once so the reviewer sees what the compiler declined to apply.
+      if (review.length > 0 && reviewKey !== entropyLastReview) {
+        entropyLastReview = reviewKey;
+        const kinds = [...new Set(review.map((proposal) => proposal.kind))].join(", ");
         context.ui.notify(
-          `entropy: compile rejected — surface unchanged (${outcome.gate.reasons[0] ?? "gate"})`,
-          "warning",
+          `entropy: ${review.length} review-only proposal${review.length === 1 ? "" : "s"} (${kinds})`,
+          "info",
         );
+      }
+      if (outcome.status === "rejected" && outcome.gate) {
+        const key = outcome.gate.reasons.join(";");
+        if (key !== entropyLastRejection) {
+          entropyLastRejection = key;
+          context.ui.notify(
+            `entropy: compile rejected — surface unchanged (${outcome.gate.reasons[0] ?? "gate"})`,
+            "warning",
+          );
+        }
       }
     }
   };

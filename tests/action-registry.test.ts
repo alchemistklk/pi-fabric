@@ -836,4 +836,55 @@ describe("compiled entropy surface enforcement", () => {
       registry.invoke("demo.echo", { value: "x" }, invokeContext()),
     ).rejects.toThrow(/demo\.echo/);
   });
+  it("keeps quarantined refs in the declared view for compile snapshots", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    setActiveCompiledSurface({
+      version: 1,
+      metricVersion: 2,
+      actions: [],
+      quarantined: [{ ref: "demo.echo", baseSchemaDigest: schemaDigest(liveEchoSchema()) }],
+      applied: [
+        { kind: "noise-quarantine", ref: "demo.echo", detail: "2 failed vs 1 succeeded" },
+      ],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    expect(await registry.list({ limit: 10 }, context)).toEqual([]);
+    const declared = await registry.list({ limit: 10, declared: true }, context);
+    expect(declared.map((action) => action.ref)).toEqual(["demo.echo"]);
+  });
+
+  it("never launches speculation the compiled surface rejects", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    registry.setSpeculation(undefined, () => true);
+    const replay = {} as Parameters<typeof registry.speculate>[3];
+    setActiveCompiledSurface(overlayArtifact(liveEchoSchema()));
+    expect(
+      await registry.speculate("demo.echo", { value: "off-modal" }, invokeContext(), replay),
+    ).toBeUndefined();
+    const launched = await registry.speculate(
+      "demo.echo",
+      { value: "alpha" },
+      invokeContext(),
+      replay,
+    );
+    expect(launched?.preparedArgs).toEqual({ value: "alpha" });
+    setActiveCompiledSurface({
+      version: 1,
+      metricVersion: 2,
+      actions: [],
+      quarantined: [{ ref: "demo.echo", baseSchemaDigest: schemaDigest(liveEchoSchema()) }],
+      applied: [
+        { kind: "noise-quarantine", ref: "demo.echo", detail: "2 failed vs 1 succeeded" },
+      ],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    expect(
+      await registry.speculate("demo.echo", { value: "alpha" }, invokeContext(), replay),
+    ).toBeUndefined();
+    registry.setSpeculation(undefined);
+  });
 });

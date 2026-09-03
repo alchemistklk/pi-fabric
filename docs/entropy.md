@@ -143,15 +143,20 @@ The autonomous loop applies only the mechanically safe kinds
 (`enum-tighten` and `noise-quarantine`). `overload-split` and `sequence-fuse`
 author new composite definitions, and a pure `modal-rename` drops the
 declared key that every successful call recorded, so all three stay
-surfaced for review and never auto-apply.
+surfaced for review and never auto-apply. The compile notification names
+each distinct review-only set once, so the reviewer sees what the compiler
+found and declined to apply mechanically.
 
 ## The compile loop
 
 The reducer is autonomous, mirroring the repair loop: no command, no
 approval, machine-checked bounds replace review. Every turn that invoked
 `fabric_exec` may have produced new action evidence, so at `turn_end` the
-compiler reads the live session window, snapshots the live surface through
-the discovery path, and runs measure → propose → apply → gate against it.
+compiler reads the live session window, snapshots the declared surface
+through the discovery path, and runs measure → propose → apply → gate
+against it. The snapshot keeps quarantined refs visible because digest
+proofs and artifact carry-forward read the declared schema; the
+model-facing catalog keeps hiding them.
 The compile is fire-and-forget (the next prompt never waits on it), and a
 session shutdown flushes a final compile while the window is richest.
 
@@ -159,8 +164,8 @@ A passing compile persists the compiled surface to
 `<agent dir>/fabric/entropy/compiled.json` beside the repair table: overlay
 entries and quarantines, the applied-proposal ledger, the gate record, and
 the evidence digest. The artifact is clock-free, so identical evidence
-compiles to identical bytes and saving them is a no-op. The runtime loads it
-at session start and enforces it live:
+compiles to identical bytes and saving them is a no-op. The runtime loads it at session start, a passing compile
+activates the new artifact immediately, and enforcement is live:
 
 - the compiled schema overlays the declared schema at the registry's prepare
   and validate stages, so enum-tightened parameters reject off-modal
