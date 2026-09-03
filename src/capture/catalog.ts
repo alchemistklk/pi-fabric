@@ -22,9 +22,25 @@ export class CapturedToolCatalog {
   // in full-code mode — without it, extensions that hook those events
   // (pi-vision-handoff, auditors, etc.) would never fire for pi core tools.
   #runner: ExtensionRunner | undefined;
+  #suspended = false;
 
   get runner(): ExtensionRunner | undefined {
     return this.#runner;
+  }
+
+  // True while capture is suspended between sessions/reloads. Derived
+  // surfaces (the repair catalog digest) must freeze: the empty catalog is
+  // transient and refills with the same tools on re-arm.
+  get suspended(): boolean {
+    return this.#suspended;
+  }
+
+  markSuspended(): void {
+    this.#suspended = true;
+  }
+
+  markResumed(): void {
+    this.#suspended = false;
   }
 
   replace(
@@ -37,9 +53,13 @@ export class CapturedToolCatalog {
     this.#runner = runner;
     this.#tools.clear();
     if (!config.enabled) {
+      // A replace under a disabled policy keeps the suspension flag: during
+      // /reload the hub listener fires while capture is still suspended, and
+      // that empty catalog is transient, not a stable catalog change.
       this.#emit();
       return;
     }
+    this.#suspended = false;
 
     for (const registeredTool of registeredTools) {
       const { definition, sourceInfo } = registeredTool;

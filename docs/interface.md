@@ -102,6 +102,7 @@ async invoke(actionName, args, context) {
 /fabric messages <actor-id>
 /fabric attach <agent-id>
 /fabric stop <actor-or-agent-id>
+/fabric repairs
 ```
 
 Actor slash commands mirror the [global template API](agents.md#global-actor-templates). `/fabric global` lists templates. `/fabric import <name> [as <new>]` stamps one into the project. `/fabric export <id> [--overwrite]` promotes a project actor. `/fabric log <id>` previews an actor or run transcript, and `/fabric export-log <id> [path]` writes the raw `session.jsonl` plus retained `runs/` to disk.

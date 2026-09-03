@@ -33,6 +33,11 @@ import {
   formatUnknownActionMessage,
   repairActionName,
 } from "./action-repair.js";
+import {
+  applyActiveActionName,
+  applyActiveArgRepairs,
+  getActiveRepairCompiler,
+} from "../repairs/active.js";
 import { formatFabricEffectConflict } from "./effect-conflict.js";
 import { stableJsonHash } from "./stable-hash.js";
 import type {
@@ -302,6 +307,7 @@ const unexpectedKeys = (
 ): string[] => {
   if ((schema as { type?: unknown }).type !== "object") return [];
   if ((schema as { additionalProperties?: unknown }).additionalProperties !== false) return [];
+  if ((schema as { patternProperties?: unknown }).patternProperties !== undefined) return [];
   const properties = (schema as { properties?: Record<string, unknown> }).properties;
   if (!properties) return [];
   return Object.keys(value).filter((key) => !(key in properties));
@@ -334,6 +340,59 @@ const validationMessage = (
   }
 };
 
+const declaredPropertyNames = (schema: Record<string, unknown>): string[] => {
+  const properties = (schema as { properties?: Record<string, unknown> }).properties;
+  return properties ? Object.keys(properties) : [];
+};
+
+const repairCatalogInput = (
+  ref: string,
+  schema: Record<string, unknown>,
+  args: Record<string, unknown>,
+): { args: Record<string, unknown>; observedUnexpected: string | undefined } => {
+  const extras = unexpectedKeys(schema, args).sort();
+  const observedUnexpected = extras.length > 0 ? extras.join("\0") : undefined;
+  if (extras.length > 0) {
+    getActiveRepairCompiler()?.observeInvalidArgs(
+      ref,
+      args,
+      declaredPropertyNames(schema),
+      extras.join(","),
+      { countError: false, extraKeys: extras },
+    );
+  }
+  return {
+    args: applyActiveArgRepairs(ref, args, schema),
+    observedUnexpected,
+  };
+};
+
+const validateCatalogArgs = (
+  ref: string,
+  schema: Record<string, unknown>,
+  args: Record<string, unknown>,
+  observedUnexpected: string | undefined,
+): { args: Record<string, unknown>; invalid?: string } => {
+  const compiler = getActiveRepairCompiler();
+  const first = applyActiveArgRepairs(ref, args, schema);
+  const invalid = validationMessage(schema, first);
+  if (!invalid) return { args: first };
+  const extras = unexpectedKeys(schema, first).sort();
+  if (observedUnexpected === undefined || extras.join("\0") !== observedUnexpected) {
+    compiler?.observeInvalidArgs(
+      ref,
+      first,
+      declaredPropertyNames(schema),
+      invalid,
+      { countError: false, extraKeys: extras },
+    );
+  }
+  const second = applyActiveArgRepairs(ref, first, schema);
+  const stillInvalid = validationMessage(schema, second);
+  if (stillInvalid) compiler?.recordInvocationError();
+  return stillInvalid ? { args: second, invalid: stillInvalid } : { args: second };
+};
+
 export class ActionRegistry {
   readonly #providerBindings = new FabricProviderBindings();
   readonly #activeEffects = new Map<string, { ref: string; effect: FabricActionEffect }>();
@@ -341,7 +400,9 @@ export class ActionRegistry {
   #speculation: FabricSpeculationRuntime | undefined;
   #speculationEligibility: ((action: ResolvedFabricAction) => boolean) | undefined;
 
-  constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {}
+  constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {
+    this.#providerBindings.subscribe(() => this.#speculation?.reset?.());
+  }
 
   /**
    * Attach the speculative-PTC runtime. Eligibility is re-checked against the
@@ -784,18 +845,24 @@ export class ActionRegistry {
       if (!provider.acquire) {
         throw new Error(`Fabric provider does not implement scoped acquisition: ${provider.name}`);
       }
+      const catalogInput = repairCatalogInput(action.ref, action.inputSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(providerActionName, args, context),
+            provider.prepareArguments!(providerActionName, catalogInput.args, context),
           )
-        : args;
+        : catalogInput.args;
       if (typeof preparedArgs !== "object" || preparedArgs === null || Array.isArray(preparedArgs)) {
         throw new Error(`Argument preparation for ${ref} did not return an object`);
       }
-      const invalid = validationMessage(action.inputSchema, preparedArgs);
-      if (invalid) throw new Error(`Invalid arguments for ${ref}: ${invalid}`);
+      const catalog = validateCatalogArgs(
+        action.ref,
+        action.inputSchema,
+        preparedArgs,
+        catalogInput.observedUnexpected,
+      );
+      if (catalog.invalid) throw new Error(`Invalid arguments for ${ref}: ${catalog.invalid}`);
       const acquired = await runAbortable(context.signal, () =>
-        provider.acquire!(providerActionName, preparedArgs, context),
+        provider.acquire!(providerActionName, catalog.args, context),
       );
       if (!acquired || typeof acquired.dispose !== "function") {
         throw new Error(`Scoped acquisition ${ref} did not return a disposer`);
@@ -864,24 +931,32 @@ export class ActionRegistry {
       }
 
       failureStage = "prepare";
+      const catalogInput = repairCatalogInput(action.ref, action.inputSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(providerActionName, args, context),
+            provider.prepareArguments!(providerActionName, catalogInput.args, context),
           )
-        : args;
+        : catalogInput.args;
       if (typeof preparedArgs !== "object" || preparedArgs === null || Array.isArray(preparedArgs)) {
         throw new FabricTraceSafeError(`Argument preparation for ${ref} did not return an object`);
       }
-      traceOperation?.prepared(preparedArgs);
 
       failureStage = "validate";
-      const invalid = validationMessage(action.inputSchema, preparedArgs);
+      const catalog = validateCatalogArgs(
+        action.ref,
+        action.inputSchema,
+        preparedArgs,
+        catalogInput.observedUnexpected,
+      );
+      traceOperation?.prepared(catalog.args);
       // TypeBox validator messages describe schema expectations only — they
       // never echo argument values — so they are safe for durable traces.
-      if (invalid) throw new FabricTraceSafeError(`Invalid arguments for ${ref}: ${invalid}`);
+      if (catalog.invalid) {
+        throw new FabricTraceSafeError(`Invalid arguments for ${ref}: ${catalog.invalid}`);
+      }
 
       failureStage = "approve";
-      await runAbortable(context.signal, () => context.approve(action, preparedArgs));
+      await runAbortable(context.signal, () => context.approve(action, catalog.args));
 
       failureStage = "invoke";
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}${randomUUID()}`;
@@ -902,7 +977,7 @@ export class ActionRegistry {
             .join("; ")}`,
         );
       }
-      const argsPreview = previewArgs(ref, preparedArgs);
+      const argsPreview = previewArgs(ref, catalog.args);
       const activeAudit: FabricCallAudit = {
         ref,
         nestedToolCallId,
@@ -933,7 +1008,7 @@ export class ActionRegistry {
       let providerValue: unknown;
       if (this.#speculation && effect.kind === "none") {
         const served = await runAbortable(context.signal, () =>
-          this.#speculation!.tryServe(context.parentToolCallId, ref, preparedArgs));
+          this.#speculation!.tryServe(context.parentToolCallId, ref, catalog.args, binding.id));
         if (served.hit) {
           servedFromSpeculation = true;
           activeAudit.speculated = true;
@@ -963,7 +1038,7 @@ export class ActionRegistry {
         if (!servedFromSpeculation) {
         providerInvoked = true;
         providerValue = await runAbortable(context.signal, () =>
-          provider.invoke(providerActionName, preparedArgs, {
+          provider.invoke(providerActionName, catalog.args, {
           ...context,
           nestedToolCallId,
           update(message) {
@@ -1018,7 +1093,7 @@ export class ActionRegistry {
       const value = this.toolResultProxy
         ? await runAbortable(context.signal, () => this.toolResultProxy!.proxy({
             action,
-            args: preparedArgs,
+            args: catalog.args,
             toolCallId: nestedToolCallId,
             value: providerValue,
             ...(context.signal ? { signal: context.signal } : {}),
@@ -1089,22 +1164,30 @@ export class ActionRegistry {
   ): Promise<
     | {
         preparedArgs: Record<string, unknown>;
+        bindingToken: string;
         execute(signal: AbortSignal | undefined): Promise<unknown>;
       }
     | undefined
   > {
     if (!this.#speculationEligibility) return undefined;
     try {
-      const { binding, provider, actionName } = this.#parseRef(ref, context.capabilityView);
+      const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
+        ref,
+        context.capabilityView,
+      );
       const descriptor = await runAbortable(context.signal, () =>
         provider.describe(actionName, context));
       if (!descriptor) return undefined;
       const action = resolveDescriptor(provider, descriptor);
+      if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) {
+        return undefined;
+      }
       if (!this.#speculationEligibility(action)) return undefined;
+      const catalogInput = applyActiveArgRepairs(action.ref, args, action.inputSchema);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(actionName, args, context))
-        : args;
+            provider.prepareArguments!(actionName, catalogInput, context))
+        : catalogInput;
       if (
         typeof preparedArgs !== "object" ||
         preparedArgs === null ||
@@ -1112,15 +1195,21 @@ export class ActionRegistry {
       ) {
         return undefined;
       }
-      if (validationMessage(action.inputSchema, preparedArgs)) return undefined;
+      const repairedArgs = applyActiveArgRepairs(
+        action.ref,
+        preparedArgs,
+        action.inputSchema,
+      );
+      if (validationMessage(action.inputSchema, repairedArgs)) return undefined;
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}spec-${randomUUID()}`;
       return {
-        preparedArgs,
+        preparedArgs: repairedArgs,
+        bindingToken: binding.id,
         execute: async (signal) => {
           const endBindingInvocation = this.#providerBindings.beginInvocation(binding.id);
           try {
             return await runAbortable(signal, () =>
-              provider.invoke(actionName, preparedArgs, {
+              provider.invoke(actionName, repairedArgs, {
                 ...context,
                 signal,
                 nestedToolCallId,
@@ -1273,13 +1362,33 @@ export class ActionRegistry {
     const descriptor = await runAbortable(context.signal, () =>
       provider.describe(actionName, context),
     );
-    if (descriptor) return { action: resolveDescriptor(provider, descriptor), suggestions: [] };
+    if (descriptor) {
+      return {
+        action: resolveDescriptor(provider, descriptor),
+        suggestions: [],
+      };
+    }
     if (!allowRepair) return { suggestions: [] };
-    const repair = repairActionName(
-      await this.#declaredActionNames(provider, context),
-      actionName,
-    );
+    const declared = await this.#declaredActionNames(provider, context);
+    const catalogName = applyActiveActionName(provider.name, actionName, declared);
+    if (catalogName !== actionName) {
+      const catalogDescriptor = await runAbortable(context.signal, () =>
+        provider.describe(catalogName, context),
+      );
+      if (catalogDescriptor) {
+        return {
+          action: resolveDescriptor(provider, catalogDescriptor),
+          suggestions: [],
+          repairedFrom: actionName,
+        };
+      }
+    }
+    const repair = repairActionName(declared, actionName);
+    const compiler = getActiveRepairCompiler();
     if (repair.repaired !== undefined) {
+      compiler?.observeUnknownAction(provider.name, actionName, declared, {
+        countError: false,
+      });
       const repairedDescriptor = await runAbortable(context.signal, () =>
         provider.describe(repair.repaired!, context),
       );
@@ -1290,6 +1399,9 @@ export class ActionRegistry {
           repairedFrom: actionName,
         };
       }
+      compiler?.recordInvocationError();
+    } else {
+      compiler?.observeUnknownAction(provider.name, actionName, declared);
     }
     return {
       suggestions: repair.suggestions.map((name) => `${provider.name}.${name}`),

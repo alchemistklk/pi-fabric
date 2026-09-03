@@ -426,6 +426,16 @@ describe("Fabric configuration", () => {
     ).toBe(7);
   });
 
+  it("enables catalog repairs by default and accepts an explicit disable", () => {
+    expect(DEFAULT_FABRIC_CONFIG.repairs).toEqual({ enabled: true });
+    expect(normalizeFabricConfig({ repairs: { enabled: false } }).repairs).toEqual({
+      enabled: false,
+    });
+    expect(normalizeFabricConfig({ repairs: { enabled: "no" } }).repairs).toEqual({
+      enabled: true,
+    });
+  });
+
   it("normalizes strict Schema mode, transaction bounds, and trusted command definitions", () => {
     const config = normalizeFabricConfig({
       schema: {

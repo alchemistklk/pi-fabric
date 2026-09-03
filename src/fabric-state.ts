@@ -129,6 +129,7 @@ export class FabricState {
   get globalActors(): FabricRuntimeState["globalActors"] { return this.#required().globalActors; }
   get mesh(): FabricRuntimeState["mesh"] { return this.#required().mesh; }
   get compact(): FabricRuntimeState["compact"] { return this.#required().compact; }
+  get repairs(): FabricRuntimeState["repairs"] { return this.#required().repairs; }
   get components(): FabricRuntimeState["components"] { return this.#required().components; }
 
   setActivationHook(hook: ActivationHook, onFailure?: ActivationFailureHook): void {

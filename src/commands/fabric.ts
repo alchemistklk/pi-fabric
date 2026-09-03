@@ -18,6 +18,7 @@ import {
   type FabricPrewalkRequestResultV1,
 } from "../protocol.js";
 import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
+import type { RepairStatus } from "../repairs/types.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -225,6 +226,28 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     });
   }
 
+  const formatRepairStatus = (status: RepairStatus): string => {
+    const top = status.fingerprints
+      .slice(0, 8)
+      .map((entry) => `  ${entry.count}× ${entry.fingerprint}`)
+      .join("\n");
+    const rows = status.repairs
+      .slice(0, 12)
+      .map((repair) =>
+        repair.kind === "keyAlias"
+          ? `  ${repair.ref}: ${repair.from} → ${repair.to}`
+          : `  ${repair.provider}.${repair.from} → ${repair.to}`,
+      )
+      .join("\n");
+    return [
+      `repairs: ${status.enabled ? "on" : "off"} · digest ${status.catalogDigest.slice(0, 12) || "none"}`,
+      `table: ${status.repairCount} · apply hits ${status.applyHits} · invocation ${status.invocationErrors} · effect dropped ${status.effectDropped}`,
+      status.repairs.length > 0 ? `current:\n${rows}` : "current: (empty)",
+      ...(status.storeError ? [`store: ${status.storeError}`] : []),
+      top ? `fingerprints:\n${top}` : "fingerprints: (none this session)",
+    ].join("\n");
+  };
+
   pi.registerCommand("fabric", {
     description: "Open Fabric, arm prewalk, reload, or manage agents and actors",
     getArgumentCompletions: (argumentPrefix: string): AutocompleteItem[] | null => {
@@ -250,6 +273,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         "import",
         "export",
         "kill",
+        "repairs",
       ];
       const idCommands = new Set([
         "messages",
@@ -812,9 +836,17 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         }
         return;
       }
+      if (command === "repairs") {
+        if (argumentsList[0] !== undefined) {
+          context.ui.notify("Usage: /fabric repairs", "warning");
+          return;
+        }
+        context.ui.notify(formatRepairStatus(state.repairs.status()), "info");
+        return;
+      }
       if (command !== "status") {
         context.ui.notify(
-          "Usage: /fabric [status|dashboard|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>]",
+          "Usage: /fabric [status|dashboard|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs]",
           "warning",
         );
         return;

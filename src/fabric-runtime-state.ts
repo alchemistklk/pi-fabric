@@ -47,6 +47,11 @@ import { FabricSessionApprovals } from "./core/approval-controller.js";
 import { CompactController, type CompactLastCommit, type CompactPendingIntent } from "./core/compact-controller.js";
 import { FabricToolResultProxy } from "./core/tool-result-proxy.js";
 import { FabricExecutionService, type FabricExecutionResult } from "./execution-service.js";
+import { RepairCompiler } from "./repairs/compiler.js";
+import {
+  clearActiveRepairCompiler,
+  setActiveRepairCompiler,
+} from "./repairs/active.js";
 import {
   isSpeculationEligible,
   mcpAllowlistMatch,
@@ -145,6 +150,7 @@ export class FabricRuntimeState {
   #mcpProvider: McpProvider | undefined;
   #config: FabricConfig | undefined;
   #execution: FabricExecutionService | undefined;
+  #repairs: RepairCompiler | undefined;
   #speculationStore: FabricSpeculationStore | undefined;
   #speculationTap: FabricSpeculationStreamTap | undefined;
   #agents: AgentManager | undefined;
@@ -286,6 +292,9 @@ export class FabricRuntimeState {
       nestedToolCallId: "fabric-speculation",
       extensionContext: context,
       update() {},
+      ...(this.#sessionCapabilityLease?.view
+        ? { capabilityView: this.#sessionCapabilityLease.view }
+        : {}),
     };
     const speculation = await registry.speculate(
       candidate.ref,
@@ -301,6 +310,7 @@ export class FabricRuntimeState {
       speculation.execute,
       createFreshnessChecker(candidate.ref, speculation.preparedArgs, context.cwd),
       replay,
+      speculation.bindingToken,
     );
   }
 
@@ -384,6 +394,11 @@ export class FabricRuntimeState {
     return this.#compact;
   }
 
+  get repairs(): RepairCompiler {
+    if (!this.#repairs) throw new Error("Pi Fabric has not initialized");
+    return this.#repairs;
+  }
+
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
     try {
@@ -413,9 +428,11 @@ export class FabricRuntimeState {
       new FabricToolResultProxy(() => this.capturedTools.runner),
     );
     this.#wireSpeculation();
-    this.#unsubscribeCapturedCatalog = this.capturedTools.subscribe(() =>
-      this.#registry?.notifyCatalogChanged("extensions"),
-    );
+    this.#unsubscribeCapturedCatalog?.();
+    this.#unsubscribeCapturedCatalog = this.capturedTools.subscribe(() => {
+      this.#registry?.notifyCatalogChanged("extensions");
+      this.#refreshRepairCatalog();
+    });
     this.#componentSupervisor = new FabricComponentSupervisor(this.#registry, {
       invocationContext: () => ({
         cwd: context.cwd,
@@ -736,7 +753,10 @@ export class FabricRuntimeState {
             acquireCapabilityView: acquireActorCapabilityView,
           },
     );
-    this.#registry.subscribeProviderChanges(() => this.#actors?.retryCapabilityWaiters());
+    this.#registry.subscribeProviderChanges(() => {
+      this.#actors?.retryCapabilityWaiters();
+      this.#refreshRepairCatalog();
+    });
     this.#lifecycle = new LifecycleBroker(
       this.#mesh,
       identity,
@@ -929,6 +949,15 @@ export class FabricRuntimeState {
       this.#sessionCapabilityLease = lease;
       this.#execution.setCapabilityView(lease.view);
     }
+    this.#repairs = new RepairCompiler({
+      agentDir: resolveAgentDir(),
+      enabled: this.#config.repairs.enabled,
+    });
+    // Commit the stable catalog surface before promotion can reach the
+    // active compiler: an active compiler whose surface has not been
+    // committed yet must never persist under a mid-reconcile catalog.
+    this.#refreshRepairCatalog();
+    setActiveRepairCompiler(this.#repairs);
   }
 
   async ensure(context: ExtensionContext): Promise<void> {
@@ -1197,6 +1226,7 @@ export class FabricRuntimeState {
 
   async shutdown(): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
+    this.#deactivateRepairs();
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();
     await Promise.allSettled([...this.#componentTransitionPublications]);
@@ -1264,7 +1294,28 @@ export class FabricRuntimeState {
     }
   }
 
+  #refreshRepairCatalog(): void {
+    if (!this.#repairs || !this.#registry) return;
+    // Capture suspension (session_start, /fabric reload) clears the catalog
+    // only transiently: the same tools refill on re-arm, so recomputing here
+    // would flip the digest to an empty-catalog value that promotion could
+    // then persist, destroying the stable catalog's table. Freeze the surface
+    // instead; the refill re-commits it (or legitimately starts a new one).
+    if (this.capturedTools.suspended) return;
+    this.#repairs.setCatalogSurface({
+      providers: this.#registry.providers().map((provider) => provider.name),
+      capturedTools: this.capturedTools.list().map((entry) => entry.name),
+    });
+  }
+
+  #deactivateRepairs(): void {
+    const repairs = this.#repairs;
+    this.#repairs = undefined;
+    clearActiveRepairCompiler(repairs);
+  }
+
   async #closeInternal(): Promise<void> {
+    this.#deactivateRepairs();
     if (!this.#registry) return;
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();

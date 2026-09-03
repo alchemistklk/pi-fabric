@@ -62,6 +62,8 @@ import {
 import { buildSkillReferenceGuidance } from "./core/skill-references.js";
 import { createFabricExecTool } from "./fabric-exec-tool.js";
 import { FabricState } from "./fabric-state.js";
+import { classifyToolResult } from "./repairs/classify.js";
+import { getActiveRepairCompiler } from "./repairs/active.js";
 import { piHostCompatibilityWarning } from "./host-compatibility.js";
 import {
   FABRIC_COMPONENT_REGISTER_EVENT,
@@ -247,6 +249,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {
+    // Re-applying the persistent policy ends any suspension window; do it
+    // before setPolicy so a config-disabled policy recomputes derived
+    // surfaces against the (now stable) empty catalog.
+    capturedTools.markResumed();
     toolCapture.setPolicy(capturePolicy());
     pi.registerTool(fabricTool);
     toolOwnership.apply(
@@ -256,6 +262,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     capturedTools.refresh();
   };
   const suspendToolCapture = (): void => {
+    // Mark the suspension before the policy flip: setPolicy clears the
+    // catalog, and the freeze must already be in effect when that clear
+    // reaches derived-surface listeners.
+    capturedTools.markSuspended();
     toolCapture.setPolicy(inactiveCapturePolicy);
   };
 
@@ -555,6 +565,18 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     if (!state.initialized) return;
     state.noteMainActivity(context);
     if (event.isError) {
+      const classified = classifyToolResult({
+        toolName: event.toolName,
+        isError: true,
+        content: event.result,
+      });
+      const registryObserved =
+        event.toolName === "fabric_exec" &&
+        (classified?.stage === "invocation_args" ||
+          classified?.stage === "invocation_unknown_action");
+      if (classified && !registryObserved) {
+        getActiveRepairCompiler()?.observe(classified);
+      }
       state.dispatchHostEvent("tool_error", event, context);
       await state.publishHostLifecycle("pi.tool_error", event);
     }

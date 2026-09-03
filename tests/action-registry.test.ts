@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ActionRegistry,
   type FabricCallAudit,
@@ -8,6 +11,8 @@ import type {
   FabricInvocationContext,
   FabricProvider,
 } from "../src/protocol.js";
+import { setActiveRepairCompiler } from "../src/repairs/active.js";
+import { RepairCompiler } from "../src/repairs/compiler.js";
 
 const provider = (): FabricProvider => ({
   name: "demo",
@@ -79,6 +84,21 @@ const invokeContext = (audits: FabricCallAudit[] = []) => ({
   audits,
   maxResultChars: 10_000,
 });
+
+const repairTmp: string[] = [];
+afterEach(() => {
+  setActiveRepairCompiler(undefined);
+  for (const dir of repairTmp.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const attachCompiler = (): RepairCompiler => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-registry-repairs-"));
+  repairTmp.push(agentDir);
+  const compiler = new RepairCompiler({ agentDir });
+  compiler.setCatalogSurface({ providers: ["demo"], capturedTools: [] });
+  setActiveRepairCompiler(compiler);
+  return compiler;
+};
 
 describe("ActionRegistry", () => {
   it("lists, searches, describes, and invokes providers", async () => {
@@ -523,5 +543,216 @@ describe("ActionRegistry", () => {
     await expect(registry.describe("demo.echo", context)).resolves.toMatchObject({
       ref: "demo.echo",
     });
+  });
+
+  it("persists a unique live action alias and applies it on the next miss", async () => {
+    const compiler = attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register(actionProvider("recall", "expand"));
+    expect(await registry.invoke("demo.search", {}, invokeContext())).toBe("recall");
+    expect(compiler.repairs).toContainEqual({
+      kind: "actionAlias",
+      provider: "demo",
+      from: "search",
+      to: "recall",
+    });
+  });
+
+  it("does not apply action aliases when a committed capability view is pinned", async () => {
+    attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register(actionProvider("recall", "expand"));
+    expect(await registry.invoke("demo.search", {}, invokeContext())).toBe("recall");
+    const pinned = await registry.acquireCapabilityView(["demo.recall"], context);
+    expect(pinned.satisfied).toBe(true);
+    await expect(
+      registry.invoke("demo.search", {}, {
+        ...invokeContext(),
+        capabilityView: pinned.view!,
+      }),
+    ).rejects.toThrow(/Unknown Fabric action|outside the committed view/);
+    await pinned.release();
+  });
+
+  it("does not learn accepted extension keys", async () => {
+    const compiler = attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register({
+      name: "demo",
+      description: "extensible action",
+      async list() {
+        return [await this.describe("echo", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "echo"
+          ? {
+              name: "echo",
+              description: "echo",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                additionalProperties: true,
+              },
+              risk: "read" as const,
+            }
+          : undefined;
+      },
+      async invoke(_name, args) {
+        return args.val;
+      },
+    });
+    expect(await registry.invoke("demo.echo", { val: "ok" }, invokeContext())).toBe("ok");
+    expect(compiler.repairs).toEqual([]);
+  });
+
+  it("repairs before provider preparation and scopes the row to the resolved action", async () => {
+    const compiler = attachCompiler();
+    const proxy = {
+      proxy: vi.fn(async (request: {
+        value: unknown;
+        args: Record<string, unknown>;
+      }) => request.value),
+    };
+    const registry = new ActionRegistry(proxy);
+    registry.register({
+      name: "demo",
+      description: "session action",
+      async list() {
+        return [await this.describe("recall", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "recall"
+          ? {
+              name: "recall",
+              description: "recall",
+              inputSchema: {
+                type: "object",
+                properties: { session: { type: "string" } },
+                required: ["session"],
+                additionalProperties: false,
+              },
+              risk: "read" as const,
+            }
+          : undefined;
+      },
+      async prepareArguments(_name, args) {
+        if ("sessionId" in args) throw new Error("preparer received spilled arguments");
+        return { ...args, session: String(args.session).trim() };
+      },
+      async invoke(_name, args) {
+        return args.session;
+      },
+    });
+    expect(
+      await registry.invoke("demo.search", { sessionId: " s1 " }, invokeContext()),
+    ).toBe("s1");
+    expect(compiler.repairs).toContainEqual({
+      kind: "keyAlias",
+      ref: "demo.recall",
+      from: "sessionId",
+      to: "session",
+    });
+    expect(proxy.proxy).toHaveBeenCalledWith(
+      expect.objectContaining({ args: { session: "s1" }, value: "s1" }),
+    );
+    expect(compiler.status()).toMatchObject({ invocationErrors: 0 });
+
+    registry.setSpeculation({
+      async tryServe() { return { hit: false, reason: "absent" }; },
+      bumpEpoch() {},
+    }, () => true);
+    const speculation = await registry.speculate(
+      "demo.recall",
+      { sessionId: " s2 " },
+      context,
+      {},
+    );
+    expect(speculation?.preparedArgs).toEqual({ session: "s2" });
+    await expect(speculation?.execute(undefined)).resolves.toBe("s2");
+  });
+
+  it("counts an unrepaired invalid-argument occurrence once", async () => {
+    const compiler = attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register({
+      name: "demo",
+      description: "ambiguous session action",
+      async list() {
+        return [await this.describe("expand", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "expand"
+          ? {
+              name: "expand",
+              description: "expand",
+              inputSchema: {
+                type: "object",
+                properties: { session: { type: "string" }, path: { type: "string" } },
+                required: ["session"],
+                additionalProperties: false,
+              },
+              risk: "read" as const,
+            }
+          : undefined;
+      },
+      async invoke() { return undefined; },
+    });
+    await expect(
+      registry.invoke("demo.expand", { id: "ambiguous" }, invokeContext()),
+    ).rejects.toThrow("Invalid arguments");
+    expect(compiler.repairs).toEqual([]);
+    expect(compiler.status()).toMatchObject({
+      invocationErrors: 1,
+      fingerprints: [expect.objectContaining({ count: 1, fingerprint: "args:demo.expand:id" })],
+    });
+  });
+
+  it("repairs scoped acquisition arguments before provider preparation", async () => {
+    const compiler = attachCompiler();
+    const dispose = vi.fn(async () => {});
+    const registry = new ActionRegistry();
+    registry.register({
+      name: "demo",
+      description: "scoped session action",
+      async list() {
+        return [await this.describe("open", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "open"
+          ? {
+              name: "open",
+              description: "open",
+              inputSchema: {
+                type: "object",
+                properties: { session: { type: "string" } },
+                required: ["session"],
+                additionalProperties: false,
+              },
+              risk: "execute" as const,
+              effect: { kind: "scoped" as const, resources: ["session"], ordering: "ordered" as const },
+            }
+          : undefined;
+      },
+      async prepareArguments(_name, args) {
+        if ("sessionId" in args) throw new Error("preparer received spilled arguments");
+        return args;
+      },
+      async invoke() {
+        throw new Error("use acquire");
+      },
+      async acquire(_name, args) {
+        return { value: args.session, dispose };
+      },
+    });
+    const acquired = await registry.acquireScoped("demo.open", { sessionId: "s1" }, context);
+    expect(acquired.value).toBe("s1");
+    expect(compiler.repairs).toContainEqual({
+      kind: "keyAlias",
+      ref: "demo.open",
+      from: "sessionId",
+      to: "session",
+    });
+    await acquired.dispose();
+    expect(dispose).toHaveBeenCalledOnce();
   });
 });

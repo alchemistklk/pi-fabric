@@ -223,6 +223,10 @@ export interface FabricMeshConfig {
   actorContextEntries: number;
 }
 
+interface FabricRepairsConfig {
+  enabled: boolean;
+}
+
 export interface FabricMemoryConfig {
   enabled: boolean;
   indexDir?: string;
@@ -284,6 +288,7 @@ export interface FabricConfig {
   retention: FabricRetentionConfig;
   mesh: FabricMeshConfig;
   memory: FabricMemoryConfig;
+  repairs: FabricRepairsConfig;
   schema: FabricSchemaConfig;
   speculation: FabricSpeculationConfig;
   codePreview: CodePreviewSettings;
@@ -435,6 +440,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     regexMaxHaystackTerms: 20_000,
     regexMaxHaystackBytes: 2 * 1024 * 1024,
     regexTimeoutMs: 250,
+  },
+  repairs: {
+    enabled: true,
   },
   schema: {
     mode: "off",
@@ -624,6 +632,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const retention = objectValue(input.retention);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
+  const repairs = objectValue(input.repairs);
   const modelsSection = objectValue(input.models);
   const schema = objectValue(input.schema);
   const schemaMode = schemaModeValue(schema.mode, DEFAULT_FABRIC_CONFIG.schema.mode);
@@ -1105,6 +1114,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         10,
         10_000,
       ),
+    },
+    repairs: {
+      enabled: booleanValue(repairs.enabled, DEFAULT_FABRIC_CONFIG.repairs.enabled),
     },
     schema: {
       mode: schemaMode,
