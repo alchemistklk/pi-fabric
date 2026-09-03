@@ -1,0 +1,205 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  compileEntropySurface,
+  loadCompiledSurface,
+  saveCompiledSurface,
+  schemaDigest,
+  type EntropyOperationInput,
+  type EntropySurfaceSnapshot,
+  type EntropyTraceInput,
+} from "../src/entropy/index.js";
+
+const tmpRoots: string[] = [];
+const makeTempDir = (): string => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-compiler-"));
+  tmpRoots.push(dir);
+  return dir;
+};
+afterEach(() => {
+  for (const dir of tmpRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const op = (
+  ref: string,
+  args: Record<string, unknown>,
+  outcome: "succeeded" | "failed" = "succeeded",
+  failureStage?: string,
+): EntropyOperationInput => ({ ref, args, outcome, ...(failureStage ? { failureStage } : {}) });
+
+const trace = (operations: EntropyOperationInput[], taskKey?: string): EntropyTraceInput => ({
+  operations,
+  ...(taskKey ? { taskKey } : {}),
+});
+
+const ratchetSurface = (): EntropySurfaceSnapshot => ({
+  version: 1,
+  actions: [
+    {
+      ref: "mcp.flaky.run",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["mode"],
+        properties: { mode: { type: "string" } },
+      },
+    },
+    {
+      ref: "mcp.report.render",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["format"],
+        properties: { format: { type: "string" } },
+      },
+    },
+    {
+      ref: "memory.expand",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["session"],
+        properties: { session: { type: "string" } },
+      },
+    },
+  ],
+});
+
+const renderLiveSchema = () =>
+  ratchetSurface().actions.find((action) => action.ref === "mcp.report.render")!.inputSchema;
+const flakyLiveSchema = () =>
+  ratchetSurface().actions.find((action) => action.ref === "mcp.flaky.run")!.inputSchema;
+
+const ratchetTraces = (): EntropyTraceInput[] => [
+  trace(
+    [
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "pdf" }),
+      op("mcp.report.render", { format: "html" }),
+    ],
+    "ratchet",
+  ),
+  trace(
+    [
+      op("mcp.flaky.run", { mode: "fast" }, "failed", "validate"),
+      op("mcp.flaky.run", { mode: "slow" }, "failed", "invoke"),
+      op("mcp.flaky.run", { mode: "fast" }, "failed", "validate"),
+      op("mcp.flaky.run", { mode: "fast" }, "failed", "invoke"),
+    ],
+    "ratchet",
+  ),
+  trace(
+    [
+      op("memory.expand", { session: "s1" }),
+      ...["s2", "s3", "s4", "s5", "s6", "s7", "s8"].map((session) =>
+        op("memory.expand", { session }),
+      ),
+    ],
+    "ratchet",
+  ),
+];
+
+const ratchetRepairs = () => [
+  { kind: "keyAlias" as const, ref: "memory.expand", from: "sessionId", to: "session" },
+];
+
+const compileInput = () => ({
+  traces: ratchetTraces(),
+  surface: ratchetSurface(),
+  repairs: ratchetRepairs(),
+});
+
+describe("compileEntropySurface", () => {
+  it("applies the mechanical subset through the gate and builds the artifact", () => {
+    const outcome = compileEntropySurface(compileInput());
+    expect(outcome.status).toBe("compiled");
+    expect(outcome.report.score).toBe(0.333435);
+    expect(outcome.gate?.passed).toBe(true);
+    expect(outcome.after!.score).toBeLessThan(outcome.report.score);
+    const artifact = outcome.artifact!;
+    expect(artifact.actions).toHaveLength(1);
+    expect(artifact.actions[0]!.ref).toBe("mcp.report.render");
+    expect(artifact.actions[0]!.baseSchemaDigest).toBe(schemaDigest(renderLiveSchema()));
+    const properties = artifact.actions[0]!.inputSchema.properties as Record<
+      string,
+      { enum?: unknown[] }
+    >;
+    expect(properties.format?.enum).toEqual(["pdf", "html"]);
+    expect(artifact.quarantined).toEqual([
+      { ref: "mcp.flaky.run", baseSchemaDigest: schemaDigest(flakyLiveSchema()) },
+    ]);
+    expect(artifact.applied.map((entry) => entry.kind)).toEqual([
+      "enum-tighten",
+      "noise-quarantine",
+    ]);
+    expect(artifact.gate.passed).toBe(true);
+  });
+
+  it("converges on the compiled artifact and leaves review-only proposals surfaced", () => {
+    const first = compileEntropySurface(compileInput());
+    const second = compileEntropySurface({
+      ...compileInput(),
+      ...(first.artifact ? { artifact: first.artifact } : {}),
+    });
+    expect(second.status).toBe("converged");
+    expect(second.artifact).toBe(first.artifact);
+    expect(second.proposals.map((proposal) => proposal.kind)).toEqual(["modal-rename"]);
+  });
+
+  it("rejects a compile whose enum would break a recorded successful call", () => {
+    const divergent = compileEntropySurface({
+      traces: [
+        trace([
+          ...Array.from({ length: 8 }, () => op("mcp.report.render", { format: "pdf" })),
+          op("mcp.report.render", { format: "web" }),
+        ]),
+      ],
+      surface: ratchetSurface(),
+      valueObservations: [
+        ...Array.from({ length: 8 }, () => ({
+          ref: "mcp.report.render",
+          key: "format",
+          value: "pdf",
+        })),
+        { ref: "mcp.report.render", key: "format", value: "html" },
+        { ref: "mcp.report.render", key: "format", value: "html" },
+      ],
+    });
+    expect(divergent.status).toBe("rejected");
+    expect(divergent.gate?.passed).toBe(false);
+    expect(divergent.gate?.reasons).toEqual([
+      "mcp.report.render: recorded arguments no longer validate against the compiled schema",
+    ]);
+    expect(divergent.artifact).toBeUndefined();
+  });
+});
+
+describe("compiled surface store", () => {
+  it("round-trips the artifact, no-ops identical writes, and surfaces damage", () => {
+    const agentDir = makeTempDir();
+    expect(loadCompiledSurface(agentDir)).toEqual({});
+    const outcome = compileEntropySurface(compileInput());
+    const artifact = outcome.artifact!;
+    const saved = saveCompiledSurface(agentDir, artifact);
+    expect(saved.written).toBe(true);
+    const loaded = loadCompiledSurface(agentDir);
+    expect(loaded.error).toBeUndefined();
+    expect(loaded.file).toEqual(artifact);
+    expect(saveCompiledSurface(agentDir, artifact).written).toBe(false);
+    const file = path.join(agentDir, "fabric", "entropy", "compiled.json");
+    fs.writeFileSync(file, "{ nope");
+    const damaged = loadCompiledSurface(agentDir);
+    expect(damaged.error).toBe("compiled surface is malformed JSON");
+    // Damage blocks the overwrite instead of silently rebuilding.
+    expect(() => saveCompiledSurface(agentDir, artifact)).toThrow(
+      "compiled surface is malformed JSON",
+    );
+  });
+});

@@ -5,17 +5,23 @@
 // synthetic session JSONL — all offline, with no model and no clocks inside
 // the measured values.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   ENTROPY_METRIC_VERSION,
+  applyCompiledSurface,
   applyProposalsToSurface,
+  compileEntropySurface,
   entropyReportHash,
   entropySurfaceHash,
   entropyTracesFromSessionJsonl,
   entropyValueObservationsFromSessionJsonl,
   evaluateGate,
+  loadCompiledSurface,
   measureEntropy,
   proposeEntropyReductions,
+  saveCompiledSurface,
+  schemaDigest,
   surfaceFreedomReport,
 } from "../../dist/entropy/index.js";
 
@@ -428,6 +434,103 @@ export const runEntropyCertification = async (options = {}) => {
     `round-2 proposals ${roundTwo.map((proposal) => proposal.kind).join(",")}`,
   );
 
+  // The autonomous compile loop: measure → propose → apply the mechanical
+  // subset → re-measure → gate, then converge on the compiled artifact.
+  // Modal-rename is surfaced but never applied here: a pure rename drops
+  // the declared key every successful call recorded, so it cannot pass the
+  // replay gate as a schema rewrite.
+  const compileInput = () => ({
+    traces: ratchetTraces(),
+    surface: ratchetSurface(),
+    repairs: ratchetRepairs(),
+  });
+  const compiledOutcome = compileEntropySurface(compileInput());
+  const overlayLive = ratchetSurface();
+  const overlayLiveJson = JSON.stringify(overlayLive);
+  const overlayApplied = applyCompiledSurface(overlayLive, compiledOutcome.artifact);
+  check(
+    "compiler-loop",
+    compiledOutcome.status === "compiled" &&
+      compiledOutcome.report.score === 0.333435 &&
+      compiledOutcome.gate.passed === true &&
+      compiledOutcome.after.score === 0.304789 &&
+      compiledOutcome.gate.delta === -0.028646 &&
+      compiledOutcome.artifact.actions.length === 1 &&
+      compiledOutcome.artifact.actions[0].ref === "mcp.report.render" &&
+      compiledOutcome.artifact.actions[0].baseSchemaDigest ===
+        schemaDigest(
+          ratchetSurface().actions.find((action) => action.ref === "mcp.report.render")
+            .inputSchema,
+        ) &&
+      compiledOutcome.artifact.quarantined.length === 1 &&
+      compiledOutcome.artifact.quarantined[0].ref === "mcp.flaky.run" &&
+      compiledOutcome.artifact.applied.length === 2,
+    `status ${compiledOutcome.status} score ${compiledOutcome.report.score} → ${compiledOutcome.after?.score}`,
+  );
+  const recompiled = compileEntropySurface({
+    ...compileInput(),
+    artifact: compiledOutcome.artifact,
+  });
+  check(
+    "compiler-converged",
+    recompiled.status === "converged" &&
+      recompiled.artifact === compiledOutcome.artifact &&
+      recompiled.proposals.every((proposal) => proposal.kind === "modal-rename"),
+    `status ${recompiled.status} proposals ${recompiled.proposals.map((p) => p.kind).join(",")}`,
+  );
+  check(
+    "compiled-surface-overlay",
+    JSON.stringify(overlayLive) === overlayLiveJson &&
+      overlayApplied.actions.length === 2 &&
+      overlayApplied.actions.some(
+        (action) =>
+          action.ref === "mcp.report.render" &&
+          action.inputSchema.properties.format.enum.length === 2,
+      ) &&
+      !overlayApplied.actions.some((action) => action.ref === "mcp.flaky.run"),
+    `overlay actions ${overlayApplied.actions.map((a) => a.ref).join(",")}`,
+  );
+  const divergentObservations = [
+    ...Array.from({ length: 8 }, () => ({
+      ref: "mcp.report.render",
+      key: "format",
+      value: "pdf",
+    })),
+    { ref: "mcp.report.render", key: "format", value: "html" },
+    { ref: "mcp.report.render", key: "format", value: "html" },
+  ];
+  const divergent = compileEntropySurface({
+    traces: [
+      trace([
+        ...Array.from({ length: 8 }, () => op("mcp.report.render", { format: "pdf" })),
+        op("mcp.report.render", { format: "web" }),
+      ]),
+    ],
+    surface: ratchetSurface(),
+    valueObservations: divergentObservations,
+  });
+  check(
+    "compiler-gate-reject",
+    divergent.status === "rejected" &&
+      divergent.gate.passed === false &&
+      divergent.gate.reasons.some((reason) => reason.includes("mcp.report.render")) &&
+      divergent.artifact === undefined,
+    `status ${divergent.status} reasons ${divergent.gate?.reasons.join("; ")}`,
+  );
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-store-"));
+  const saved = saveCompiledSurface(storeDir, compiledOutcome.artifact);
+  const reloaded = loadCompiledSurface(storeDir);
+  const noopSave = saveCompiledSurface(storeDir, compiledOutcome.artifact);
+  check(
+    "compiled-store-roundtrip",
+    saved.written === true &&
+      noopSave.written === false &&
+      reloaded.error === undefined &&
+      JSON.stringify(reloaded.file) === JSON.stringify(compiledOutcome.artifact),
+    `written ${saved.written}/${noopSave.written} error ${reloaded.error ?? "none"}`,
+  );
+  fs.rmSync(storeDir, { recursive: true, force: true });
+
   // Score decomposition: the surface share prices the potential the corpus
   // used; everything else is freedom models exercised.
   check(
@@ -623,6 +726,12 @@ export const runEntropyCertification = async (options = {}) => {
         delta: gate.delta,
         proposals,
         gate,
+      },
+      compiler: {
+        status: compiledOutcome.status,
+        beforeScore: compiledOutcome.report.score,
+        afterScore: compiledOutcome.after?.score,
+        applied: compiledOutcome.artifact?.applied ?? [],
       },
       structure: {
         proposals: structureProposals,

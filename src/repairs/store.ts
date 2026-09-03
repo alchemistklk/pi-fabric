@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { withExclusiveFileLock } from "../core/file-lock.js";
 import {
   emptyRepairTable,
   MAX_CATALOG_REPAIRS,
@@ -11,32 +11,18 @@ import {
   type RepairTableFile,
 } from "./types.js";
 
-const REPAIR_LOCK_ATTEMPTS = 50;
-const REPAIR_LOCK_DELAY_MS = 5;
-const REPAIR_STALE_LOCK_MS = 30_000;
+const LOCK_TIMEOUT_MESSAGE = "Timed out waiting for the Fabric repair table lock";
 
 export const repairsDirectory = (agentDir: string): string =>
   path.join(agentDir, "fabric", "repairs");
 
 const currentPath = (directory: string): string => path.join(directory, "current.json");
-const lockPath = (directory: string): string => path.join(directory, "current.lock");
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const errorCode = (error: unknown): string | undefined =>
   isRecord(error) && typeof error.code === "string" ? error.code : undefined;
-
-const sleepSync = (() => {
-  try {
-    const buffer = new Int32Array(new SharedArrayBuffer(4));
-    return (ms: number): void => {
-      Atomics.wait(buffer, 0, 0, ms);
-    };
-  } catch {
-    return (): void => undefined;
-  }
-})();
 
 const parseRepair = (value: unknown): CatalogRepair | undefined | "skip" => {
   if (!isRecord(value) || typeof value.kind !== "string") return undefined;
@@ -106,132 +92,6 @@ const writeTable = (file: string, table: RepairTableFile): void => {
   writeJsonAtomic(file, table, { space: 2, newline: true, mode: 0o600, dirMode: 0o700 });
 };
 
-const processAlive = (pid: number): boolean => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-// Stale-lock recovery must be an exclusive claim. Stat-then-delete is
-// TOCTOU: two reapers (or a reaper and a fresh writer that recreated the
-// lock in between) can both pass their checks, and the slower rm then
-// deletes a lock the faster one already replaced. rename() is the claim —
-// only one process can move the directory, and removal targets the claimed
-// path, never the live lock path. A claim that turns out to hold a live
-// lock is renamed back before any destructive step; a live lock is never
-// deleted, even if the rename-back races a fresh writer.
-const reapStaleLock = (lock: string, verify: (claimed: string) => boolean): boolean => {
-  const claim = `${lock}.reap-${process.pid}-${randomUUID()}`;
-  try {
-    fs.renameSync(lock, claim);
-  } catch {
-    return false;
-  }
-  if (!verify(claim)) {
-    try {
-      fs.renameSync(claim, lock);
-    } catch {
-      // `lock` was recreated after the claim. Re-verify before any
-      // destructive step so a claimed live lock is only ever abandoned as
-      // garbage, never deleted.
-      if (verify(claim)) fs.rmSync(claim, { recursive: true, force: true });
-    }
-    return false;
-  }
-  fs.rmSync(claim, { recursive: true, force: true });
-  return true;
-};
-
-const withRepairLock = <T>(directory: string, operation: () => T): T => {
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const lock = lockPath(directory);
-  const ownerPath = path.join(lock, "owner");
-  const token = randomUUID();
-  let acquired = false;
-  for (let attempt = 0; attempt < REPAIR_LOCK_ATTEMPTS; attempt++) {
-    try {
-      fs.mkdirSync(lock, { mode: 0o700 });
-      try {
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
-      } catch (error) {
-        fs.rmSync(lock, { recursive: true, force: true });
-        throw error;
-      }
-      acquired = true;
-      break;
-    } catch (error) {
-      if (errorCode(error) !== "EEXIST") throw error;
-      try {
-        const firstOwner = fs.readFileSync(ownerPath, "utf8");
-        const [, pidText, createdText] = firstOwner.trim().split("\n");
-        const stale = Date.now() - Number(createdText) > REPAIR_STALE_LOCK_MS;
-        if (stale && !processAlive(Number(pidText))) {
-          const secondOwner = fs.readFileSync(ownerPath, "utf8");
-          if (
-            secondOwner === firstOwner &&
-            reapStaleLock(lock, (claimed) => {
-              try {
-                const owner = fs.readFileSync(path.join(claimed, "owner"), "utf8");
-                const [, pid, created] = owner.trim().split("\n");
-                return (
-                  Date.now() - Number(created) > REPAIR_STALE_LOCK_MS &&
-                  !processAlive(Number(pid))
-                );
-              } catch {
-                return false;
-              }
-            })
-          ) {
-            continue;
-          }
-        }
-      } catch {
-        try {
-          // Ownerless lock (crash between mkdir and the owner write): age is
-          // the only signal, and the claim re-verifies it after the rename.
-          const first = fs.statSync(lock);
-          if (
-            Date.now() - first.mtimeMs > REPAIR_STALE_LOCK_MS &&
-            reapStaleLock(lock, (claimed) => {
-              try {
-                return Date.now() - fs.statSync(claimed).mtimeMs > REPAIR_STALE_LOCK_MS;
-              } catch {
-                return false;
-              }
-            })
-          ) {
-            continue;
-          }
-        } catch {
-          // Lock creation or stale recovery raced; retry the bounded acquisition.
-        }
-      }
-      if (attempt === REPAIR_LOCK_ATTEMPTS - 1) break;
-      sleepSync(REPAIR_LOCK_DELAY_MS);
-    }
-  }
-  if (!acquired) throw new Error("Timed out waiting for the Fabric repair table lock");
-  try {
-    return operation();
-  } finally {
-    try {
-      const owner = fs.readFileSync(ownerPath, "utf8");
-      if (owner.startsWith(`${token}\n`)) {
-        fs.rmSync(lock, { recursive: true, force: true });
-      }
-    } catch {
-      // A recovering process already removed this lock.
-    }
-  }
-};
-
 export interface LoadedRepairTable {
   table: RepairTableFile;
   error?: string;
@@ -274,30 +134,33 @@ export const saveRepairTable = (
   directory: string,
   table: RepairTableFile,
 ): RepairTableFile =>
-  withRepairLock(directory, () => {
-    const loaded = loadRepairTable(directory, table.catalogDigest);
-    // A damaged table must never be silently rebuilt: merging from empty
-    // would overwrite the user's data. Fail so promotion records the reason
-    // in status().storeError and leaves the file untouched for recovery.
-    if (loaded.error) throw new Error(loaded.error);
-    const persisted = loaded.table;
-    const repairs: CatalogRepair[] = [];
-    const identities = new Set<string>();
-    for (const repair of [...persisted.repairs, ...table.repairs]) {
-      const identity = repairIdentity(repair);
-      if (identities.has(identity)) continue;
-      if (repairs.length >= MAX_CATALOG_REPAIRS) break;
-      identities.add(identity);
-      repairs.push(repair);
-    }
-    const now = new Date().toISOString();
-    const merged: RepairTableFile = {
-      version: REPAIR_TABLE_VERSION,
-      catalogDigest: table.catalogDigest,
-      repairs,
-      createdAt: persisted.repairs.length > 0 ? persisted.createdAt : table.createdAt,
-      updatedAt: now,
-    };
-    writeTable(currentPath(directory), merged);
-    return merged;
-  });
+  withExclusiveFileLock(
+    { directory, lockName: "current.lock", timeoutMessage: LOCK_TIMEOUT_MESSAGE },
+    () => {
+      const loaded = loadRepairTable(directory, table.catalogDigest);
+      // A damaged table must never be silently rebuilt: merging from empty
+      // would overwrite the user's data. Fail so promotion records the reason
+      // in status().storeError and leaves the file untouched for recovery.
+      if (loaded.error) throw new Error(loaded.error);
+      const persisted = loaded.table;
+      const repairs: CatalogRepair[] = [];
+      const identities = new Set<string>();
+      for (const repair of [...persisted.repairs, ...table.repairs]) {
+        const identity = repairIdentity(repair);
+        if (identities.has(identity)) continue;
+        if (repairs.length >= MAX_CATALOG_REPAIRS) break;
+        identities.add(identity);
+        repairs.push(repair);
+      }
+      const now = new Date().toISOString();
+      const merged: RepairTableFile = {
+        version: REPAIR_TABLE_VERSION,
+        catalogDigest: table.catalogDigest,
+        repairs,
+        createdAt: persisted.repairs.length > 0 ? persisted.createdAt : table.createdAt,
+        updatedAt: now,
+      };
+      writeTable(currentPath(directory), merged);
+      return merged;
+    },
+  );
