@@ -1094,9 +1094,32 @@ export class AgentsProvider implements FabricProvider {
           context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
           return actor;
         }
-        if (request.residency === "durable") await this.#resident().ensureHost();
+        if (request.residency === "durable") {
+          await this.#resident().ensureHost();
+          let actor: Awaited<ReturnType<ActorManager["create"]>>;
+          try {
+            actor = await this.actorManager.create(request);
+            if (actor.residency === "durable") await this.#activateDurableActor(actor);
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              !error.message.includes("registry is owned by another host")
+            ) {
+              throw error;
+            }
+            // The registry already transferred to the resident host (a prior
+            // durable was created and ceded to it). Route the authoritative
+            // create over the residency file protocol instead of failing:
+            // the resident host creates it as the registry owner.
+            const config = this.#resident().options.config;
+            const client = new ResidentActorClient(config.meshRoot, config.rootId);
+            actor = await client.createActor(request);
+          }
+          this.participants.scheduleRefresh();
+          context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
+          return actor;
+        }
         const actor = await this.actorManager.create(request);
-        if (actor.residency === "durable") await this.#activateDurableActor(actor);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;

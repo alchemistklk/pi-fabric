@@ -511,6 +511,50 @@ describe("ActorManager", () => {
     ).rejects.toThrow("registry is owned by another host");
   });
 
+  it("creates via the registry-owner channel while a live foreign actor holds the registry", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({
+      name: "foreign-live-owner-channel",
+      instructions: "Owned elsewhere.",
+      residency: "session",
+    });
+    const peerIdentity: MeshIdentity = {
+      id: "session:owner-channel",
+      name: "main",
+      kind: "main",
+      sessionId: "owner-channel",
+    };
+    const peer = new ActorManager(
+      "owner-channel",
+      peerIdentity,
+      state.mesh,
+      state.meshConfig,
+      state.agents,
+      () => {},
+      {
+        actorRoot: path.join(state.root, "actors"),
+        persistent: true,
+        claimResidency: "session",
+        rootId: peerIdentity.id,
+        // Live foreign owner advertised by the participant directory.
+        canManageActor: () => false,
+      },
+    );
+    actorManagers.push(peer);
+
+    // Plain callers stay guarded.
+    await expect(
+      peer.create({ name: "blocked", instructions: "Guard stays for plain callers." }),
+    ).rejects.toThrow("registry is owned by another host");
+    // The resident host control channel creates as the registry owner.
+    const created = await peer.create(
+      { name: "via-owner-channel", instructions: "Created as the registry owner." },
+      { asRegistryOwner: true },
+    );
+    expect(created.name).toBe("via-owner-channel");
+    expect(created.id).toBeTruthy();
+  });
+
   it("settles exactly one adopter when concurrent starters race an orphan", async () => {
     const state = setup(true);
     const actor = await state.actors.create({
