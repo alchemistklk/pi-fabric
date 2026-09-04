@@ -244,6 +244,7 @@ export const projectFabricAuditArgs = (
     case "pi.write":
       return projected(args, (output) => copyPath(output, args));
     case "pi.bash":
+    case "pi.powershell":
       return projected(args, (output) => copyString(output, args, "command"));
     case "mesh.publish":
       return projected(args, (output) => {

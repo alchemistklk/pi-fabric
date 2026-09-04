@@ -74,9 +74,9 @@ For provider-level corruption, or for sessions that expose Pi tools directly, in
 
 The provider owns the Anthropic strict tool use setting. When enabled, strict mode stops the server from sampling keys that are absent from the schema. Anthropic limits the complexity of strict tool definitions.
 
-## Bash exit status and result middleware
+## Shell exit status and result middleware
 
-`pi.bash(..., { settle: true })` converts an ordinary native nonzero exit into
+`pi.bash(..., { settle: true })` and Windows-only `pi.powershell(..., { settle: true })` convert an ordinary native nonzero exit into
 `{ ok: false, exitCode, output, details, error }`. Fabric classifies that exit
 before `tool_result` middleware runs and transports the status separately from
 display text in both runtimes. Trimming, redaction, newline changes, or replacing
@@ -91,7 +91,7 @@ middleware recovery through `isError: false` remains effective. Pi's
 a handler introduced a new failure. After a native nonzero exit, Fabric cannot
 distinguish an annotation/redaction from an additional middleware veto expressed
 only through text and `isError: true`. Such a veto needs a separate explicit
-provenance contract; this limitation is not solved by bash settlement. For now,
+provenance contract; this limitation is not solved by shell settlement. For now,
 checks that must prevent command execution belong in approval or `tool_call`
 preflight, and callers requiring all final errors to throw should omit `settle`.
 

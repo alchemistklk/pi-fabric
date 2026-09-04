@@ -19,6 +19,7 @@ const SHELL_OR_PROSE_NAMES = new Set([
   "a",
   "and",
   "bash",
+  "powershell",
   "data",
   "do",
   "document",
@@ -186,7 +187,7 @@ export const classifyToolResult = (input: {
   const unknown = UNKNOWN_ACTION.exec(text);
   if (unknown?.[1]) return classifyUnknownAction(unknown[1]);
   if (EXACT_TEXT.test(text)) return { stage: "effect", fingerprint: `effect:edit_miss:${tool}` };
-  if (tool === "bash" || tool === "pi.bash") {
+  if (["bash", "pi.bash", "powershell", "pi.powershell"].includes(tool)) {
     return { stage: "effect", fingerprint: "effect:bash" };
   }
   if (["read", "write", "edit", "grep", "find", "ls"].includes(tool)) {

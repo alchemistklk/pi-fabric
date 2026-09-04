@@ -94,8 +94,8 @@ const SHIKI_THEME_PRESETS = [
   "one-dark-pro",
 ] as const;
 const RISKS = ["read", "write", "execute", "network", "agent"] as const;
-const CORE_RISK_TOOLS = ["read", "grep", "find", "edit", "write", "bash"] as const;
-const CORE_DEFAULT_TOOL_CANDIDATES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const CORE_RISK_TOOLS = ["read", "grep", "find", "edit", "write", "bash", "powershell"] as const;
+const CORE_DEFAULT_TOOL_CANDIDATES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 const BUDGET_VALUES = [0, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10];
 const TOKEN_VALUES = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000];
 const PREWALK_MODEL_UNSET_LABEL = "Ask each time";
@@ -1275,7 +1275,7 @@ export const buildFabricSettingsItems = (
             config.prewalk.detectShellWrites ? "true" : "false",
             {
               description:
-                "Filesystem fallback trigger: when an armed task ran a successful pi.bash in fabric_exec without an audited pi.edit / pi.write / schema.commit, claim the handoff if file stats drifted from baseline, so shell heredocs, sed -i, or formatter-binary writes also reach the executor.",
+                "Filesystem fallback trigger: when an armed task ran a successful pi.bash or pi.powershell in fabric_exec without an audited pi.edit / pi.write / schema.commit, claim the handoff if file stats drifted from baseline, so shell heredocs, sed -i, or formatter-binary writes also reach the executor.",
               values: BOOLEANS,
             },
           ),

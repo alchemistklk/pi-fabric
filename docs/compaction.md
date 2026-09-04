@@ -259,7 +259,7 @@ execution only from `message.details.trace` through
 `readFabricExecutionTraceV1`. Emitted operations follow `operation.sequence`
 order with addresses such as `entry-id/0`, and phases use `entry-id/phase:0`.
 Known `pi.read`, `pi.grep`, `pi.find`, `pi.ls`, `pi.edit`, `pi.write`, and
-`pi.bash` calls retain exact typed arguments and outcomes. Other refs remain
+`pi.bash` and `pi.powershell` calls retain exact typed arguments and outcomes. Other refs remain
 typed Fabric activity.
 
 Fabric ignores a present trace version when it is malformed or unknown. It

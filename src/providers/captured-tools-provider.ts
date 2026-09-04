@@ -3,6 +3,7 @@ import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { isPiShellToolName } from "../core/pi-tools.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -169,6 +170,10 @@ export class CapturedToolsProvider implements FabricProvider {
         throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
       }
       executionStarted = true;
+      const requestedCwd = args.cwd;
+      const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
+        ? { ...runner.createContext(), cwd: requestedCwd }
+        : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
         const progress = textFromContent(partialResult.content).trim();
@@ -184,10 +189,10 @@ export class CapturedToolsProvider implements FabricProvider {
             })),
           )
           .catch(() => undefined);
-        }),
+        }, executionContext),
       );
     } catch (error) {
-      thrown = entry.name === "bash" && executionStarted ? classifyPiBashError(error) : error;
+      thrown = isPiShellToolName(entry.name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
       result = {
         content: [
@@ -229,7 +234,9 @@ export class CapturedToolsProvider implements FabricProvider {
     }));
 
     if (isError) {
-      if (entry.name === "bash") throw piBashResultError(thrown, textFromContent(result.content));
+      if (isPiShellToolName(entry.name)) {
+        throw piBashResultError(thrown, textFromContent(result.content));
+      }
       const text = textFromContent(result.content).trim();
       throw new Error(
         text || (thrown instanceof Error ? thrown.message : `Captured tool ${entry.name} failed`),

@@ -201,6 +201,45 @@ describe("PiToolsProvider lifecycle", () => {
     expect((result as string).length).toBeGreaterThan(0);
   });
 
+  it("preserves shell cwd through pi 0.85 argument preparation", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-cwd-"));
+    const nested = path.join(root, "nested");
+    fs.mkdirSync(nested);
+    try {
+      const registry = new ActionRegistry();
+      registry.register(new PiToolsProvider(root, undefined, undefined));
+      const result = await registry.invoke(
+        "pi.bash",
+        { command: "pwd", cwd: "nested" },
+        {
+          ...baseContext,
+          cwd: root,
+          extensionContext: { ...baseContext.extensionContext, cwd: root } as ExtensionContext,
+          audits: [],
+        },
+      ) as { output: string };
+      expect(result.output.trim()).toBe(fs.realpathSync(nested));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("registers PowerShell with shell schema and execution risk", async () => {
+    const provider = new PiToolsProvider(process.cwd(), undefined, undefined);
+    const descriptor = await provider.describe("powershell", baseContext);
+
+    expect(descriptor).toMatchObject({
+      name: "powershell",
+      namespace: "builtin",
+      risk: "execute",
+    });
+    expect(descriptor?.inputSchema.properties).toMatchObject({
+      command: expect.any(Object),
+      timeout: expect.any(Object),
+      cwd: expect.any(Object),
+    });
+  });
+
   it("expands explicit skill-dir markers only for SKILL.md reads", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-skill-dir-"));
     const skillDir = path.join(cwd, "installed", "duplicate-name");

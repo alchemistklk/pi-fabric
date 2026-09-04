@@ -113,7 +113,7 @@ interface FabricPrewalkConfig {
   // model after an in-place continuation settles.
   compactOnReturn: boolean;
   // Filesystem fallback trigger: when an armed boundary ran a successful
-  // pi.bash without an audited mutation, claim on stat-manifest drift so
+  // pi.bash or pi.powershell without an audited mutation, claim on stat-manifest drift so
   // shell heredocs / sed -i / formatter writes also hand off.
   detectShellWrites: boolean;
   // Reasoning effort for the trajectory executor; unset inherits agents.thinking.

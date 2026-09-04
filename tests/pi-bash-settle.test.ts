@@ -23,7 +23,7 @@ const cwd = process.cwd();
 async function run(
   runtime: "quickjs" | "node-process",
   patch: Patch,
-  options: { command?: string; captured?: boolean; preflight?: boolean; noRunner?: boolean; settle?: boolean; timeout?: number; signal?: AbortSignal; approvalDenied?: boolean; middleware?: (event: ResultEvent) => ResultPatch } = {},
+  options: { command?: string; captured?: boolean; tool?: "bash" | "powershell"; preflight?: boolean; noRunner?: boolean; settle?: boolean; timeout?: number; signal?: AbortSignal; approvalDenied?: boolean; middleware?: (event: ResultEvent) => ResultPatch } = {},
 ) {
   const runner = {
     createContext: () => ({ cwd, sessionManager: { getSessionId: () => "settle-regression", getSessionFile: () => undefined } }),
@@ -58,8 +58,12 @@ async function run(
     runner.emitToolResult = (event) => ExtensionRunner.prototype.emitToolResult.call(middlewareRunner, event);
   }
   const catalog = new CapturedToolCatalog();
+  const shellDefinition = createBashToolDefinition(cwd);
+  const capturedDefinition = options.tool === "powershell"
+    ? { ...shellDefinition, name: "powershell", label: "powershell" }
+    : shellDefinition;
   catalog.replace(options.captured ? [{
-    definition: createBashToolDefinition(cwd) as RegisteredTool["definition"],
+    definition: capturedDefinition as RegisteredTool["definition"],
     sourceInfo: createSyntheticSourceInfo("/extensions/bash-override/index.ts", { source: "test" }),
   }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
   const registry = new ActionRegistry();
@@ -68,7 +72,7 @@ async function run(
   config.executor.runtime = runtime;
   config.approvals.execute = options.approvalDenied ? "deny" : "allow";
   return new FabricExecutionService(registry, config).execute({
-    code: "return await pi.bash({command: π.command, settle: π.settle === 'true', ...(π.timeout ? {timeout: Number(π.timeout)} : {})});",
+    code: `return await pi.${options.tool ?? "bash"}({command: π.command, settle: π.settle === 'true', ...(π.timeout ? {timeout: Number(π.timeout)} : {})});`,
     strings: { command: options.command ?? command, settle: String(options.settle ?? true), timeout: options.timeout === undefined ? "" : String(options.timeout) },
     signal: options.signal,
     parentToolCallId: "settle-regression",
@@ -97,6 +101,12 @@ describe.each(["quickjs", "node-process"] as const)("pi.bash settle via %s", (ru
 
   it("settles a captured bash override with suffix middleware", async () => {
     const result = await run(runtime, "suffix", { captured: true });
+    expect(result.error).toBeUndefined();
+    expect(result.value).toMatchObject({ ok: false, exitCode: 7 });
+  });
+
+  it("settles a captured PowerShell override with suffix middleware", async () => {
+    const result = await run(runtime, "suffix", { captured: true, tool: "powershell" });
     expect(result.error).toBeUndefined();
     expect(result.value).toMatchObject({ ok: false, exitCode: 7 });
   });

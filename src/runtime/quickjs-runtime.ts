@@ -94,7 +94,7 @@ const __call = async (ref, args) => {
   __recordSuccessfulCall(ref, normalizedArgs);
   return value;
 };
-const __piToolNames = ["read","bash","edit","write","grep","find","ls"];
+const __piToolNames = ["read","bash","powershell","edit","write","grep","find","ls"];
 const __toolsBase = {
   providers: () => __call("fabric.$providers", {}),
   catalog: (args = {}) => __call("fabric.$catalog", args),
@@ -128,7 +128,7 @@ globalThis.tools = new Proxy(__toolsBase, {
   set() { return true; },
   deleteProperty() { return true; },
 });
-const __piStringFields = { bash: "command", read: "path", ls: "path", grep: "pattern", find: "pattern" };
+const __piStringFields = { bash: "command", powershell: "command", read: "path", ls: "path", grep: "pattern", find: "pattern" };
 // Per-tool key aliases. The runtime normalizes them to the canonical form
 // before the host validates args; unit-converting aliases are handled separately
 // in __normalizePiArgs. This lets a model that writes { query, regex, ... }
@@ -137,6 +137,11 @@ const __piStringFields = { bash: "command", read: "path", ls: "path", grep: "pat
 // the type-checker accepts the same spellings it coercion-handles at runtime.
 const __piArgAliases = {
   bash: {
+    cmd: "command", shell: "command", cmdline: "command", script: "command",
+    commandLine: "command",
+    workdir: "cwd", directory: "cwd", workingDirectory: "cwd",
+  },
+  powershell: {
     cmd: "command", shell: "command", cmdline: "command", script: "command",
     commandLine: "command",
     workdir: "cwd", directory: "cwd", workingDirectory: "cwd",
@@ -208,6 +213,7 @@ const __piNumericFields = {
   find: ["limit"],
   ls: ["limit"],
   bash: ["timeout"],
+  powershell: ["timeout"],
 };
 const __piOptionalFields = {
   read: ["offset", "limit"],
@@ -215,6 +221,7 @@ const __piOptionalFields = {
   find: ["path", "limit"],
   ls: ["path", "limit"],
   bash: ["timeout"],
+  powershell: ["timeout"],
 };
 // (primary, options) two-arg merge for the string-primary tools:
 // pi.read("index.ts", { limit: 120 }) becomes { path: "index.ts", limit: 120 }.
@@ -252,7 +259,7 @@ const __normalizePiArgs = (name, args) => {
   if (args === null || typeof args !== "object" || Array.isArray(args)) return args;
   const aliases = __piArgAliases[name];
   let out = args;
-  if (name === "bash" && "timeoutMs" in out) {
+  if ((name === "bash" || name === "powershell") && "timeoutMs" in out) {
     out = Object.assign({}, args);
     if (!("timeout" in out)) {
       const timeoutMs = out.timeoutMs;
@@ -264,7 +271,7 @@ const __normalizePiArgs = (name, args) => {
   }
   // settle is a guest-only directive (settles nonzero exits instead of
   // rejecting); strip it so it never reaches the host/bash schema.
-  if (name === "bash" && "settle" in out) {
+  if ((name === "bash" || name === "powershell") && "settle" in out) {
     if (out === args) out = Object.assign({}, args);
     delete out.settle;
   }
@@ -330,7 +337,7 @@ const __normalizePiArgs = (name, args) => {
   }
   return out;
 };
-// bash/edit/write resolve envelope objects { ok, output, details }, and the
+// shell/edit/write resolve envelope objects { ok, output, details }, and the
 // type-checker deliberately suppresses property-miss (2339) diagnostics, so
 // result.trim() on an envelope typechecks and then dies with QuickJS's terse
 // "not a function" — an error models cannot localize (observed: misdirected
@@ -338,7 +345,7 @@ const __normalizePiArgs = (name, args) => {
 // that throws an actionable TypeError for string-method access and iteration,
 // naming the tool and the .output fix. Ordinary reads (ok/output/details/
 // exitCode/error), destructuring, 'in' checks, and JSON marshaling pass through.
-const __piEnvelopeTools = { bash: true, edit: true, write: true };
+const __piEnvelopeTools = { bash: true, powershell: true, edit: true, write: true };
 const __piEnvelopeStringTraps = new Set([
   "anchor", "at", "big", "blink", "bold", "charAt", "charCodeAt", "codePointAt",
   "concat", "endsWith", "fixed", "fontcolor", "fontsize", "includes", "indexOf",
@@ -362,7 +369,7 @@ const __piEnvelopeGuard = (name, value) => {
         throw new TypeError(
           "pi." + name + "(...) resolves an envelope { ok, output, details }, not a string, so ." + property +
           " is unavailable on it. Read the text first: const out = (await pi." + name + "(...)).output; then out." + property +
-          "(...). bash rejects on a nonzero exit — pass settle: true to receive an ok:false envelope instead."
+          "(...). Shell commands reject on a nonzero exit — pass settle: true to receive an ok:false envelope instead."
         );
       }
       return Reflect.get(target, property, receiver);
@@ -385,9 +392,9 @@ globalThis.pi = new Proxy({}, {
       } else {
         args = __positionalToArgs(name, rest);
       }
-      // bash rejects on an ordinary nonzero exit; settle:true returns
+      // Shell tools reject on an ordinary nonzero exit; settle:true returns
       // {ok:false, exitCode, ...} instead (opt-in). Other failures still reject.
-      const settle = name === "bash" &&
+      const settle = (name === "bash" || name === "powershell") &&
         typeof args === "object" && args !== null && args.settle === true;
       const call = __call("pi." + name, __normalizePiArgs(name, args));
       const promise = settle ? call.catch((error) => {
@@ -1112,7 +1119,9 @@ export class QuickJsRuntime {
               const errorHandle = context.newError(
                 error instanceof Error ? error.message : String(error),
               );
-              const exit = reference === "pi.bash" ? piBashExitMetadata(error) : undefined;
+              const exit = reference === "pi.bash" || reference === "pi.powershell"
+                ? piBashExitMetadata(error)
+                : undefined;
               if (exit) {
                 const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
                 context.setProp(errorHandle, "__fabricBashExit", metadata);

@@ -692,7 +692,7 @@ const transcriptToolAudit = (entry: FabricTranscriptEntry): FabricRenderAudit =>
   const normalized = rawName.toLowerCase();
   const tool = normalized === "glob"
     ? "find"
-    : ["read", "write", "edit", "bash", "grep", "find", "ls"].includes(normalized)
+    : ["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"].includes(normalized)
       ? normalized
       : rawName;
   const rawArgs = entry.args ?? {};
@@ -1030,7 +1030,7 @@ export interface FabricCoreToolPreview extends FabricRenderAudit {
   ref: string;
 }
 
-const CORE_TOOL_NAMES = new Set(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+const CORE_TOOL_NAMES = new Set(["bash", "powershell", "read", "write", "edit", "grep", "find", "ls"]);
 
 export const captureFabricCoreToolPreviews = (
   audits: FabricRenderAudit[],

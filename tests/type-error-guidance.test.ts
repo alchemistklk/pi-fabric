@@ -127,9 +127,11 @@ describe("typeErrorRecoveryHint", () => {
   });
 
   it("derives the property registry from the guest type declarations", () => {
-    expect(CORE_TOOL_NAMES).toEqual(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-    expect(CORE_TOOL_PROPERTIES.get("settle")).toEqual(["bash"]);
-    expect(CORE_TOOL_PROPERTIES.get("timeout")).toEqual(["bash"]);
+    expect(CORE_TOOL_NAMES).toEqual([
+      "read", "bash", "powershell", "edit", "write", "grep", "find", "ls",
+    ]);
+    expect(CORE_TOOL_PROPERTIES.get("settle")).toEqual(["bash", "powershell"]);
+    expect(CORE_TOOL_PROPERTIES.get("timeout")).toEqual(["bash", "powershell"]);
     expect(CORE_TOOL_PROPERTIES.get("edits")).toEqual(["edit"]);
     expect(CORE_TOOL_PROPERTIES.get("context")).toEqual(["grep"]);
     expect(CORE_TOOL_PROPERTIES.get("content")).toEqual(["write"]);

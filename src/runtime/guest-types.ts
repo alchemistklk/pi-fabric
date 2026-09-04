@@ -9,6 +9,7 @@ import type { FabricDynamicGuestDeclarations } from "../protocol.js";
 export const PI_CORE_COMPATIBILITY_ARGUMENT_TYPE_NAMES = {
   read: "PiReadCompatibilityArgument",
   bash: "PiBashCompatibilityArgument",
+  powershell: "PiPowerShellCompatibilityArgument",
   edit: "PiEditCompatibilityArgument",
   write: "PiWriteCompatibilityArgument",
   grep: "PiGrepCompatibilityArgument",
@@ -19,6 +20,7 @@ export const PI_CORE_COMPATIBILITY_ARGUMENT_TYPE_NAMES = {
 export const PI_CORE_NUMERIC_FIELDS = {
   read: ["offset", "limit"],
   bash: ["timeout"],
+  powershell: ["timeout"],
   edit: [],
   write: [],
   grep: ["context", "limit"],
@@ -365,11 +367,11 @@ interface FabricCapturedTool {
   (args?: Record<string, unknown>): Promise<FabricCapturedToolResult>;
 }
 type FabricExtensionsApi = Record<string, FabricCapturedTool>;
-// String-primary tools (read/bash/grep/find/ls) accept a bare string; the
+// String-primary tools (read/bash/powershell/grep/find/ls) accept a bare string; the
 // runtime proxy coerces it to { <primaryField>: string }. Lets the model write
 // the natural form (pi.bash("ls")) instead of pi.bash({ command: "ls" }).
 // Return shapes differ by tool: read/grep/find/ls return their text as a bare
-// string (e.g. const src: string = await pi.read({ path })); bash/edit/write
+// string (e.g. const src: string = await pi.read({ path })); shell/edit/write
 // return { ok, output, details } (e.g. const { output } = await pi.bash(...)).
 // Common alias keys (cmd→command, query→pattern, file→path, dir→path) and a
 // flat edit shape ({ path, oldText, newText }) are also accepted; the runtime
@@ -382,7 +384,7 @@ type FabricExtensionsApi = Record<string, FabricCapturedTool>;
 // String-primary tools also take a two-arg (primary, options) form —
 // pi.read("index.ts", { limit: 120 }) merges to { path, ...options } at
 // runtime, the positional string winning the primary field on conflict.
-// bash/edit/write envelopes are proxy-guarded so string-method access
+// shell/edit/write envelopes are proxy-guarded so string-method access
 // (.trim(), .split(), iteration) fails with an actionable TypeError pointing
 // at .output instead of QuickJS's context-free "not a function" — property-
 // miss (2339) checks are suppressed by design, so the runtime gives the hint.
@@ -453,19 +455,22 @@ type PiFindPatternArgument = { pattern?: string; query?: string; regex?: string;
 // the primary field comes from the positional string.
 type PiReadOptions = { offset?: number; limit?: number; start?: number; max?: number };
 // cwd is honored per call by the pi provider, which binds the command to a
-// bash definition rooted there; relative paths resolve from the session cwd.
-// The alias spellings mirror __piArgAliases.bash in quickjs-runtime.ts: the
+// shell definition rooted there; relative paths resolve from the session cwd.
+// The alias spellings mirror the shell entries in __piArgAliases: the
 // runtime repairs them, so the checker has to accept the same spellings or a
 // repairable call is rejected before it ever reaches the sandbox.
-type PiBashOptions = {
+type PiShellOptions = {
   timeout?: number; timeoutMs?: number; settle?: boolean;
   cwd?: string; workdir?: string; directory?: string; workingDirectory?: string;
 };
+type PiBashOptions = PiShellOptions;
+type PiPowerShellOptions = PiShellOptions;
 type PiGrepOptions = { path?: string; glob?: string; globPattern?: string; ignoreCase?: boolean; ic?: boolean; caseInsensitive?: boolean; literal?: boolean; context?: number; ctx?: number; limit?: number; max?: number };
 type PiFindOptions = { path?: string; limit?: number; max?: number };
 type PiLsOptions = { limit?: number; max?: number };
 type PiReadArgument = string | (PiPathArgument & PiReadOptions);
 type PiBashArgument = string | (PiCommandArgument & PiBashOptions);
+type PiPowerShellArgument = string | (PiCommandArgument & PiPowerShellOptions);
 type PiEditFlatArgument = PiPathArgument & PiOldTextArgument & PiNewTextArgument & { all?: boolean };
 type PiEditArgument = PiPathArgument & ({ edits: PiEditOperation[]; all?: boolean } | PiEditFlatArgument);
 type PiWriteArgument = string | (PiPathArgument & PiContentArgument);
@@ -476,6 +481,7 @@ type PiNumericString<T> = T extends number ? T | string : T;
 type PiNumericStringOptions<T> = { [K in keyof T]: PiNumericString<T[K]> };
 type PiReadCompatibilityArgument = string | (PiPathArgument & PiNumericStringOptions<PiReadOptions>);
 type PiBashCompatibilityArgument = string | (PiCommandArgument & PiNumericStringOptions<PiBashOptions>);
+type PiPowerShellCompatibilityArgument = string | (PiCommandArgument & PiNumericStringOptions<PiPowerShellOptions>);
 type PiEditCompatibilityArgument = PiEditFlatArgument;
 type PiWriteCompatibilityArgument = PiWriteArgument;
 type PiGrepCompatibilityArgument = string | (PiGrepPatternArgument & PiNumericStringOptions<PiGrepOptions>);
@@ -484,6 +490,7 @@ type PiLsCompatibilityArgument = string | (PiOptionalPathArgument & PiNumericStr
 interface PiToolsApi {
   read(args: PiReadArgument, options?: PiReadOptions): Promise<string>;
   bash(args: PiBashArgument, options?: PiBashOptions): Promise<{ ok: true; output: string; details: unknown } | { ok: false; output: string; details: null; exitCode: number; error: string }>;
+  powershell(args: PiPowerShellArgument, options?: PiPowerShellOptions): Promise<{ ok: true; output: string; details: unknown } | { ok: false; output: string; details: null; exitCode: number; error: string }>;
   edit(args: PiEditArgument): Promise<{ ok: true; output: string; details: unknown }>;
   edit(path: string, oldText: string, newText: string): Promise<{ ok: true; output: string; details: unknown }>;
   write(args: PiWriteArgument): Promise<{ ok: true; output: string; details: unknown }>;

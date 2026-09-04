@@ -1,3 +1,4 @@
+import { isPiShellRef } from "../core/pi-tools.js";
 import { projectFabricAuditArgs, projectFabricAuditResult } from "./projection.js";
 
 export const FABRIC_EXECUTION_TRACE_KIND = "pi-fabric.execution" as const;
@@ -437,7 +438,7 @@ export class FabricExecutionTraceOperationHandle {
     const cause =
       outcome === "failed" &&
       (this.operation.causeSafe === true ||
-        (this.operation.projectionRef === "pi.bash" && stage === "invoke"))
+        (isPiShellRef(this.operation.projectionRef) && stage === "invoke"))
         ? errorCause(error)
         : undefined;
     this.operation.error = sanitizeString(
@@ -514,7 +515,7 @@ export class FabricExecutionTraceRecorder {
         const preserveCause =
           operation.error !== undefined &&
           (operation.causeSafe === true ||
-            (operation.projectionRef === "pi.bash" && operation.outcome === "failed"));
+            (isPiShellRef(operation.projectionRef) && operation.outcome === "failed"));
         if (!preserveCause) {
           operation.error = sanitizeString(
             failureMessage(operation.failureStage ?? "invoke", operation.outcome),

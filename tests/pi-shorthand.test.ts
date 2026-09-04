@@ -46,6 +46,34 @@ describe("pi bare-string shorthand", () => {
     expect(result.value).toEqual({ a: "echo hi", b: "ls", c: "/x" });
   });
 
+  it("normalizes PowerShell shorthand and settles native nonzero exits", async () => {
+    const calls: Array<{ ref: string; args: Record<string, unknown> }> = [];
+    const success = await new QuickJsRuntime().execute(
+      'const result = await pi.powershell("Write-Output hi", { timeoutMs: 2000, workdir: "." }); return result.output;',
+      async (ref, args) => {
+        calls.push({ ref, args });
+        return { ok: true, output: "hi", details: null };
+      },
+      options,
+    );
+    expect(success.error).toBeUndefined();
+    expect(success.value).toBe("hi");
+    expect(calls).toEqual([{
+      ref: "pi.powershell",
+      args: { command: "Write-Output hi", timeout: 2, cwd: "." },
+    }]);
+
+    const settled = await new QuickJsRuntime().execute(
+      'return await pi.powershell("exit 7", { settle: true });',
+      async () => {
+        throw classifyPiBashError(new Error("failed\n\n\nCommand exited with code 7"));
+      },
+      options,
+    );
+    expect(settled.error).toBeUndefined();
+    expect(settled.value).toMatchObject({ ok: false, exitCode: 7, output: "failed\n" });
+  });
+
   it("rejects a nonzero exit by default and settles only with settle:true", async () => {
     const checked = typeCheckFabricCode(
       `const result = await pi.bash({ command: "exit 7", settle: true });

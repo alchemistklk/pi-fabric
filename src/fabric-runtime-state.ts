@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorManager } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
+import { isPiShellRef } from "./core/pi-tools.js";
 import { GlobalActorRegistry } from "./actors/global-registry.js";
 import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
@@ -1036,7 +1037,7 @@ export class FabricRuntimeState {
   }
 
   // Filesystem fallback for writes audits cannot attribute (shell heredocs,
-  // sed -i, formatter binaries). Gated on a successful pi.bash in the program
+  // sed -i, formatter binaries). Gated on a successful Pi shell call in the program
   // so read-only scans never pay the stat walk, and external saves can only
   // mis-fire inside a bash-running window. The tracker refreshes its baseline
   // on every evaluation, claimed or not, so one change never fires twice.
@@ -1046,7 +1047,7 @@ export class FabricRuntimeState {
     resultFormat: FabricResultFormat,
   ): Promise<PendingFabricHandoff | undefined> {
     if (!this.prewalk.isArmed(sessionId) || !this.#cwd) return undefined;
-    if (!execution.audits.some((audit) => audit.ref === "pi.bash" && audit.success === true)) {
+    if (!execution.audits.some((audit) => isPiShellRef(audit.ref) && audit.success === true)) {
       return undefined;
     }
     const drift = await this.prewalkDrift.evaluate(sessionId, this.#cwd);
