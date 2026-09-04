@@ -16,10 +16,11 @@ import {
 import { normalizeSession, extractFullText, expandSessionEntry } from "../src/memory/normalize.js";
 import { encodeCwdDir, resolveScope, enumerateAllSessions } from "../src/memory/discovery.js";
 import { bm25Score, loadShard, loadShards, recentEntries } from "../src/memory/index.js";
-import { searchShards, formatSearchResult } from "../src/memory/search.js";
+import { searchShards } from "../src/memory/search.js";
 import { MemoryProvider } from "../src/providers/memory-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import type { FabricMemoryConfig } from "../src/config.js";
+import { RECALL_MAX_RESPONSE_CHARS } from "../src/memory/context.js";
 
 const tempDirs: string[] = [];
 
@@ -438,7 +439,11 @@ describe("memory search pipeline", () => {
       msg("e2", "e1", ts(1), assistantText("error code 99 in module beta")),
     ]);
     const shards = load([{ file, id: "r", cwd: "/home/user/re" }]);
-    const literal = await searchShards(shards, { query: "code 4[0-9]", limit: 50 });
+    const literal = await searchShards(shards, {
+      query: "code 4[0-9]",
+      queryMatch: "any",
+      limit: 50,
+    });
     expect(literal.matchedCount).toBe(2);
     const result = await searchShards(shards, {
       query: "code 4[0-9]",
@@ -486,18 +491,6 @@ describe("memory search pipeline", () => {
     expect(result.segments[0]!.entries[0]!.marker).toBe(">");
   });
 
-  it("formatSearchResult emits deterministic text with segment headers", async () => {
-    const file = seedSession("/home/user/fmt", "1.jsonl", "f", [
-      msg("e1", null, ts(0), userMessage("auth bug")),
-      msg("e2", "e1", ts(1), assistantText("auth fix applied")),
-    ]);
-    const shards = load([{ file, id: "f", cwd: "/home/user/fmt" }]);
-    const result = await searchShards(shards, { query: "auth", limit: 50 });
-    const text = formatSearchResult(result, "auth");
-    expect(text).toContain('matches across');
-    expect(text).toContain("--- #0-#1");
-    expect(text).toContain("> #0 [user] auth bug");
-  });
 });
 
 describe("MemoryProvider", () => {
@@ -527,25 +520,56 @@ describe("MemoryProvider", () => {
       ...(scope?.sessionFile ? { sessionFile: scope.sessionFile } : {}),
     });
 
+  it("describes bounded recall hits and context expansion as public contracts", async () => {
+    const recall = await provider().describe("recall", invocationContext(cwd));
+    const expand = await provider().describe("expand", invocationContext(cwd));
+    const recallInput = recall!.inputSchema as { properties: Record<string, unknown> };
+    const expandInput = expand!.inputSchema as { properties: Record<string, unknown> };
+    const recallOutput = recall!.outputSchema as { properties: Record<string, unknown> };
+    const expandOutput = expand!.outputSchema as { properties: Record<string, unknown> };
+
+    expect(recallInput.properties).toEqual(expect.objectContaining({
+      queryMode: expect.any(Object),
+      queryMatch: expect.any(Object),
+      offset: expect.any(Object),
+      snippetChars: expect.any(Object),
+    }));
+    expect(expandInput.properties).toEqual(expect.objectContaining({
+      before: expect.any(Object),
+      after: expect.any(Object),
+      textOffset: expect.any(Object),
+      maxChars: expect.any(Object),
+    }));
+    expect(recallOutput.properties).toEqual(expect.objectContaining({
+      hits: expect.any(Object),
+      next: expect.any(Object),
+    }));
+    expect(expandOutput.properties).toEqual(expect.objectContaining({
+      entries: expect.any(Object),
+      next: expect.any(Object),
+    }));
+  });
+
   it("recall with no query browses recent entries in session scope", async () => {
     const result = (await provider().invoke(
       "recall",
       { scope: "session" },
       invocationContext(cwd),
-    )) as { matchedCount: number; text: string; segments: unknown[] };
-    expect(result.matchedCount).toBeGreaterThan(0);
-    expect(result.text).toContain("most recent entries");
+    )) as { total: number; hits: unknown[] };
+    expect(result.total).toBeGreaterThan(0);
+    expect(result.hits).toHaveLength(result.total);
   });
 
-  it("recall with a query returns BM25 matches and deterministic text", async () => {
+  it("recall with a query returns deterministic BM25 matches", async () => {
     const first = (await provider().invoke("recall", { scope: "session", query: "auth" }, invocationContext(cwd))) as {
-      text: string;
+      hits: Array<{ snippet: string }>;
     };
     const second = (await provider().invoke("recall", { scope: "session", query: "auth" }, invocationContext(cwd))) as {
-      text: string;
+      hits: Array<{ snippet: string }>;
     };
-    expect(first.text).toEqual(second.text);
-    expect(first.text).toContain("auth");
+    expect(first).toEqual(second);
+    expect(first.hits.some((hit) => hit.snippet.includes("auth"))).toBe(true);
+    expect(first).not.toHaveProperty("text");
   });
 
   it("project scope searches all sessions for the cwd", async () => {
@@ -558,8 +582,8 @@ describe("MemoryProvider", () => {
       "recall",
       { scope: "project", query: "auth" },
       invocationContext(cwd),
-    )) as { matchedCount: number; segments: { sessionId: string }[] };
-    const sessionIds = new Set(result.segments.map((s) => s.sessionId));
+    )) as { total: number; hits: Array<{ sessionId: string }> };
+    const sessionIds = new Set(result.hits.map((hit) => hit.sessionId));
     expect(sessionIds.has("main")).toBe(true);
     expect(sessionIds.has("other")).toBe(true);
   });
@@ -571,16 +595,253 @@ describe("MemoryProvider", () => {
       msg("e1", null, ts(0), userMessage(longText)),
     ]);
     const result = (await provider().invoke("expand", { session: file, indices: [0] }, invocationContext(cwd))) as {
-      expanded: { index: number; text: string | null }[];
+      entries: { index: number; text: string | null }[];
     };
-    expect(result.expanded[0]!.text).toBe(longText);
+    expect(result.entries[0]!.text).toBe(longText);
   });
 
   it("expand resolves a session by id", async () => {
     const result = (await provider().invoke("expand", { session: "main", indices: [0] }, invocationContext(cwd))) as {
-      expanded: { index: number; text: string | null }[];
+      entries: { index: number; text: string | null }[];
     };
-    expect(result.expanded[0]!.text).toContain("remember the auth refactor");
+    expect(result.entries[0]!.text).toContain("remember the auth refactor");
+  });
+
+  it("supports explicit all-term and phrase matching", async () => {
+    const file = writeSessionFile(path.join(agentDir, "sessions", encodeCwdDir(cwd)), "2_query-modes.jsonl", [
+      sessionHeader("query-modes", cwd),
+      msg("root", null, ts(0), userMessage("investigate the browser choice")),
+      msg("distractor", "root", ts(1), assistantText("Use the browser already present in Heddlework.")),
+      msg(
+        "decision",
+        "distractor",
+        ts(2),
+        assistantText("Recommendation: Use CEF for Heddlework browser in Stage 1."),
+      ),
+    ]);
+    const literal = await provider().invoke(
+      "recall",
+      {
+        scope: `session:${file}`,
+        query: '"Use CEF" "Stage 1" browser Heddlework',
+        queryMatch: "all",
+      },
+      invocationContext(cwd),
+    ) as { total: number; hits: Array<{ index: number }> };
+    expect(literal.total).toBe(1);
+    expect(literal.hits.map((hit) => hit.index)).toEqual([2]);
+
+    const phrase = await provider().invoke(
+      "recall",
+      { scope: `session:${file}`, query: "use cef for heddlework", queryMode: "phrase" },
+      invocationContext(cwd),
+    ) as { total: number; hits: Array<{ index: number }> };
+    expect(phrase.total).toBe(1);
+    expect(phrase.hits[0]!.index).toBe(2);
+  });
+
+  it("rejects queryMatch outside literal mode", async () => {
+    for (const queryMode of ["phrase", "regex"] as const) {
+      await expect(provider().invoke(
+        "recall",
+        { query: "auth", queryMode, queryMatch: "all" },
+        invocationContext(cwd),
+      )).rejects.toThrow("queryMatch is only valid with literal queryMode");
+    }
+  });
+
+  it("ranks human decisions ahead of recall-query plumbing", async () => {
+    const file = writeSessionFile(path.join(agentDir, "sessions", encodeCwdDir(cwd)), "3_provenance.jsonl", [
+      sessionHeader("provenance", cwd),
+      msg("root", null, ts(0), userMessage("choose the desktop engine")),
+      msg(
+        "echo",
+        "root",
+        ts(1),
+        assistantToolCall("recall-call", "fabric_exec", {
+          code: 'memory.recall({ query: "Use CEF Stage 1 browser Heddlework" })',
+        }),
+      ),
+      msg(
+        "echo-result",
+        "echo",
+        ts(2),
+        toolResult("recall-call", "fabric_exec", "Use CEF Stage 1 browser Heddlework"),
+      ),
+      msg(
+        "decision",
+        "echo-result",
+        ts(3),
+        assistantText("CEF/Chromium is the better Heddlework main-browser engine."),
+      ),
+    ]);
+    const result = await provider().invoke(
+      "recall",
+      {
+        scope: `session:${file}`,
+        query: '"Use CEF" "Stage 1" browser Heddlework',
+        pageSize: 10,
+      },
+      invocationContext(cwd),
+    ) as { hits: Array<{ index: number; tool: string | null; snippet: string }> };
+    expect(result.hits[0]).toEqual(expect.objectContaining({
+      index: 3,
+      tool: null,
+      snippet: expect.stringContaining("better Heddlework"),
+    }));
+  });
+
+  it("bounds broad recall by exact hits and provides a lossless continuation", async () => {
+    const entries: FixtureEntry[] = [
+      sessionHeader("broad", cwd),
+      msg("root", null, ts(0), userMessage("start retrieval regression")),
+    ];
+    let parent = "root";
+    for (let index = 0; index < 600; index += 1) {
+      const id = `assistant-${index}`;
+      entries.push(msg(
+        id,
+        parent,
+        ts(index + 1),
+        assistantText(
+          `${index === 0 ? "Use CEF Stage 1 Heddlework " : ""}browser result ${index} ${"x".repeat(1_400)}`,
+        ),
+      ));
+      parent = id;
+    }
+    const file = writeSessionFile(
+      path.join(agentDir, "sessions", encodeCwdDir(cwd)),
+      "3_broad.jsonl",
+      entries,
+    );
+    const first = await provider().invoke(
+      "recall",
+      {
+        scope: `session:${file}`,
+        query: '"Use CEF" "Stage 1" browser Heddlework',
+        queryMatch: "any",
+        pageSize: 50,
+        snippetChars: 2_000,
+      },
+      invocationContext(cwd),
+    ) as {
+      total: number;
+      hits: Array<{ index: number }>;
+      next: { ref: string; args: Record<string, unknown> } | null;
+    };
+    expect(first.total).toBe(600);
+    expect(first.hits.length).toBeGreaterThan(0);
+    expect(first.hits.length).toBeLessThan(50);
+    expect(first.hits[0]!.index).toBe(1);
+    expect(first.next).not.toBeNull();
+    expect(JSON.stringify(first).length).toBeLessThanOrEqual(RECALL_MAX_RESPONSE_CHARS);
+    expect(first.next!.args).toEqual(expect.objectContaining({
+      scope: `session:${file}`,
+      expectedSourceHash: expect.any(String),
+      expectedLineageFingerprint: expect.any(String),
+      offset: first.hits.length,
+    }));
+
+    const second = await provider().invoke("recall", first.next!.args, invocationContext(cwd)) as {
+      hits: Array<{ index: number }>;
+    };
+    expect(second.hits[0]!.index).not.toBe(first.hits[0]!.index);
+
+    fs.appendFileSync(
+      file,
+      `${JSON.stringify(msg("late", parent, ts(700), assistantText("late browser result")))}\n`,
+    );
+    const stale = await provider().invoke("recall", first.next!.args, invocationContext(cwd)) as {
+      error: { code: string };
+      hits: unknown[];
+    };
+    expect(stale.error.code).toBe("stale_pointer");
+    expect(stale.hits).toEqual([]);
+  });
+
+  it("expands nearby context in bounded chunks that continue without JSONL tooling", async () => {
+    const longText = `TARGET_CONTEXT_TOKEN ${"z".repeat(55_000)}`;
+    const file = writeSessionFile(path.join(agentDir, "sessions", encodeCwdDir(cwd)), "4_context.jsonl", [
+      sessionHeader("context", cwd),
+      msg("before", null, ts(0), userMessage("before context")),
+      msg("target", "before", ts(1), assistantText(longText)),
+      msg("after", "target", ts(2), userMessage("after context")),
+    ]);
+    const recalled = await provider().invoke(
+      "recall",
+      { scope: `session:${file}`, query: "TARGET_CONTEXT_TOKEN" },
+      invocationContext(cwd),
+    ) as { hits: Array<{ follow: { args: Record<string, unknown> } }> };
+
+    let expanded = await provider().invoke(
+      "expand",
+      { ...recalled.hits[0]!.follow.args, before: 2, after: 2 },
+      invocationContext(cwd),
+    ) as {
+      entries: Array<{ index: number; anchor?: boolean; text: string; textRange: { complete: boolean } }>;
+      next: { args: Record<string, unknown> } | null;
+    };
+    const textByIndex = new Map<number, string>();
+    let anchorChunks = 0;
+    let calls = 0;
+    while (true) {
+      calls += 1;
+      expect(JSON.stringify(expanded).length).toBeLessThan(30_000);
+      for (const entry of expanded.entries) {
+        textByIndex.set(entry.index, `${textByIndex.get(entry.index) ?? ""}${entry.text}`);
+        if (entry.anchor) anchorChunks += 1;
+      }
+      if (expanded.next === null) break;
+      expect(expanded.next).not.toBeNull();
+      expanded = await provider().invoke(
+        "expand",
+        expanded.next!.args,
+        invocationContext(cwd),
+      ) as typeof expanded;
+    }
+    expect(calls).toBeGreaterThan(1);
+    expect(anchorChunks).toBeGreaterThan(1);
+    expect(textByIndex.get(0)).toBe("before context");
+    expect(textByIndex.get(1)).toBe(longText);
+    expect(textByIndex.get(2)).toBe("after context");
+  });
+
+  it("hard-bounds expansion metadata while preserving lossless text continuations", async () => {
+    const longText = `METADATA_BUDGET_TOKEN ${"m".repeat(23_500)}`;
+    const longPaths = Array.from(
+      { length: 20 },
+      (_, index) => `/tmp/${index}-${"path".repeat(300)}`,
+    );
+    const file = writeSessionFile(path.join(agentDir, "sessions", encodeCwdDir(cwd)), "5_metadata.jsonl", [
+      sessionHeader("metadata", cwd),
+      msg("entry", null, ts(0), {
+        role: "assistant",
+        content: [
+          { type: "text", text: longText },
+          { type: "toolCall", id: "paths", name: "read", arguments: { paths: longPaths } },
+        ],
+      }),
+    ]);
+    const expected = normalizeSession(file, Number.MAX_SAFE_INTEGER).entries[0]!.text;
+    let result = await provider().invoke(
+      "expand",
+      { session: file, indices: [0], maxChars: 24_000, maxEntries: 20 },
+      invocationContext(cwd),
+    ) as {
+      entries: Array<{ text: string }>;
+      next: { args: Record<string, unknown> } | null;
+    };
+    let reconstructed = "";
+    let calls = 0;
+    while (true) {
+      calls += 1;
+      expect(JSON.stringify(result).length).toBeLessThanOrEqual(RECALL_MAX_RESPONSE_CHARS);
+      reconstructed += result.entries.map((entry) => entry.text).join("");
+      if (result.next === null) break;
+      result = await provider().invoke("expand", result.next!.args, invocationContext(cwd)) as typeof result;
+    }
+    expect(calls).toBeGreaterThan(1);
+    expect(reconstructed).toBe(expected);
   });
 
   it("sessions lists known sessions with entry counts", async () => {

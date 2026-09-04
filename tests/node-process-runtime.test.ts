@@ -52,6 +52,47 @@ return { models, process: typeof process, require: typeof require };
     expect(result.value).toEqual([{ ref: "extensions.fovea_focus" }]);
   });
 
+
+  it("provides memory.walk callbacks in the process runtime", async () => {
+    let calls = 0;
+    const result = await new NodeProcessRuntime().execute(
+      `
+const texts = [];
+const walk = await memory.walk({ session: "session", indices: [4] }, async (entry) => {
+  await Promise.resolve();
+  texts.push(entry.text + ":" + entry.parentId);
+});
+return { texts, walk };
+`,
+      async (ref) => {
+        expect(ref).toBe("memory.expand");
+        calls += 1;
+        return {
+          entries: [{
+            index: 4,
+            entryId: "e4",
+            parentId: "e3",
+            type: "message",
+            role: "user",
+            timestamp: 4,
+            isError: false,
+            text: "remember",
+            textRange: { start: 0, end: 8, total: 8, complete: true },
+          }],
+          next: null,
+        };
+      },
+      options,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({
+      texts: ["remember:e3"],
+      walk: { visited: 1, stopped: false },
+    });
+    expect(calls).toBe(1);
+  });
+
   it("extends the active deadline for a long host call", async () => {
     const result = await new NodeProcessRuntime().execute(
       'await tools.call({ ref: "pi.bash", args: { timeout: 1 } }); return "ok";',

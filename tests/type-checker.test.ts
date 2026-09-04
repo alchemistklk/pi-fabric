@@ -116,10 +116,25 @@ return { answer, binding: session.binding, defaults: session.projectDefaults };
     );
     expect(result.errors).toEqual([]);
   });
+  it("rejects unknown memory arguments", () => {
+    const result = typeCheckFabricCode(
+      'return memory.expand({ session: "session-id", befroe: 2 });',
+      GUEST_TYPE_DECLARATIONS,
+    );
+    expect(result.errors.map((error) => error.message).join(" ")).toMatch(/befroe|known properties/i);
+  });
+
   it("accepts typed first-class Fabric provider calls", () => {
     const result = typeCheckFabricCode(
       `
 const recalled = await memory.recall({ query: "proxy", branches: "active" });
+const visited: Array<string | null | undefined> = [];
+const walked = await memory.walk({ session: "session-id" }, async (entry, index) => {
+  visited.push(entry.tool);
+  return index < 2;
+});
+const followed = recalled.hits[0] ? await tools.call(recalled.hits[0].follow) : null;
+const authoritative = recalled.coverage.complete && recalled.coverage.reasons.length === 0;
 const current = await state.get();
 const status = await schema.status();
 const hypothesis = await schema.hypothesize({
@@ -128,7 +143,7 @@ const hypothesis = await schema.hypothesize({
   evidence: [{ kind: "file_exists", path: "package.json" }],
 });
 const pending = await compact.status();
-return { recalled, current, mode: status.mode, hypothesis: hypothesis.hypothesisId, pending };
+return { recalled, authoritative, walked, followed, visited, current, mode: status.mode, hypothesis: hypothesis.hypothesisId, pending };
 `,
       GUEST_TYPE_DECLARATIONS,
     );

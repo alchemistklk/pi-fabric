@@ -95,11 +95,11 @@ describe("memory final integrity guarantees", () => {
       "recall",
       { scope: `session:${tailFile}`, query: "rare_tail_token" },
       invocation(cwd),
-    ) as { coverage: { complete: boolean; reasons: string[] }; matchedCount: number; text: string };
-    expect(result.matchedCount).toBe(0);
+    ) as { coverage: { complete: boolean; reasons: string[] }; total: number };
+    expect(result.total).toBe(0);
     expect(result.coverage.complete).toBe(false);
     expect(result.coverage.reasons).toContain("max_entry_chars");
-    expect(result.text).toContain("No indexed matches");
+    expect(result).not.toHaveProperty("text");
   });
 
   it("marks duplicate identities and refuses missing or ambiguous expansion addresses", async () => {
@@ -120,17 +120,17 @@ describe("memory final integrity guarantees", () => {
       "expand",
       { session: file, branches: "all", entryIds: ["same-entry"] },
       invocation(cwd),
-    ) as { error: { code: string; matches: number }; expanded: unknown[] };
+    ) as { error: { code: string; matches: number }; entries: unknown[] };
     expect(ambiguous.error).toEqual(expect.objectContaining({ code: "ambiguous_address", matches: 2 }));
-    expect(ambiguous.expanded).toEqual([]);
+    expect(ambiguous.entries).toEqual([]);
 
     const missing = await provider.invoke(
       "expand",
       { session: file, branches: "all", entryIds: ["absent-entry"] },
       invocation(cwd),
-    ) as { error: { code: string; matches: number }; expanded: unknown[] };
+    ) as { error: { code: string; matches: number }; entries: unknown[] };
     expect(missing.error).toEqual(expect.objectContaining({ code: "address_not_found", matches: 0 }));
-    expect(missing.expanded).toEqual([]);
+    expect(missing.entries).toEqual([]);
   });
 
   it("detects duplicate direct operation addresses and refuses ambiguous operation expansion", async () => {
@@ -159,9 +159,9 @@ describe("memory final integrity guarantees", () => {
       "expand",
       { session: file, branches: "all", operationAddresses: ["same-carrier/0"] },
       invocation(cwd),
-    ) as { error: { code: string; matches: number }; expanded: unknown[] };
+    ) as { error: { code: string; matches: number }; entries: unknown[] };
     expect(expanded.error).toEqual(expect.objectContaining({ code: "ambiguous_address", matches: 2 }));
-    expect(expanded.expanded).toEqual([]);
+    expect(expanded.entries).toEqual([]);
   });
 
   it("normalizes typed branch facts, preserves carrier identity and paths, and deduplicates nested carriers", async () => {
@@ -270,15 +270,15 @@ describe("memory final integrity guarantees", () => {
       "expand",
       { session: file, operationAddresses: [operation.address, run.address] },
       invocation(cwd),
-    ) as { expanded: Array<Record<string, unknown>> };
-    expect(expanded.expanded).toHaveLength(2);
-    expect(expanded.expanded[0]).toEqual(expect.objectContaining({
+    ) as { entries: Array<Record<string, unknown>> };
+    expect(expanded.entries).toHaveLength(2);
+    expect(expanded.entries[0]).toEqual(expect.objectContaining({
       operationAddress: operation.address,
       carrierEntryId: "carrier-original",
       filesTouched: ["src/abandoned.ts"],
       branchFact: expect.objectContaining({ address: operation.address, tool: "write" }),
     }));
-    expect(expanded.expanded[1]).toEqual(expect.objectContaining({
+    expect(expanded.entries[1]).toEqual(expect.objectContaining({
       operationAddress: run.address,
       carrierEntryId: "carrier-original",
       outcome: "succeeded",
@@ -324,7 +324,7 @@ describe("memory final integrity guarantees", () => {
     ]);
   });
 
-  it("paginates the globally ranked mixed item stream once and browses beyond the first page", async () => {
+  it("paginates the globally ranked exact-hit stream and browses beyond the first page", async () => {
     const agentDir = temp("pagination-agent");
     const indexDir = temp("pagination-index");
     const cwd = "/work/pagination";
@@ -345,19 +345,29 @@ describe("memory final integrity guarantees", () => {
 
     const first = await provider.invoke(
       "recall",
-      { scope: "project", query: "shared pagination token", page: 1, pageSize: 1 },
+      { scope: "project", query: "shared pagination token", pageSize: 1 },
       invocation(cwd),
-    ) as { items: Array<{ kind: string }>; totalItems: number; totalMatches: number; hasNext: boolean };
+    ) as {
+      hits: Array<{ kind: string }>;
+      total: number;
+      next: { args: Record<string, unknown> };
+    };
     const second = await provider.invoke(
       "recall",
-      { scope: "project", query: "shared pagination token", page: 2, pageSize: 1 },
+      first.next.args,
       invocation(cwd),
-    ) as { items: Array<{ kind: string }>; totalItems: number; totalMatches: number; hasNext: boolean };
-    expect(first.totalItems).toBe(2);
-    expect(first.totalMatches).toBe(3);
-    expect(second).toEqual(expect.objectContaining({ totalItems: 2, totalMatches: 3, hasNext: false }));
-    expect(new Set([first.items[0]!.kind, second.items[0]!.kind])).toEqual(new Set(["entry", "digest"]));
-    expect(first.hasNext).toBe(true);
+    ) as { hits: Array<{ kind: string }>; total: number; next: { args: Record<string, unknown> } };
+    const third = await provider.invoke(
+      "recall",
+      second.next.args,
+      invocation(cwd),
+    ) as { hits: Array<{ kind: string }>; total: number; next: null };
+    expect(first.total).toBe(3);
+    expect(second).toEqual(expect.objectContaining({ total: 3, next: expect.any(Object) }));
+    expect(third).toEqual(expect.objectContaining({ total: 3, next: null }));
+    expect([first.hits[0]!.kind, second.hits[0]!.kind, third.hits[0]!.kind].sort())
+      .toEqual(["entry", "entry", "session"]);
+    expect(first.next).not.toBeNull();
 
     const browseFile = writeSessionFile(directory, "browse.jsonl", [
       sessionHeader("browse", cwd),
@@ -366,11 +376,11 @@ describe("memory final integrity guarantees", () => {
     fs.utimesSync(browseFile, base + 2, base + 2);
     const browse = await provider.invoke(
       "recall",
-      { scope: `session:${browseFile}`, branches: "all", page: 2, pageSize: 2 },
+      { scope: `session:${browseFile}`, branches: "all", offset: 2, pageSize: 2 },
       invocation(cwd),
-    ) as { items: unknown[]; totalItems: number; totalMatches: number; hasNext: boolean };
-    expect(browse).toEqual(expect.objectContaining({ totalItems: 5, totalMatches: 5, hasNext: true }));
-    expect(browse.items).toHaveLength(2);
+    ) as { hits: unknown[]; total: number; next: unknown };
+    expect(browse).toEqual(expect.objectContaining({ total: 5, next: expect.any(Object) }));
+    expect(browse.hits).toHaveLength(2);
   });
 
   it("marks explicit candidate budget exhaustion incomplete", async () => {

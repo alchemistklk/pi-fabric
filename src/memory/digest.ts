@@ -64,6 +64,7 @@ export const foldSessionDigest = (input: DigestInput): SessionDigest => {
   const vocabulary = new Set<string>();
   const filesLimit = Math.max(0, input.filesTouchedLimit ?? DEFAULT_FILES_TOUCHED_LIMIT);
   const maxVocabularyBytes = Math.max(2, input.maxVocabularyBytes ?? Number.MAX_SAFE_INTEGER);
+  let filesLimitReached = false;
   let vocabularyLimitReached = false;
   let estimatedVocabularyBytes = 2;
 
@@ -75,9 +76,12 @@ export const foldSessionDigest = (input: DigestInput): SessionDigest => {
     if (entry.isError) errorCount += 1;
     if (entry.toolName) tools.set(entry.toolName, (tools.get(entry.toolName) ?? 0) + 1);
     for (const file of entry.filesTouched ?? []) {
-      if (filesTouched.length >= filesLimit) break;
       const normalized = file.trim();
       if (!normalized || seenFiles.has(normalized)) continue;
+      if (filesTouched.length >= filesLimit) {
+        filesLimitReached = true;
+        continue;
+      }
       seenFiles.add(normalized);
       filesTouched.push(normalized);
     }
@@ -114,6 +118,7 @@ export const foldSessionDigest = (input: DigestInput): SessionDigest => {
     entry.outcome ?? null,
   ]);
   const reasons = new Set(input.normalizationCoverage?.reasons ?? []);
+  if (filesLimitReached) reasons.add("max_files_touched");
   if (vocabularyLimitReached) reasons.add("max_cold_vocabulary_bytes");
   const sortedReasons = [...reasons].sort(compareLexical);
 

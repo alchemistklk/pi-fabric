@@ -9,16 +9,33 @@ timestamps, entry IDs, operation addresses, exact `ref`/`provider`/`action`
 identities, execution outcomes, tool errors, and tool argument paths all come
 from typed session fields.
 
+## Retrieval workflow
+
+Treat recall as navigation and expansion as reading:
+
+1. `memory.recall` locates ranked, bounded evidence.
+2. Inspect entry snippets directly. Every hit has one copy-ready `follow` call.
+3. Run `await tools.call(hit.follow)` to expand an entry or resolve a cold session.
+4. Continue any paged result with `await tools.call(result.next)` until `next` is `null`.
+5. Use guest-local `memory.walk` when TypeScript should scan, filter, reduce, join,
+   or traverse complete normalized records.
+
+These calls are the supported session-data API. Consumers should not open,
+scan, or parse Pi session files themselves. Follow calls carry source hashes and
+selected lineages without duplicating that integrity metadata on each hit;
+single-session page continuations preserve the same bindings. Coverage explains
+when indexed absence is not authoritative.
+
 ## Active branches
 
 `memory.recall`, `memory.sessions`, and `memory.expand` accept
 `branches: "active" | "all"`. Every scope defaults to `"active"`, including
 `project`, `global`, and explicit `session:<id-or-path>` scopes. Only records
 carried on each session's active parent-linked path contribute to hot text,
-cold vocabulary, structural addresses, segments, and entry counts, so an
+cold vocabulary, structural addresses, hits, and entry counts, so an
 abandoned sibling cannot match by default. `branches: "all"` asks explicitly
-for every branch. Responses, segments, cold pointers, and session rows
-identify their branch mode.
+for every branch. Expansion results and session rows identify their branch
+mode; recall follow calls preserve it.
 
 For the current live session, every memory action calls the extension
 context's live `SessionManager.getBranch()` and `getLeafId()` getters.
@@ -75,9 +92,9 @@ Cold vocabulary maps each exact lexical term only to the session that
 contains it. The digest keeps no per-term entry indices. Structural address
 tuples separately keep exact entry identity, role/tool/time, and persisted
 `ref`/`provider`/`action`/`outcome` fields. A cold lexical result remains a
-session pointer with exact `sessionFile` and `sourceHash`. It never appears
-as an inferred lexical entry range. Exact lexical entry matches come back
-only after explicit hydration.
+compact session candidate whose `follow` call carries its exact source and
+hash bindings. It never appears as an inferred lexical entry range. Exact
+lexical entry matches come back only after following that call.
 
 `maxColdVocabularyBytes` bounds vocabulary construction for each session.
 `maxColdCacheBytes` is a hard per-session cap on the persisted cache.
@@ -114,11 +131,10 @@ intact.
 - `outcome`: one of `succeeded | failed | aborted | timed_out`.
 - the existing `role`, `tool`, `since`, and `until` filters.
 
-With no `query` present, these filters produce `matchMode: "structural"`,
-and persisted typed fields alone decide membership. A `query` value
-constrains the normal lexical or explicit-regex search and produces
-`matchMode: "combined"`. Responses echo the exact `structuralFilters`.
-Catalog description text never becomes a lexical match.
+With no `query` present, persisted typed fields alone decide membership. A
+`query` value constrains lexical or explicit-regex search with the same exact
+filters. The result does not echo request diagnostics; the call already records
+them. Catalog description text never becomes a lexical match.
 
 ```ts
 const heads = await tools.search({ query: "search source files" });
@@ -135,46 +151,70 @@ const failures = await memory.recall({
 ```
 
 A complete cold structural posting proves that the selected session contains
-a matching typed entry. The cold response remains an integrity-bound
-session pointer. A combined cold lexical + structural
-candidate cannot prove that both conditions occur on the same entry, because
-cold vocabulary has no posting lists. The response reports
-`cold_structural_filter_requires_hydration`. The caller must hydrate the
-session before claiming entry-level co-location.
+a matching typed entry. The cold response remains an integrity-bound session
+candidate. A combined cold lexical + structural candidate cannot prove that
+both conditions occur on the same entry, because cold vocabulary has no
+posting lists. Coverage reports
+`cold_structural_filter_requires_hydration`; follow the candidate before
+claiming entry-level co-location.
 
 ## Exact lexical queries
 
 Callers choose `queryMode` explicitly:
 
-- `"literal"` serves as the default.
+- `"literal"` is the default token mode.
+- `"phrase"` performs a case-insensitive contiguous text search after Unicode
+  normalization.
 - `"regex"` requires an explicit opt-in.
 
-Literal mode does not inspect punctuation to guess whether the input looks
-like a regular expression. It never compiles the input with `RegExp`. A path
-such as `src/foo.ts` stays literal input.
+Literal mode does not inspect punctuation to guess whether input is a regular
+expression. It never compiles input with `RegExp`; a path such as `src/foo.ts`
+stays literal text. Quotes are punctuation only in literal mode; quoted words
+still become independent canonical terms and never turn into regex syntax.
 
-`tokenize.ts` works as the single canonical tokenizer for literal queries,
-hot BM25 scoring, and cold vocabulary creation. It applies Unicode NFKC
-normalization, extracts Unicode letters, numbers, and `_` characters, then
-lowercases them. Literal terms match through exact canonical-token equality.
-Matching runs as a lexical OR across the unique query terms. Fabric applies
-no stemming, synonym expansion, phrase inference, or semantic regex
-classification.
+`tokenize.ts` is the single canonical tokenizer for literal queries, hot BM25
+scoring, and cold vocabulary creation. It applies Unicode NFKC normalization,
+extracts Unicode letters, numbers, and `_` characters, then lowercases them.
+Literal terms match through exact canonical-token equality. Fabric applies no
+stemming, synonym expansion, or semantic regex classification.
 
-In a cold session with complete coverage, every unique canonical token of
-the normalized source text occurs exactly once in the sorted vocabulary.
-Rare terms stay exactly discoverable as long as the configured vocabulary
-and cache bounds hold. Exceeding a bound makes an empty result explicitly
-non-authoritative.
+Multi-term literal queries default to `queryMatch: "any"` so recall does not
+silently lose an answer whose wording differs from the query. BM25 relevance
+is weighted by typed provenance: assistant and user prose ranks ahead of
+tool-call plumbing unless structural filters explicitly request operations.
+Every exact entry is ranked individually; context-segment grouping cannot give
+thousands of neighbors one shared score.
+
+The response is still hard-bounded, so broad discovery cannot flood model
+context. Request `queryMatch: "all"` when every canonical term must occur in
+one indexed entry:
+
+```ts
+memory.recall({
+  query: '"Use CEF" "Stage 1" browser Heddlework',
+  queryMatch: "all"
+})
+```
+
+Use `queryMode: "phrase"` when word order and adjacency are material. The
+request is not echoed in the compact result.
+
+In a cold session with complete coverage, every unique canonical token of the
+normalized source text occurs exactly once in the sorted vocabulary. An
+`all` query requires every term in that vocabulary, but the vocabulary cannot
+prove same-entry co-location. Phrase adjacency cannot be proved either. Both
+cases return an explicit incomplete cold-coverage reason until the session is
+resolved. Rare terms stay exactly discoverable as
+long as the configured vocabulary and cache bounds hold. Exceeding a bound
+makes an empty result explicitly non-authoritative.
 
 Unicode scalar count sets the hot-text limit. Raw UTF-16 code units play no
-part. A cut cannot split a surrogate pair, and the shard text remains
-valid UTF-8. Hot shards retain no separate complete tail vocabulary, so
-truncating any normalized entry sets shard `indexCoverage.complete:
-false` with reason `max_entry_chars`. A token that occurs only after the
-cut cannot yield an authoritative no-match. Recall says `No indexed
-matches` and includes that reason. Expansion still re-reads the complete
-source record.
+part. A cut cannot split a surrogate pair, and the shard text remains valid
+UTF-8. Hot shards retain no separate complete tail vocabulary, so truncating
+any normalized entry sets shard `indexCoverage.complete: false` with reason
+`max_entry_chars`. A token that occurs only after the cut cannot yield an
+authoritative no-match. Recall returns no hit and reports that reason through
+`coverage`. Expansion still re-reads the complete source record.
 
 ## Bounded regular expressions
 
@@ -213,11 +253,12 @@ database dependency.
 Query mode and no-query browse mode both discover every eligible session.
 `memory.maxSessions` limits session listing only. Search materialization
 works under explicit deterministic per-call budgets: 50,000 filtered hot
-entry candidates, 10,000 cold digest candidates, and 10,000 grouped result
-items. Hitting one of these marks coverage incomplete with
+entry candidates, 10,000 cold digest candidates, and 10,000 ranked result
+candidates. Hitting one of these marks coverage incomplete with
 `candidate_entry_budget`, `candidate_digest_budget`, or
-`candidate_item_budget`. Totals then describe the retained deterministic
-candidate set. Unknown omitted candidates stay outside those totals.
+`candidate_item_budget`. Public totals count the retained exact entry hits
+and cold session candidates after filtering. Unknown omitted candidates stay
+outside those totals.
 Coverage reports:
 
 ```ts
@@ -232,11 +273,11 @@ coverage: {
 }
 ```
 
-`No matches` counts as authoritative only when cache/index coverage and
-query execution coverage are both complete. In every other case the response
-reads `No indexed matches` and names reasons such as source unavailability,
-`max_entry_chars`, duplicate identities, vocabulary/cache caps, candidate or
-synchronization budgets, or regex limits.
+An empty `hits` array is authoritative only when cache/index coverage and
+query execution coverage are both complete. Otherwise `coverage.reasons` names
+causes such as source unavailability, `max_entry_chars`, duplicate identities,
+vocabulary, file-metadata, or cache caps, candidate or synchronization budgets,
+or regex limits.
 
 ## Scopes
 
@@ -245,90 +286,217 @@ synchronization budgets, or regex limits.
 | `session` | The current session, or the newest session for the current cwd. |
 | `project` | All sessions in the current cwd's Pi session directory. |
 | `global` | Sessions under the agent directory. This scope requires an explicit request and can never be the default. |
-| `session:<id-or-path>` | One source session, hydrated explicitly without promotion. |
+| `session:<id-or-path>` | One source session, resolved explicitly without promotion. |
 
 Duplicate session IDs are ambiguous. `session:<id>` and `memory.expand`
-reject an ambiguous ID with `ambiguous_session` and list the candidate
-paths. Pass the exact session file path from the cold pointer.
+reject an ambiguous ID with `ambiguous_session` and list the candidate paths.
+Normal recall navigation does not require extracting a path: copy the hit
+`follow` call unchanged.
 Duplicate normalized entry IDs and operation addresses also mark index
 coverage incomplete, with `duplicate_entry_id` or
 `duplicate_operation_address`. Stable-address expansion demands exactly one
 record. Zero matches return `address_not_found`. More than one match
 returns `ambiguous_address`. Fabric returns no source records in either case.
 
-## Pointers, hydration, and expansion
+## Compact results and call tokens
 
-A cold result carries session identity alone:
+`memory.recall` returns one flat, bounded hit stream:
+
+```ts
+type FabricCall = {
+  ref: "memory.recall" | "memory.expand";
+  args: Record<string, unknown>;
+};
+
+type RecallPage = {
+  total: number;
+  hits: MemoryHit[];
+  next: FabricCall | null;
+  coverage: MemoryCoverage;
+  error?: MemoryError;
+};
+```
+
+`total` is the retained pre-page count of exact entry hits plus cold session
+candidates. `hits.length` is the returned count. The request already records
+query semantics, so results do not echo query terms, modes, filters, offsets,
+or redundant counts and prose.
+
+A hot or explicitly resolved entry hit carries evidence plus one action:
 
 ```ts
 {
-  tier: "cold",
+  kind: "entry",
   sessionId,
-  sessionFile,
-  sourceHash,
-  branches,
-  lineageFingerprint,
-  matchedTerms,
-  matchedStructuralEntries
+  tier,
+  index,
+  entryId,
+  parentId,
+  operationAddress,
+  type,
+  role,
+  tool,
+  ref,
+  provider,
+  action,
+  outcome,
+  timestamp,
+  isError,
+  score,
+  snippet,
+  truncated,
+  follow: { ref: "memory.expand", args: { /* integrity-bound selector */ } }
 }
 ```
 
-The pointer keeps disjoint term occurrences distinct. It never merges them
-into one misleading inclusive range, and its list of exact matches stays
-complete. Hydrate the exact path and pass the pointer hash:
+A cold candidate cannot claim an exact source entry. It carries only
+session-level evidence and a recall action:
 
 ```ts
-memory.recall({
-  scope: `session:${pointer.sessionFile}`,
-  branches: pointer.branches,
-  expectedSourceHash: pointer.sourceHash,
-  expectedLineageFingerprint: pointer.lineageFingerprint,
-  query: "rare_token"
-})
+{
+  kind: "session",
+  sessionId,
+  tier: "cold",
+  cwd,
+  lastTimestamp,
+  score,
+  matchedTerms,
+  matchedStructuralEntries,
+  follow: { ref: "memory.recall", args: { /* integrity-bound request */ } }
+}
 ```
 
-Hydrated and hot segments include `exactMatches` with the exact normalized
-entry index, entry ID, and operation address. Recall first groups every
-retained hot match into entry segments, merges those segments with cold
-pointers, ranks the combined item stream globally, and applies
-`page`/`pageSize` only at the end. Several matches inside one segment
-count as one paginated item. Responses expose stable `totalItems`,
-`totalMatches`, and `hasNext` for that retained stream. No-query browse
-takes the same pagination path, and no earlier 25-entry or `maxSessions`
-cap applies. An optional inclusive `entryRange` can bound hydration. Both
-endpoints must be valid session indices. Out-of-range or negative
-addresses return structured `index_out_of_bounds` errors. Clamping and
-silent dropping never occur.
-
-`memory.expand` re-reads full, untruncated source text. It accepts indices,
-stable entry IDs, operation addresses, or an inclusive range:
+The integrity arguments live only inside `follow`; they are not duplicated in
+separate source or action-specific pointer objects. Dispatch either hit without
+branch-specific plumbing:
 
 ```ts
-memory.expand({
-  session: pointer.sessionFile,
-  branches: pointer.branches,
-  expectedSourceHash: pointer.sourceHash,
-  expectedLineageFingerprint: pointer.lineageFingerprint,
-  indices: [12, 14]
-})
-memory.expand({ session: pointer.sessionFile, entryIds: ["entry-uuid"] })
-memory.expand({ session: pointer.sessionFile, operationAddresses: ["entry-uuid/7"] })
+const detail = await tools.call(hit.follow);
 ```
 
-During hydration and expansion, Fabric compares `expectedSourceHash` with
-the current source and `expectedLineageFingerprint` with the selected live
-or persisted lineage. If a rewrite, an append, or active-leaf navigation
-changes an expected binding, the call returns a structured `stale_pointer`
-and no source content. Results carry source hash, branch mode, and lineage
-fingerprint, so callers can retain pointer integrity. Under active mode, an
-off-lineage stable address returns `address_not_found`. An explicit
-`branches: "all"` request is the only way to expand that address.
+When a statically typed result is useful, discriminate the hit and call the
+known provider method:
+
+```ts
+const detail = hit.kind === "entry"
+  ? await memory.expand(hit.follow.args)
+  : await memory.recall(hit.follow.args);
+```
+
+Recall ranks one mixed stream and then paginates it. `pageSize` is a request
+ceiling, not permission to exceed the hard 30,000-character JSON envelope.
+If more retained items remain, `next` is another complete call token:
+
+```ts
+let page = await memory.recall({ query: "timeout", scope: "project" });
+while (page.next !== null) {
+  page = await memory.recall(page.next.args);
+}
+```
+
+A single-session continuation includes exact source-hash and lineage bindings;
+an append or branch change returns `stale_pointer`, preventing a silent page
+shift. Each project or global call takes a fresh, nontransactional snapshot.
+Every snippet is independently bounded and reports only whether it was
+truncated.
+
+An optional inclusive `entryRange` can bound explicit single-session recall.
+Both endpoints must be valid normalized indices. Out-of-range or negative
+addresses return `index_out_of_bounds`; Fabric never clamps them.
+
+## Expansion and guest-local computation
+
+`memory.expand` re-reads full, untruncated normalized records. It accepts
+indices, stable entry IDs, operation addresses, or an inclusive range.
+`before` and `after` add adjacent entries around exactly one selected anchor:
+
+```ts
+const exact = await memory.expand(hit.follow.args);
+const around = await memory.expand({
+  ...hit.follow.args,
+  before: 2,
+  after: 3,
+});
+const operation = await memory.expand({
+  session,
+  operationAddresses: ["entry-uuid/7"],
+});
+```
+
+Expansion results use `entries`. Recall and expansion both call the capability
+field `tool`. Expanded records include Pi's `parentId`, so code can reconstruct
+branch relationships under `branches: "all"`; `parentEntryId` remains the
+separate carrier link for extracted Fabric child records.
+
+Expansion never silently slices away a long record. Every returned chunk has
+`textRange: { start, end, total, complete }`. A partial final entry returns a
+non-null `next`; follow it to reconstruct the exact text:
+
+```ts
+let chunk = await memory.expand(args);
+while (chunk.next !== null && chunk.next !== undefined) {
+  chunk = await memory.expand(chunk.next.args);
+}
+```
+
+The default aggregate text budget is 20,000 characters and `maxChars` can
+request a smaller chunk. Valid typed operation and branch-fact payloads stay
+available as bounded structured fields. Oversized structured payloads set
+`structuredTruncated` and stay out of the envelope.
+
+For arbitrary filtering, projection, aggregation, joins, and parent traversal,
+the query language is the surrounding TypeScript. `memory.walk` is a
+guest-only combinator, not a fourth host action and not a serialized callback:
+
+```ts
+const failedFiles = new Set<string>();
+const parents = new Map<string, string | null>();
+
+const walk = await memory.walk(
+  { session, branches: "all" },
+  async (entry) => {
+    if (entry.entryId) parents.set(entry.entryId, entry.parentId);
+    if (entry.outcome === "failed") {
+      for (const file of entry.filesTouched ?? []) {
+        if (file) failedFiles.add(file);
+      }
+    }
+    return failedFiles.size < 20; // exactly false stops early
+  },
+);
+
+return { files: [...failedFiles], visited: walk.visited };
+```
+
+With no selector, `memory.walk` obtains an integrity-bound session range and
+visits the whole normalized session. With a selector, it visits only that
+selection and optional context. Start it from an original selection, not a
+continuation with a nonzero `textOffset`, because every callback receives a
+complete entry. The helper follows all expansion pages, validates continuity,
+and reassembles each `textRange` fully before invoking the visitor,
+awaits async visitors and nested tool calls, and returns `{visited, stopped}`.
+A provider error is returned as `walk.error`. Functions remain inside the guest
+runtime, isolated by default; no predicate source or closure crosses the host
+bridge.
+
+This is the Python replacement boundary: the host supplies bounded search and
+lossless normalized records; the fabric program supplies callbacks, maps,
+sets, joins, reductions, and the small final `return`. Do not add JSONPath,
+SQL, projection, grouping, or host-evaluated predicate fields, and do not open
+Pi session JSONL directly.
+
+During recall follow calls and expansion, Fabric compares the expected source
+hash and lineage fingerprint with the selected live or persisted session. A
+rewrite, append, or active-leaf navigation that changes a binding returns
+`stale_pointer` and no source content. Under active mode, an off-lineage stable
+address returns `address_not_found`; `branches: "all"` is the explicit way to
+read it.
 
 A valid `FabricExecutionTraceV1` on an outer `fabric_exec` result emits one
 child record per operation, placed immediately after the outer normalized
 entry. Each child keeps `parentEntryId`, `operationAddress`, the exact
-`toolName`, `ref`, `provider`, `action`, typed `filesTouched`, `outcome`,
-and a bounded structured `operation` object. Expansion re-reads and
+`tool`, `ref`, `provider`, `action`, typed `filesTouched`, `outcome`, and a
+bounded structured `operation` object. Expansion re-reads and
 re-normalizes source. Fabric never reconstructs operations from output
 prose.
 
@@ -386,7 +554,7 @@ After changes to discovery, structural postings, ranking, or cache layout,
 run the deterministic synthetic benchmark:
 
 ```sh
-pnpm benchmark:memory-heads
+bun run benchmark:memory-heads
 ```
 
 The benchmark reports catalog head selection separately from source

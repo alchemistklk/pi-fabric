@@ -800,19 +800,23 @@ interface FabricMeshApi {
 // property path named. Keep these spillover fields in sync with the provider
 // normalization tables.
 type FabricMemoryBranches = "active" | "all";
+type FabricMemoryQueryMode = "literal" | "phrase" | "regex";
+type FabricMemoryQueryMatch = "all" | "any";
 interface FabricMemoryEntryRange {
   first: number;
   last: number;
 }
 interface FabricMemoryRecallArgs {
   query?: string;
-  queryMode?: "literal" | "regex";
+  queryMode?: FabricMemoryQueryMode;
+  queryMatch?: FabricMemoryQueryMatch;
   expectedSourceHash?: string;
   expectedLineageFingerprint?: string;
   branches?: FabricMemoryBranches;
   scope?: string;
-  page?: number;
+  offset?: number;
   pageSize?: number;
+  snippetChars?: number;
   role?: string;
   tool?: string;
   ref?: string;
@@ -826,38 +830,10 @@ interface FabricMemoryRecallArgs {
   limit?: number;
   max?: number;
   page_size?: number;
-  query_mode?: "literal" | "regex";
+  snippet_chars?: number;
+  query_mode?: FabricMemoryQueryMode;
+  query_match?: FabricMemoryQueryMatch;
   entry_range?: FabricMemoryEntryRange;
-}
-interface FabricMemoryRecallResult {
-  scope?: string;
-  branches?: FabricMemoryBranches;
-  query?: string | null;
-  queryMode?: "literal" | "regex";
-  matchMode?: "browse" | "lexical" | "regex" | "structural" | "combined";
-  structuralFilters?: {
-    role?: string;
-    tool?: string;
-    ref?: string;
-    provider?: string;
-    action?: string;
-    outcome?: "succeeded" | "failed" | "aborted" | "timed_out";
-    since?: number;
-    until?: number;
-  };
-  matchedCount?: number;
-  totalMatches?: number;
-  totalItems?: number;
-  segmentCount?: number;
-  segments?: unknown[];
-  digestHits?: unknown[];
-  items?: unknown[];
-  page?: number;
-  pageSize?: number;
-  hasNext?: boolean;
-  coverage?: unknown;
-  text?: string;
-  error?: { code: string; message: string; [key: string]: unknown };
 }
 interface FabricMemoryExpandArgs {
   session: string;
@@ -868,6 +844,12 @@ interface FabricMemoryExpandArgs {
   entryIds?: string[];
   operationAddresses?: string[];
   entryRange?: FabricMemoryEntryRange;
+  before?: number;
+  after?: number;
+  entryOffset?: number;
+  textOffset?: number;
+  maxChars?: number;
+  maxEntries?: number;
   id?: string;
   file?: string;
   path?: string;
@@ -876,14 +858,111 @@ interface FabricMemoryExpandArgs {
   entry_ids?: string[];
   operation_addresses?: string[];
   entry_range?: FabricMemoryEntryRange;
+  entry_offset?: number;
+  text_offset?: number;
+  max_chars?: number;
+  max_entries?: number;
+}
+interface FabricMemoryCall<Ref extends string, Args> {
+  ref: Ref;
+  args: Args;
+}
+interface FabricMemoryRecallEntryHit {
+  kind: "entry";
+  sessionId: string;
+  tier: "hot" | "cold";
+  index: number;
+  entryId: string | null;
+  parentId: string | null;
+  operationAddress: string | null;
+  type: string;
+  role: string | null;
+  tool: string | null;
+  ref: string | null;
+  provider: string | null;
+  action: string | null;
+  timestamp: number | null;
+  isError: boolean;
+  outcome?: "succeeded" | "failed" | "aborted" | "timed_out";
+  score: number;
+  snippet: string;
+  truncated: boolean;
+  follow: FabricMemoryCall<"memory.expand", FabricMemoryExpandArgs>;
+}
+interface FabricMemoryRecallSessionHit {
+  kind: "session";
+  sessionId: string;
+  tier: "cold";
+  cwd: string;
+  lastTimestamp: number | null;
+  score: number;
+  matchedTerms: number;
+  matchedStructuralEntries: number;
+  follow: FabricMemoryCall<"memory.recall", FabricMemoryRecallArgs>;
+}
+type FabricMemoryRecallHit = FabricMemoryRecallEntryHit | FabricMemoryRecallSessionHit;
+interface FabricMemoryError {
+  code: string;
+  message: string;
+  [key: string]: unknown;
+}
+interface FabricMemoryCoverage {
+  complete: boolean;
+  indexedSessions: number;
+  eligibleSessions: number;
+  staleSessions: number;
+  incompleteSessions: number;
+  reasons: string[];
+  error?: FabricMemoryError;
+}
+interface FabricMemoryRecallResult {
+  total: number;
+  hits: FabricMemoryRecallHit[];
+  next: FabricMemoryCall<"memory.recall", FabricMemoryRecallArgs> | null;
+  coverage: FabricMemoryCoverage;
+  error?: FabricMemoryError;
+}
+interface FabricMemoryExpandedEntry {
+  index: number;
+  entryId: string | null;
+  parentId: string | null;
+  type: string | null;
+  role: string | null;
+  timestamp: number | null;
+  isError: boolean;
+  anchor?: boolean;
+  text: string;
+  textRange: { start: number; end: number; total: number; complete: boolean };
+  parentEntryId?: string | null;
+  operationAddress?: string | null;
+  tool?: string | null;
+  ref?: string | null;
+  provider?: string | null;
+  action?: string | null;
+  outcome?: "succeeded" | "failed" | "aborted" | "timed_out";
+  filesTouched?: Array<string | null>;
+  operation?: unknown;
+  branchFact?: unknown;
+  structuredTruncated?: boolean;
+  factAddress?: string | null;
+  carrierEntryId?: string | null;
+  carrierParentId?: string | null;
+  carrierFromId?: string | null;
 }
 interface FabricMemoryExpandResult {
   session?: string;
   sourceHash?: string;
   branches?: FabricMemoryBranches;
   lineageFingerprint?: string;
-  expanded?: unknown[];
-  error?: { code: string; message: string; [key: string]: unknown };
+  entryCount?: number;
+  entries: FabricMemoryExpandedEntry[];
+  next?: FabricMemoryCall<"memory.expand", FabricMemoryExpandArgs> | null;
+  error?: FabricMemoryError;
+}
+interface FabricMemoryWalkResult {
+  visited: number;
+  stopped: boolean;
+  error?: FabricMemoryError;
 }
 interface FabricMemorySessionInfo {
   id: string;
@@ -898,6 +977,13 @@ interface FabricMemorySessionInfo {
 interface FabricMemoryApi {
   recall(args?: FabricMemoryRecallArgs): Promise<FabricMemoryRecallResult>;
   expand(args: FabricMemoryExpandArgs): Promise<FabricMemoryExpandResult>;
+  walk(
+    args: FabricMemoryExpandArgs,
+    visitor: (
+      entry: FabricMemoryExpandedEntry,
+      index: number,
+    ) => boolean | void | Promise<boolean | void>,
+  ): Promise<FabricMemoryWalkResult>;
   sessions(args?: {
     scope?: string;
     branches?: FabricMemoryBranches;
@@ -907,7 +993,7 @@ interface FabricMemoryApi {
     scope?: string;
     branches?: FabricMemoryBranches;
     sessions?: FabricMemorySessionInfo[];
-    error?: { code: string; message: string; [key: string]: unknown };
+    error?: FabricMemoryError;
   }>;
 }
 interface FabricStateTransitionArgs {

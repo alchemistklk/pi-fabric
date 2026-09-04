@@ -85,15 +85,14 @@ describe("memory query and pointer hardening", () => {
     ]);
 
   it("never infers regex mode from dots or paths", async () => {
-    expect(planMemoryQuery("src/foo.ts")).toEqual({ kind: "terms", terms: ["src", "foo", "ts"] });
+    expect(planMemoryQuery("src/foo.ts")).toEqual({ kind: "terms", terms: ["src", "foo", "ts"], match: "any" });
     const file = seed("literal.jsonl", "literal", ["srcXfooYts only"]);
     const result = await provider().invoke(
       "recall",
       { scope: `session:${file}`, query: "src/foo.ts" },
       invocationContext(cwd),
-    ) as { matchedCount: number; queryMode: string };
-    expect(result.queryMode).toBe("literal");
-    expect(result.matchedCount).toBe(0);
+    ) as { total: number };
+    expect(result.total).toBe(0);
   });
 
   it("runs explicit regex in a bounded worker and terminates catastrophic patterns", async () => {
@@ -102,8 +101,8 @@ describe("memory query and pointer hardening", () => {
       "recall",
       { scope: `session:${normal}`, query: "code 4[0-9]", queryMode: "regex" },
       invocationContext(cwd),
-    ) as { matchedCount: number; coverage: { complete: boolean } };
-    expect(normalResult.matchedCount).toBe(1);
+    ) as { total: number; coverage: { complete: boolean } };
+    expect(normalResult.total).toBe(1);
     expect(normalResult.coverage.complete).toBe(true);
 
     const oversized = await provider({ regexMaxPatternBytes: 4 }).invoke(
@@ -131,10 +130,10 @@ describe("memory query and pointer hardening", () => {
       invocationContext(cwd),
     ) as {
       coverage: { complete: boolean; error: { code: string }; reasons: string[] };
-      matchedCount: number;
+      total: number;
     };
     expect(Date.now() - started).toBeLessThan(2_000);
-    expect(timedOut.matchedCount).toBe(0);
+    expect(timedOut.total).toBe(0);
     expect(timedOut.coverage.complete).toBe(false);
     expect(timedOut.coverage.error.code).toBe("regex_timeout");
     expect(timedOut.coverage.reasons).toContain("regex_timeout");
@@ -151,28 +150,30 @@ describe("memory query and pointer hardening", () => {
       "recall",
       { scope: "project", branches: "all", query: "needle" },
       invocationContext(cwd),
-    ) as { digestHits: Array<Record<string, unknown>> };
-    expect(pointer.digestHits).toHaveLength(1);
-    expect(pointer.digestHits[0]).toEqual(expect.objectContaining({
-      sessionFile: cold,
-      sourceHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    ) as { hits: Array<{ kind: string; sessionId: string; tier: string; follow: { ref: string; args: Record<string, unknown> } }> };
+    expect(pointer.hits).toHaveLength(1);
+    expect(pointer.hits[0]).toEqual(expect.objectContaining({
+      kind: "session",
+      sessionId: "cold",
+      tier: "cold",
+      follow: expect.objectContaining({
+        ref: "memory.recall",
+        args: expect.objectContaining({
+          scope: `session:${cold}`,
+          expectedSourceHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      }),
     }));
-    expect(pointer.digestHits[0]).not.toHaveProperty("entryRange");
-    expect(pointer.digestHits[0]).not.toHaveProperty("entryIds");
+    expect(pointer.hits[0]!.follow.args).not.toHaveProperty("entryRange");
+    expect(pointer.hits[0]!.follow.args).not.toHaveProperty("entryIds");
 
-    const hit = pointer.digestHits[0] as { sessionFile: string; sourceHash: string };
+    const hit = pointer.hits[0]!;
     const hydrated = await provider().invoke(
       "recall",
-      {
-        scope: `session:${hit.sessionFile}`,
-        expectedSourceHash: hit.sourceHash,
-        branches: "all",
-        query: "needle",
-      },
+      hit.follow.args,
       invocationContext(cwd),
-    ) as { segments: Array<{ exactMatches: Array<{ index: number; entryId: string }> }> };
-    expect(hydrated.segments.flatMap((segment) => segment.exactMatches).map((match) => match.index))
-      .toEqual([0, 2]);
+    ) as { hits: Array<{ kind: string; index: number; entryId: string }> };
+    expect(hydrated.hits.map((match) => match.index)).toEqual([0, 2]);
   });
 
   it("rejects stale pointers after a same-path source rewrite", async () => {
@@ -185,24 +186,20 @@ describe("memory query and pointer hardening", () => {
       "recall",
       { scope: "project", query: "stale_token" },
       invocationContext(cwd),
-    ) as { digestHits: Array<{ sessionFile: string; sourceHash: string }> };
-    const hit = pointer.digestHits[0]!;
+    ) as { hits: Array<{ follow: { args: { expectedSourceHash: string } & Record<string, unknown> } }> };
+    const follow = pointer.hits[0]!.follow.args;
     fs.appendFileSync(cold, `${JSON.stringify(message("changed", "rewritten"))}\n`);
 
     const hydrated = await provider().invoke(
       "recall",
-      {
-        scope: `session:${hit.sessionFile}`,
-        expectedSourceHash: hit.sourceHash,
-        query: "stale_token",
-      },
+      follow,
       invocationContext(cwd),
     ) as { error: { code: string } };
     expect(hydrated.error.code).toBe("stale_pointer");
 
     const expanded = await provider().invoke(
       "expand",
-      { session: hit.sessionFile, expectedSourceHash: hit.sourceHash, indices: [0] },
+      { session: cold, expectedSourceHash: follow.expectedSourceHash, indices: [0] },
       invocationContext(cwd),
     ) as { error: { code: string } };
     expect(expanded.error.code).toBe("stale_pointer");
@@ -223,8 +220,8 @@ describe("memory query and pointer hardening", () => {
       "expand",
       { session: first, indices: [0] },
       invocationContext(cwd),
-    ) as { expanded: Array<{ text: string }> };
-    expect(exact.expanded[0]!.text).toBe("first");
+    ) as { entries: Array<{ text: string }> };
+    expect(exact.entries[0]!.text).toBe("first");
   });
 
   it("reports index bounds instead of silently dropping invalid addresses", async () => {
@@ -253,11 +250,11 @@ describe("memory query and pointer hardening", () => {
       "recall",
       { scope: "project", query: "epsilon" },
       invocationContext(cwd),
-    ) as { coverage: { complete: boolean; reasons: string[]; incompleteSessions: number }; text: string };
+    ) as { total: number; coverage: { complete: boolean; reasons: string[]; incompleteSessions: number } };
     expect(vocabulary.coverage.complete).toBe(false);
     expect(vocabulary.coverage.incompleteSessions).toBe(1);
     expect(vocabulary.coverage.reasons).toContain("max_cold_vocabulary_bytes");
-    expect(vocabulary.text).toContain("No indexed matches");
+    expect(vocabulary.total).toBe(0);
 
     seed("budget-2.jsonl", "budget-2", ["second"]);
     seed("budget-3.jsonl", "budget-3", ["third"]);
@@ -286,8 +283,8 @@ describe("memory query and pointer hardening", () => {
       "recall",
       { scope: "project", query: "unique_01999" },
       invocationContext(cwd),
-    ) as { digestHits: unknown[] };
-    expect(result.digestHits).toHaveLength(1);
+    ) as { hits: unknown[] };
+    expect(result.hits).toHaveLength(1);
     const cache = digestPathForSession(file, indexDir);
     const cacheBytes = fs.statSync(cache).size;
     const sourceBytes = fs.statSync(file).size;

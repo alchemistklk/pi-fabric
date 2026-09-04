@@ -14,6 +14,15 @@ import {
   type ResolveScopeInput,
   type SessionRef,
 } from "../memory/discovery.js";
+import {
+  presentRecall,
+  RECALL_DEFAULT_PAGE_SIZE,
+  RECALL_DEFAULT_SNIPPET_CHARS,
+  RECALL_MAX_PAGE_SIZE,
+  RECALL_MAX_RESPONSE_CHARS,
+  RECALL_MAX_SNIPPET_CHARS,
+  type MemoryRecallCallArgs,
+} from "../memory/context.js";
 import type { LiveSessionBranch, MemoryBranches } from "../memory/lineage.js";
 import { reconstructSessionLineage } from "../memory/lineage.js";
 import { expandSessionEntriesChecked, normalizeSession } from "../memory/normalize.js";
@@ -30,30 +39,271 @@ import {
   DEFAULT_REGEX_MAX_HAYSTACK_TERMS,
   DEFAULT_REGEX_MAX_PATTERN_BYTES,
   DEFAULT_REGEX_TIMEOUT_MS,
-  formatSearchResult,
   searchMemoryIndex,
-  type SearchItem,
 } from "../memory/search.js";
-import type { MemoryQueryMode } from "../memory/tokenize.js";
+import type { MemoryQueryMatch, MemoryQueryMode } from "../memory/tokenize.js";
 import { actionArgNormalizer, type ArgNormalizationSpec } from "./arg-normalization.js";
 
-const RECALL_DEFAULT_PAGE_SIZE = 25;
-const RECALL_MAX_PAGE_SIZE = 200;
+const EXPAND_DEFAULT_MAX_CHARS = 20_000;
+const EXPAND_MAX_CHARS = 24_000;
+const EXPAND_DEFAULT_MAX_ENTRIES = 10;
+const EXPAND_MAX_ENTRIES = 20;
+const EXPAND_MAX_CONTEXT = 100;
+const EXPAND_MAX_EXACT_SELECTORS = 100;
 const SESSIONS_MAX = 500;
+
+const errorOutputSchema = {
+  type: "object",
+  properties: {
+    code: { type: "string" },
+    message: { type: "string" },
+  },
+  required: ["code", "message"],
+};
+
+const coverageOutputSchema = {
+  type: "object",
+  properties: {
+    complete: { type: "boolean" },
+    indexedSessions: { type: "number" },
+    eligibleSessions: { type: "number" },
+    staleSessions: { type: "number" },
+    incompleteSessions: { type: "number" },
+    reasons: {
+      type: "array",
+      items: { type: "string" },
+      description: "Stable machine-readable incompleteness codes; empty when complete is true.",
+    },
+    error: errorOutputSchema,
+  },
+  required: [
+    "complete",
+    "indexedSessions",
+    "eligibleSessions",
+    "staleSessions",
+    "incompleteSessions",
+    "reasons",
+  ],
+};
+
+const callOutputSchema = (ref: "memory.recall" | "memory.expand") => ({
+  type: "object",
+  properties: {
+    ref: { const: ref },
+    args: { type: "object" },
+  },
+  required: ["ref", "args"],
+});
+
+const recallEntryOutputSchema = {
+  type: "object",
+  properties: {
+    kind: { const: "entry" },
+    sessionId: { type: "string" },
+    tier: { type: "string", enum: ["hot", "cold"] },
+    index: { type: "number" },
+    entryId: { type: ["string", "null"] },
+    parentId: { type: ["string", "null"] },
+    operationAddress: { type: ["string", "null"] },
+    type: { type: "string" },
+    role: { type: ["string", "null"] },
+    tool: { type: ["string", "null"] },
+    ref: { type: ["string", "null"] },
+    provider: { type: ["string", "null"] },
+    action: { type: ["string", "null"] },
+    timestamp: { type: ["number", "null"] },
+    isError: { type: "boolean" },
+    outcome: { type: "string", enum: ["succeeded", "failed", "aborted", "timed_out"] },
+    score: { type: "number" },
+    snippet: { type: "string" },
+    truncated: { type: "boolean" },
+    follow: callOutputSchema("memory.expand"),
+  },
+  required: [
+    "kind",
+    "sessionId",
+    "tier",
+    "index",
+    "entryId",
+    "parentId",
+    "operationAddress",
+    "type",
+    "role",
+    "tool",
+    "ref",
+    "provider",
+    "action",
+    "timestamp",
+    "isError",
+    "score",
+    "snippet",
+    "truncated",
+    "follow",
+  ],
+};
+
+const recallSessionOutputSchema = {
+  type: "object",
+  properties: {
+    kind: { const: "session" },
+    sessionId: { type: "string" },
+    tier: { const: "cold" },
+    cwd: { type: "string" },
+    lastTimestamp: { type: ["number", "null"] },
+    score: { type: "number" },
+    matchedTerms: { type: "number" },
+    matchedStructuralEntries: { type: "number" },
+    follow: callOutputSchema("memory.recall"),
+  },
+  required: [
+    "kind",
+    "sessionId",
+    "tier",
+    "cwd",
+    "lastTimestamp",
+    "score",
+    "matchedTerms",
+    "matchedStructuralEntries",
+    "follow",
+  ],
+};
+
+const recallOutputSchema: Record<string, unknown> = {
+  type: "object",
+  description: "Bounded ranked memory hits with uniform follow and pagination calls.",
+  properties: {
+    total: { type: "number" },
+    hits: {
+      type: "array",
+      description: "Call tools.call(hit.follow) to expand an entry or resolve a cold session.",
+      items: { oneOf: [recallEntryOutputSchema, recallSessionOutputSchema] },
+    },
+    next: {
+      oneOf: [callOutputSchema("memory.recall"), { type: "null" }],
+      description: "When non-null, call tools.call(next).",
+    },
+    coverage: coverageOutputSchema,
+    error: errorOutputSchema,
+  },
+  required: ["total", "hits", "next", "coverage"],
+};
+
+const expandOutputSchema: Record<string, unknown> = {
+  type: "object",
+  description: "Integrity-bound session entries returned as lossless bounded text chunks.",
+  properties: {
+    session: { type: "string" },
+    sourceHash: { type: "string" },
+    branches: { type: "string", enum: ["active", "all"] },
+    lineageFingerprint: { type: "string" },
+    entryCount: { type: "number" },
+    entries: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          index: { type: "number" },
+          entryId: { type: ["string", "null"] },
+          parentId: { type: ["string", "null"] },
+          type: { type: ["string", "null"] },
+          role: { type: ["string", "null"] },
+          timestamp: { type: ["number", "null"] },
+          isError: { type: "boolean" },
+          text: { type: "string" },
+          textRange: {
+            type: "object",
+            properties: {
+              start: { type: "number" },
+              end: { type: "number" },
+              total: { type: "number" },
+              complete: { type: "boolean" },
+            },
+            required: ["start", "end", "total", "complete"],
+          },
+          anchor: { type: "boolean" },
+          parentEntryId: { type: ["string", "null"] },
+          operationAddress: { type: ["string", "null"] },
+          tool: { type: ["string", "null"] },
+          ref: { type: ["string", "null"] },
+          provider: { type: ["string", "null"] },
+          action: { type: ["string", "null"] },
+          outcome: { type: "string", enum: ["succeeded", "failed", "aborted", "timed_out"] },
+          filesTouched: { type: "array", items: { type: ["string", "null"] } },
+          operation: { type: "object" },
+          branchFact: { type: "object" },
+          structuredTruncated: { type: "boolean" },
+          factAddress: { type: ["string", "null"] },
+          carrierEntryId: { type: ["string", "null"] },
+          carrierParentId: { type: ["string", "null"] },
+          carrierFromId: { type: ["string", "null"] },
+        },
+        required: ["index", "entryId", "parentId", "type", "role", "timestamp", "isError", "text", "textRange"],
+      },
+    },
+    next: {
+      oneOf: [callOutputSchema("memory.expand"), { type: "null" }],
+      description: "When non-null, call tools.call(next).",
+    },
+    error: errorOutputSchema,
+  },
+  required: ["entries"],
+};
+
+const sessionsOutputSchema: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    scope: { type: "string" },
+    branches: { type: "string", enum: ["active", "all"] },
+    sessions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          file: { type: "string" },
+          cwd: { type: "string" },
+          mtime: { type: "number" },
+          entryCount: { type: "number" },
+          tier: { type: "string", enum: ["hot", "cold"] },
+          branches: { type: "string", enum: ["active", "all"] },
+          lineageFingerprint: { type: ["string", "null"] },
+        },
+        required: [
+          "id",
+          "file",
+          "cwd",
+          "mtime",
+          "entryCount",
+          "tier",
+          "branches",
+          "lineageFingerprint",
+        ],
+      },
+    },
+    error: errorOutputSchema,
+  },
+};
 
 const descriptors: FabricActionDescriptor[] = [
   {
     name: "recall",
     description:
-      "Search hot session entries and cold session digests. Use scope session:<id-or-path> to hydrate a cold session and search its entries.",
+      "Search session memory as bounded ranked snippets. Literal queries rank any matching term by default; queryMatch all narrows to co-located terms. Call tools.call(hit.follow) for either an exact entry or a cold-session candidate, and tools.call(next) to continue.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string" },
+        query: { type: "string", maxLength: 4096 },
         queryMode: {
           type: "string",
-          enum: ["literal", "regex"],
-          description: "Literal canonical-token matching (default) or explicitly bounded regex.",
+          enum: ["literal", "phrase", "regex"],
+          default: "literal",
+          description: "Canonical tokens (default), one case-insensitive exact phrase, or explicitly bounded regex.",
+        },
+        queryMatch: {
+          type: "string",
+          enum: ["all", "any"],
+          default: "any",
+          description: "For literal mode, accept any term (default) or require all terms in one hot entry.",
         },
         expectedSourceHash: {
           type: "string",
@@ -73,8 +323,19 @@ const descriptors: FabricActionDescriptor[] = [
           description:
             "session | project | global | session:<id-or-path>. Defaults to session.",
         },
-        page: { type: "number", minimum: 1 },
-        pageSize: { type: "number", minimum: 1, maximum: RECALL_MAX_PAGE_SIZE },
+        offset: {
+          type: "number",
+          minimum: 0,
+          description: "Exact ranked-hit offset, normally copied from next.args.",
+        },
+        pageSize: { type: "number", minimum: 1, maximum: RECALL_MAX_PAGE_SIZE, default: RECALL_DEFAULT_PAGE_SIZE },
+        snippetChars: {
+          type: "number",
+          minimum: 80,
+          maximum: RECALL_MAX_SNIPPET_CHARS,
+          default: RECALL_DEFAULT_SNIPPET_CHARS,
+          description: "Maximum indexed-text characters shown per hit; full text remains in memory.expand.",
+        },
         role: {
           type: "string",
           enum: [
@@ -121,7 +382,7 @@ const descriptors: FabricActionDescriptor[] = [
         entryRange: {
           type: "object",
           description:
-            "Inclusive normalized-entry range for an explicit session:<id> hydration.",
+            "Inclusive normalized-entry range for an explicit session:<id> resolution.",
           properties: {
             first: { type: "number", minimum: 0 },
             last: { type: "number", minimum: 0 },
@@ -132,13 +393,14 @@ const descriptors: FabricActionDescriptor[] = [
       },
       additionalProperties: false,
     },
+    outputSchema: recallOutputSchema,
     risk: "read",
     namespace: "memory",
   },
   {
     name: "expand",
     description:
-      "Re-read full text or a bounded structured Fabric operation by index, entry id, operation address, or inclusive range.",
+      "Read exact normalized session entries and nearby context as bounded lossless chunks. Call tools.call(next) to continue, or use guest-side memory.walk(args, visitor) to traverse complete reassembled entries.",
     inputSchema: {
       type: "object",
       properties: {
@@ -156,9 +418,9 @@ const descriptors: FabricActionDescriptor[] = [
           enum: ["active", "all"],
           description: "Expand on the active parent-linked path (default) or across every branch.",
         },
-        indices: { type: "array", items: { type: "number", minimum: 0 } },
-        entryIds: { type: "array", items: { type: "string" } },
-        operationAddresses: { type: "array", items: { type: "string" } },
+        indices: { type: "array", maxItems: EXPAND_MAX_EXACT_SELECTORS, items: { type: "number", minimum: 0 } },
+        entryIds: { type: "array", maxItems: EXPAND_MAX_EXACT_SELECTORS, items: { type: "string", maxLength: 512 } },
+        operationAddresses: { type: "array", maxItems: EXPAND_MAX_EXACT_SELECTORS, items: { type: "string", maxLength: 512 } },
         entryRange: {
           type: "object",
           properties: {
@@ -168,10 +430,49 @@ const descriptors: FabricActionDescriptor[] = [
           required: ["first", "last"],
           additionalProperties: false,
         },
+        before: {
+          type: "number",
+          minimum: 0,
+          maximum: EXPAND_MAX_CONTEXT,
+          default: 0,
+          description: "Entries before one exact selected anchor.",
+        },
+        after: {
+          type: "number",
+          minimum: 0,
+          maximum: EXPAND_MAX_CONTEXT,
+          default: 0,
+          description: "Entries after one exact selected anchor.",
+        },
+        entryOffset: {
+          type: "number",
+          minimum: 0,
+          description: "Continuation offset within the resolved selection; copy from next.args.",
+        },
+        textOffset: {
+          type: "number",
+          minimum: 0,
+          description: "Continuation offset within the first returned entry; copy from next.args.",
+        },
+        maxChars: {
+          type: "number",
+          minimum: 256,
+          maximum: EXPAND_MAX_CHARS,
+          default: EXPAND_DEFAULT_MAX_CHARS,
+          description: "Total entry-text characters returned in this chunk.",
+        },
+        maxEntries: {
+          type: "number",
+          minimum: 1,
+          maximum: EXPAND_MAX_ENTRIES,
+          default: EXPAND_DEFAULT_MAX_ENTRIES,
+          description: "Maximum complete or partial entries returned in this chunk.",
+        },
       },
       required: ["session"],
       additionalProperties: false,
     },
+    outputSchema: expandOutputSchema,
     risk: "read",
     namespace: "memory",
   },
@@ -195,6 +496,7 @@ const descriptors: FabricActionDescriptor[] = [
       },
       additionalProperties: false,
     },
+    outputSchema: sessionsOutputSchema,
     risk: "read",
     namespace: "memory",
   },
@@ -325,6 +627,21 @@ const addressError = (message: string, entryCount?: number) => ({
   ...(entryCount === undefined ? {} : { entryCount }),
 });
 
+const recallFailure = (error: { code: string; message: string; [key: string]: unknown }) => ({
+  total: 0,
+  hits: [],
+  next: null,
+  coverage: {
+    complete: false,
+    indexedSessions: 0,
+    eligibleSessions: 0,
+    staleSessions: 0,
+    incompleteSessions: 0,
+    reasons: [error.code],
+  },
+  error,
+});
+
 export class MemoryProvider implements FabricProvider {
   readonly name = "memory";
   readonly description =
@@ -376,14 +693,15 @@ export class MemoryProvider implements FabricProvider {
       }
     } catch (error) {
       if (error instanceof AmbiguousSessionError) {
-        return {
-          error: {
-            code: error.code,
-            message: error.message,
-            session: error.session,
-            candidates: error.candidates,
-          },
+        const detail = {
+          code: error.code,
+          message: error.message,
+          session: error.session,
+          candidates: error.candidates,
         };
+        if (actionName === "recall") return recallFailure(detail);
+        if (actionName === "expand") return { entries: [], next: null, error: detail };
+        return { error: detail };
       }
       throw error;
     }
@@ -395,10 +713,27 @@ export class MemoryProvider implements FabricProvider {
   ): Promise<unknown> {
     const query = typeof args.query === "string" ? args.query : undefined;
     const rawQueryMode = args.queryMode;
-    if (rawQueryMode !== undefined && rawQueryMode !== "literal" && rawQueryMode !== "regex") {
-      throw new Error('memory.recall queryMode must be "literal" or "regex"');
+    if (
+      rawQueryMode !== undefined &&
+      rawQueryMode !== "literal" &&
+      rawQueryMode !== "phrase" &&
+      rawQueryMode !== "regex"
+    ) {
+      throw new Error('memory.recall queryMode must be "literal", "phrase", or "regex"');
     }
-    const queryMode: MemoryQueryMode = rawQueryMode === "regex" ? "regex" : "literal";
+    const queryMode: MemoryQueryMode = rawQueryMode === "phrase"
+      ? "phrase"
+      : rawQueryMode === "regex"
+        ? "regex"
+        : "literal";
+    const rawQueryMatch = args.queryMatch;
+    if (rawQueryMatch !== undefined && rawQueryMatch !== "all" && rawQueryMatch !== "any") {
+      throw new Error('memory.recall queryMatch must be "all" or "any"');
+    }
+    if (queryMode !== "literal" && rawQueryMatch !== undefined) {
+      throw new Error("memory.recall queryMatch is only valid with literal queryMode");
+    }
+    const queryMatch: MemoryQueryMatch = rawQueryMatch === "all" ? "all" : "any";
     const expectedSourceHash = typeof args.expectedSourceHash === "string"
       ? args.expectedSourceHash
       : undefined;
@@ -425,11 +760,17 @@ export class MemoryProvider implements FabricProvider {
     const outcome = rawOutcome as SearchFilters["outcome"];
     const since = typeof args.since === "number" ? args.since : undefined;
     const until = typeof args.until === "number" ? args.until : undefined;
-    const page = typeof args.page === "number" && args.page >= 1 ? Math.floor(args.page) : 1;
+    const offset = typeof args.offset === "number" && args.offset >= 0
+      ? Math.floor(args.offset)
+      : undefined;
     const pageSize =
       typeof args.pageSize === "number" && args.pageSize >= 1
         ? Math.min(Math.floor(args.pageSize), RECALL_MAX_PAGE_SIZE)
         : RECALL_DEFAULT_PAGE_SIZE;
+    const snippetChars =
+      typeof args.snippetChars === "number" && args.snippetChars >= 80
+        ? Math.min(Math.floor(args.snippetChars), RECALL_MAX_SNIPPET_CHARS)
+        : RECALL_DEFAULT_SNIPPET_CHARS;
 
     const refs = resolveRefs(scope, this.context, false);
     const liveResolver = liveBranchResolver(this.context);
@@ -455,21 +796,13 @@ export class MemoryProvider implements FabricProvider {
       const lineageChanged = expectedLineageFingerprint !== undefined &&
         lineage.fingerprint !== expectedLineageFingerprint;
       if (state && (sourceChanged || lineageChanged)) {
-        return {
-          scope: scope ?? "session",
-          query: query ?? null,
-          branches,
-          error: stalePointerError(
-            refs[0].file,
-            expectedSourceHash,
-            state.sourceHash,
-            expectedLineageFingerprint,
-            lineage.fingerprint,
-          ),
-          segments: [],
-          digestHits: [],
-          items: [],
-        };
+        return recallFailure(stalePointerError(
+          refs[0].file,
+          expectedSourceHash,
+          state.sourceHash,
+          expectedLineageFingerprint,
+          lineage.fingerprint,
+        ));
       }
     }
 
@@ -493,14 +826,7 @@ export class MemoryProvider implements FabricProvider {
       first < 0 ||
       last < first
     )) {
-      return {
-        scope: scope ?? "session",
-        query: query ?? null,
-        error: addressError("Entry range requires safe integers with 0 <= first <= last."),
-        segments: [],
-        digestHits: [],
-        items: [],
-      };
+      return recallFailure(addressError("Entry range requires safe integers with 0 <= first <= last."));
     }
     const selectedRange: EntryRange | undefined =
       typeof first === "number" && typeof last === "number" ? { first, last } : undefined;
@@ -517,34 +843,24 @@ export class MemoryProvider implements FabricProvider {
     const hydratedLineageChanged = expectedLineageFingerprint !== undefined &&
       hydratedShard?.lineageFingerprint !== expectedLineageFingerprint;
     if (hydrate && hydratedShard && (hydratedSourceChanged || hydratedLineageChanged)) {
-      return {
-        scope: scope ?? "session",
-        query: query ?? null,
-        branches,
-        error: stalePointerError(
-          hydratedShard.sessionFile,
-          expectedSourceHash,
-          hydratedShard.sourceHash,
-          expectedLineageFingerprint,
-          hydratedShard.lineageFingerprint,
-        ),
-        segments: [],
-        digestHits: [],
-        items: [],
-      };
+      return recallFailure(stalePointerError(
+        hydratedShard.sessionFile,
+        expectedSourceHash,
+        hydratedShard.sourceHash,
+        expectedLineageFingerprint,
+        hydratedShard.lineageFingerprint,
+      ));
     }
-    if (hydrate && selectedRange && index.shards[0] && selectedRange.last >= index.shards[0].totalEntryCount) {
-      return {
-        scope: scope ?? "session",
-        query: query ?? null,
-        error: addressError(
-          `Entry range ends at ${selectedRange.last}, but the session has ${index.shards[0].totalEntryCount} entries.`,
-          index.shards[0].totalEntryCount,
-        ),
-        segments: [],
-        digestHits: [],
-        items: [],
-      };
+    if (
+      hydrate &&
+      selectedRange &&
+      index.shards[0] &&
+      selectedRange.last >= index.shards[0].totalEntryCount
+    ) {
+      return recallFailure(addressError(
+        `Entry range ends at ${selectedRange.last}, but the session has ${index.shards[0].totalEntryCount} entries.`,
+        index.shards[0].totalEntryCount,
+      ));
     }
 
     const filters: SearchFilters = {};
@@ -559,6 +875,7 @@ export class MemoryProvider implements FabricProvider {
     const searchQuery = {
       ...(query === undefined ? {} : { query }),
       queryMode,
+      queryMatch,
       filters,
       regexLimits: {
         maxPatternBytes: this.context.config.regexMaxPatternBytes
@@ -577,51 +894,68 @@ export class MemoryProvider implements FabricProvider {
       reasons: [...new Set([...index.coverage.reasons, ...result.queryCoverage.reasons])].sort(),
       ...(result.queryCoverage.error ? { error: result.queryCoverage.error } : {}),
     };
-
-    const start = (page - 1) * pageSize;
-    const pagedItems = result.items.slice(start, start + pageSize);
-    const pagedSegments = pagedItems
-      .filter((item): item is Extract<SearchItem, { kind: "entry" }> => item.kind === "entry")
-      .map((item) => item.segment);
-    const pagedDigests = pagedItems
-      .filter((item): item is Extract<SearchItem, { kind: "digest" }> => item.kind === "digest")
-      .map((item) => item.digest);
-    const displayResult = {
-      ...result,
-      segments: pagedSegments,
-      digestHits: pagedDigests,
-      items: pagedItems,
-    };
-    const pagedResult = {
-      scope: scope ?? "session",
-      branches,
-      query: query ?? null,
+    const soleRef = refs.length === 1 ? refs[0] : undefined;
+    const soleShard = soleRef
+      ? index.shards.find((candidate) => candidate.sessionFile === soleRef.file)
+      : undefined;
+    const soleDigest = soleRef
+      ? index.digests.find((candidate) => candidate.file === soleRef.file)
+      : undefined;
+    const continuationBinding = soleRef && (soleShard?.sourceHash || soleDigest?.sourceHash)
+      ? {
+          file: soleRef.file,
+          sourceHash: soleShard?.sourceHash ?? soleDigest!.sourceHash,
+          lineageFingerprint: soleShard?.lineageFingerprint ?? soleDigest!.lineageFingerprint,
+        }
+      : undefined;
+    const requestArgs: MemoryRecallCallArgs = {
+      ...(query === undefined ? {} : { query }),
       queryMode,
-      matchMode: result.matchMode,
-      structuralFilters: filters,
-      matchedCount: result.matchedCount,
-      totalMatches: result.totalMatches,
-      totalItems: result.totalItems,
-      segmentCount: result.segmentCount,
-      segments: pagedSegments,
-      digestHits: pagedDigests,
-      items: pagedItems,
-      page,
+      ...(queryMode === "literal" ? { queryMatch } : {}),
+      ...((expectedSourceHash ?? continuationBinding?.sourceHash)
+        ? { expectedSourceHash: expectedSourceHash ?? continuationBinding!.sourceHash }
+        : {}),
+      ...((expectedLineageFingerprint ?? continuationBinding?.lineageFingerprint)
+        ? {
+            expectedLineageFingerprint:
+              expectedLineageFingerprint ?? continuationBinding!.lineageFingerprint,
+          }
+        : {}),
+      branches,
+      scope: continuationBinding ? `session:${continuationBinding.file}` : scope ?? "session",
+      ...(offset === undefined ? {} : { offset }),
       pageSize,
-      hasNext: start + pageSize < result.totalItems,
-      coverage,
-      text: formatSearchResult(displayResult, query, coverage, filters),
+      snippetChars,
+      ...(role ? { role } : {}),
+      ...(tool ? { tool } : {}),
+      ...(ref ? { ref } : {}),
+      ...(provider ? { provider } : {}),
+      ...(action ? { action } : {}),
+      ...(outcome ? { outcome } : {}),
+      ...(since !== undefined ? { since } : {}),
+      ...(until !== undefined ? { until } : {}),
+      ...(selectedRange ? { entryRange: selectedRange } : {}),
     };
+    const response = presentRecall({
+      result,
+      ...(query === undefined ? {} : { query }),
+      queryMode,
+      coverage,
+      ...(offset === undefined ? {} : { offset }),
+      pageSize,
+      snippetChars,
+      requestArgs,
+    });
     invocationContext.update(
       result.matchMode === "structural"
-        ? `memory.recall: ${result.matchedCount} structural result items`
+        ? `memory.recall: ${result.matchedCount} structural matches`
         : result.matchMode === "combined"
-          ? `memory.recall: ${result.matchedCount} lexical matches within exact structural filters`
+          ? `memory.recall: ${result.matchedCount} filtered matches`
           : query
-            ? `memory.recall: ${result.matchedCount} matches across ${result.segmentCount} segments`
+            ? `memory.recall: ${result.matchedCount} matches`
             : `memory.recall: ${result.matchedCount} recent entries`,
     );
-    return pagedResult;
+    return response;
   }
 
   private async expand(args: Record<string, unknown>): Promise<unknown> {
@@ -639,7 +973,7 @@ export class MemoryProvider implements FabricProvider {
     }
     if (Array.isArray(rawIndices) && !rawIndices.every((index) =>
       typeof index === "number" && Number.isSafeInteger(index) && index >= 0)) {
-      return { session, error: addressError("Every entry index must be a non-negative safe integer."), expanded: [] };
+      return { session, error: addressError("Every entry index must be a non-negative safe integer."), entries: [] };
     }
     const indices = (rawIndices as number[] | undefined) ?? [];
     const entryIds = Array.isArray(args.entryIds)
@@ -652,6 +986,9 @@ export class MemoryProvider implements FabricProvider {
           (address): address is string => typeof address === "string" && address.length > 0,
         )
       : [];
+    if (indices.length + entryIds.length + operationAddresses.length > EXPAND_MAX_EXACT_SELECTORS) {
+      throw new Error(`memory.expand accepts at most ${EXPAND_MAX_EXACT_SELECTORS} exact selectors per call`);
+    }
     const rawRange = args.entryRange;
     const rangeRecord = rawRange && typeof rawRange === "object" && !Array.isArray(rawRange)
       ? rawRange as Record<string, unknown>
@@ -670,15 +1007,25 @@ export class MemoryProvider implements FabricProvider {
       first < 0 ||
       last < first
     )) {
-      return { session, error: addressError("Entry range requires safe integers with 0 <= first <= last."), expanded: [] };
+      return { session, error: addressError("Entry range requires safe integers with 0 <= first <= last."), entries: [] };
     }
+    const numeric = (value: unknown, fallback: number, maximum: number): number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+        ? Math.min(value, maximum)
+        : fallback;
+    const before = numeric(args.before, 0, EXPAND_MAX_CONTEXT);
+    const after = numeric(args.after, 0, EXPAND_MAX_CONTEXT);
+    const entryOffset = numeric(args.entryOffset, 0, Number.MAX_SAFE_INTEGER);
+    const textOffset = numeric(args.textOffset, 0, Number.MAX_SAFE_INTEGER);
+    const maxChars = Math.max(256, numeric(args.maxChars, EXPAND_DEFAULT_MAX_CHARS, EXPAND_MAX_CHARS));
+    const maxEntries = Math.max(1, numeric(args.maxEntries, EXPAND_DEFAULT_MAX_ENTRIES, EXPAND_MAX_ENTRIES));
 
     const ref = resolveSessionTarget(this.context.agentDir, session);
     if (!ref) {
       return {
         session,
         error: { code: "session_not_found", message: `Session not found: ${session}` },
-        expanded: [],
+        entries: [],
       };
     }
     const liveResolver = liveBranchResolver(this.context);
@@ -692,7 +1039,7 @@ export class MemoryProvider implements FabricProvider {
       return {
         session: ref.file,
         error: { code: "source_unavailable", message: `Session source is unavailable: ${ref.file}` },
-        expanded: [],
+        entries: [],
       };
     }
     const sourceChanged = expectedSourceHash !== undefined &&
@@ -710,7 +1057,7 @@ export class MemoryProvider implements FabricProvider {
           expectedLineageFingerprint,
           initialLineage.fingerprint,
         ),
-        expanded: [],
+        entries: [],
       };
     }
 
@@ -729,14 +1076,14 @@ export class MemoryProvider implements FabricProvider {
       return {
         session: ref.file,
         error: addressError(`Entry index ${outOfBounds} is outside 0..${Math.max(0, entryCount - 1)}.`, entryCount),
-        expanded: [],
+        entries: [],
       };
     }
     if (typeof last === "number" && last >= entryCount) {
       return {
         session: ref.file,
         error: addressError(`Entry range ends at ${last}, but the session has ${entryCount} entries.`, entryCount),
-        expanded: [],
+        entries: [],
       };
     }
     if (
@@ -745,28 +1092,84 @@ export class MemoryProvider implements FabricProvider {
       operationAddresses.length === 0 &&
       (first === undefined || last === undefined)
     ) {
+      if (before > 0 || after > 0) {
+        throw new Error("memory.expand before/after requires one selected anchor");
+      }
       return {
         session: ref.file,
         sourceHash: initialState.sourceHash,
         branches,
         lineageFingerprint: initialLineage.fingerprint,
-        expanded: [],
+        entryCount,
+        entries: [],
+        next: null,
       };
     }
 
-    const selection: {
+    const requestedSelection: {
       indices?: number[];
       entryIds?: string[];
       operationAddresses?: string[];
       entryRange?: { first: number; last: number };
     } = {};
-    if (indices.length > 0) selection.indices = indices;
-    if (entryIds.length > 0) selection.entryIds = entryIds;
-    if (operationAddresses.length > 0) selection.operationAddresses = operationAddresses;
+    if (indices.length > 0) requestedSelection.indices = indices;
+    if (entryIds.length > 0) requestedSelection.entryIds = entryIds;
+    if (operationAddresses.length > 0) requestedSelection.operationAddresses = operationAddresses;
     if (typeof first === "number" && typeof last === "number") {
-      selection.entryRange = { first, last };
+      requestedSelection.entryRange = { first, last };
     }
-    const expansion = expandSessionEntriesChecked(ref.file, selection, expansionOptions);
+    let expansion = expandSessionEntriesChecked(ref.file, requestedSelection, expansionOptions);
+    if ("error" in expansion) {
+      return {
+        session: ref.file,
+        sourceHash: initialState.sourceHash,
+        branches,
+        lineageFingerprint: initialLineage.fingerprint,
+        error: expansion.error,
+        entries: [],
+      };
+    }
+
+    let anchorIndex: number | null = null;
+    let canonicalSelection: {
+      indices?: number[];
+      entryIds?: string[];
+      operationAddresses?: string[];
+      entryRange?: EntryRange;
+      before?: number;
+      after?: number;
+    };
+    if (before > 0 || after > 0) {
+      if (expansion.expanded.length !== 1) {
+        throw new Error("memory.expand before/after requires exactly one resolved anchor");
+      }
+      anchorIndex = expansion.expanded[0]!.index;
+      const contextRange = {
+        first: Math.max(0, anchorIndex - before),
+        last: Math.min(Math.max(0, entryCount - 1), anchorIndex + after),
+      };
+      canonicalSelection = { ...requestedSelection, before, after };
+      expansion = expandSessionEntriesChecked(
+        ref.file,
+        { entryRange: contextRange },
+        expansionOptions,
+      );
+      if ("error" in expansion) {
+        return {
+          session: ref.file,
+          sourceHash: initialState.sourceHash,
+          branches,
+          lineageFingerprint: initialLineage.fingerprint,
+          error: expansion.error,
+          entries: [],
+        };
+      }
+    } else if (requestedSelection.entryRange) {
+      canonicalSelection = { entryRange: requestedSelection.entryRange };
+    } else {
+      canonicalSelection = { indices: expansion.expanded.map((entry) => entry.index) };
+    }
+
     const finalState = fingerprintSource(ref.file);
     const finalLineage = reconstructSessionLineage(
       ref.file,
@@ -787,26 +1190,204 @@ export class MemoryProvider implements FabricProvider {
           expectedLineageFingerprint ?? initialLineage.fingerprint,
           finalLineage.fingerprint,
         ),
-        expanded: [],
+        entries: [],
       };
     }
-    if ("error" in expansion) {
+
+    const selected = expansion.expanded;
+    if (entryOffset > selected.length) {
+      return {
+        session: ref.file,
+        error: addressError(`Entry offset ${entryOffset} is outside 0..${selected.length}.`, selected.length),
+        entries: [],
+      };
+    }
+    if (entryOffset < selected.length && textOffset > selected[entryOffset]!.text.length) {
+      return {
+        session: ref.file,
+        error: {
+          code: "text_offset_out_of_bounds",
+          message: `Text offset ${textOffset} exceeds entry #${selected[entryOffset]!.index} length ${selected[entryOffset]!.text.length}.`,
+          textLength: selected[entryOffset]!.text.length,
+        },
+        entries: [],
+      };
+    }
+
+    const bounded = (value: string | null, maximum = 512): string | null =>
+      value === null || value.length <= maximum
+        ? value
+        : `${value.slice(0, Math.max(1, maximum - 1))}…`;
+    const compactStructure = (value: unknown): unknown => {
+      if (value === undefined) return undefined;
+      const serialized = JSON.stringify(value);
+      return serialized.length <= 2_000 ? value : undefined;
+    };
+    const output: Array<Record<string, unknown>> = [];
+    const cursors: Array<{ position: number; textOffset: number }> = [];
+    let position = entryOffset;
+    let currentTextOffset = textOffset;
+    let remainingChars = maxChars;
+    while (position < selected.length && output.length < maxEntries && remainingChars > 0) {
+      const entry = selected[position]!;
+      let end = Math.min(entry.text.length, currentTextOffset + remainingChars);
+      if (
+        end < entry.text.length &&
+        end > currentTextOffset &&
+        entry.text.charCodeAt(end) >= 0xdc00 &&
+        entry.text.charCodeAt(end) <= 0xdfff
+      ) {
+        end -= 1;
+      }
+      if (end === currentTextOffset && currentTextOffset < entry.text.length) {
+        end = Math.min(entry.text.length, currentTextOffset + 2);
+      }
+      const chunk = entry.text.slice(currentTextOffset, end);
+      const textComplete = end >= entry.text.length;
+      const operation = compactStructure(entry.operation);
+      const branchFact = compactStructure(entry.branchFact);
+      output.push({
+        index: entry.index,
+        entryId: bounded(entry.entryId),
+        parentId: bounded(entry.parentId),
+        type: bounded(entry.type),
+        role: bounded(entry.role),
+        timestamp: entry.timestamp,
+        isError: entry.isError,
+        ...(anchorIndex !== null ? { anchor: entry.index === anchorIndex } : {}),
+        text: chunk,
+        textRange: {
+          start: currentTextOffset,
+          end,
+          total: entry.text.length,
+          complete: textComplete,
+        },
+        ...(entry.parentEntryId !== undefined ? { parentEntryId: bounded(entry.parentEntryId) } : {}),
+        ...(entry.operationAddress ? { operationAddress: bounded(entry.operationAddress) } : {}),
+        ...(entry.toolName ? { tool: bounded(entry.toolName) } : {}),
+        ...(entry.ref ? { ref: bounded(entry.ref) } : {}),
+        ...(entry.provider ? { provider: bounded(entry.provider) } : {}),
+        ...(entry.action ? { action: bounded(entry.action) } : {}),
+        ...(entry.outcome ? { outcome: entry.outcome } : {}),
+        ...(entry.filesTouched
+          ? { filesTouched: entry.filesTouched.slice(0, 20).map((file) => bounded(file, 1_024)) }
+          : {}),
+        ...(operation !== undefined ? { operation } : {}),
+        ...(branchFact !== undefined ? { branchFact } : {}),
+        ...((entry.operation !== undefined && operation === undefined) ||
+            (entry.branchFact !== undefined && branchFact === undefined)
+          ? { structuredTruncated: true }
+          : {}),
+        ...(entry.factAddress ? { factAddress: bounded(entry.factAddress) } : {}),
+        ...(entry.carrierEntryId ? { carrierEntryId: bounded(entry.carrierEntryId) } : {}),
+        ...(entry.carrierParentId !== undefined ? { carrierParentId: bounded(entry.carrierParentId) } : {}),
+        ...(entry.carrierFromId !== undefined ? { carrierFromId: bounded(entry.carrierFromId) } : {}),
+      });
+      remainingChars -= chunk.length;
+      if (!textComplete) {
+        currentTextOffset = end;
+        cursors.push({ position, textOffset: currentTextOffset });
+        break;
+      }
+      position += 1;
+      currentTextOffset = 0;
+      cursors.push({ position, textOffset: 0 });
+    }
+
+    const responseAt = (
+      records: Array<Record<string, unknown>>,
+      cursor: { position: number; textOffset: number },
+    ): Record<string, unknown> => {
+      const hasNext = cursor.position < selected.length;
+      const nextArgs = hasNext
+        ? {
+            session: ref.file,
+            expectedSourceHash: finalState.sourceHash,
+            expectedLineageFingerprint: finalLineage.fingerprint,
+            branches,
+            ...canonicalSelection,
+            entryOffset: cursor.position,
+            ...(cursor.textOffset > 0 ? { textOffset: cursor.textOffset } : {}),
+            maxChars,
+            maxEntries,
+          }
+        : null;
       return {
         session: ref.file,
         sourceHash: finalState.sourceHash,
         branches,
         lineageFingerprint: finalLineage.fingerprint,
-        error: expansion.error,
-        expanded: [],
+        entryCount,
+        entries: records,
+        next: nextArgs ? { ref: "memory.expand", args: nextArgs } : null,
       };
-    }
-    return {
-      session: ref.file,
-      sourceHash: finalState.sourceHash,
-      branches,
-      lineageFingerprint: finalLineage.fingerprint,
-      expanded: expansion.expanded,
     };
+
+    let cursor = { position, textOffset: currentTextOffset };
+    let response = responseAt(output, cursor);
+    while (output.length > 1 && JSON.stringify(response).length > RECALL_MAX_RESPONSE_CHARS) {
+      output.pop();
+      cursors.pop();
+      cursor = cursors.at(-1) ?? { position: entryOffset, textOffset };
+      response = responseAt(output, cursor);
+    }
+    if (output.length === 1 && JSON.stringify(response).length > RECALL_MAX_RESPONSE_CHARS) {
+      const record = output[0]!;
+      const range = record.textRange as { start: number; end: number; total: number; complete: boolean };
+      const chunk = record.text as string;
+      const excess = JSON.stringify(response).length - RECALL_MAX_RESPONSE_CHARS;
+      let keep = Math.max(1, chunk.length - excess - 256);
+      if (
+        keep < chunk.length &&
+        keep > 0 &&
+        chunk.charCodeAt(keep) >= 0xdc00 &&
+        chunk.charCodeAt(keep) <= 0xdfff
+      ) {
+        keep -= 1;
+      }
+      if (keep > 0 && keep < chunk.length) {
+        record.text = chunk.slice(0, keep);
+        range.end = range.start + keep;
+        range.complete = false;
+        cursor = { position: entryOffset, textOffset: range.end };
+        response = responseAt(output, cursor);
+      }
+      if (JSON.stringify(response).length > RECALL_MAX_RESPONSE_CHARS) {
+        delete record.operation;
+        delete record.branchFact;
+        if (Array.isArray(record.filesTouched)) {
+          record.filesTouched = record.filesTouched.slice(0, 4).map((file) => bounded(String(file), 256));
+        }
+        record.structuredTruncated = true;
+        response = responseAt(output, cursor);
+      }
+      if (JSON.stringify(response).length > RECALL_MAX_RESPONSE_CHARS) {
+        const current = String(record.text);
+        const firstCodePointChars = (current.codePointAt(0) ?? 0) > 0xffff ? 2 : 1;
+        const minimalText = current.slice(0, Math.min(current.length, firstCodePointChars));
+        const minimalRange = record.textRange as { start: number; end: number; total: number; complete: boolean };
+        minimalRange.end = minimalRange.start + minimalText.length;
+        minimalRange.complete = minimalRange.end >= minimalRange.total;
+        output[0] = {
+          index: record.index,
+          entryId: record.entryId,
+          parentId: record.parentId,
+          type: record.type,
+          role: record.role,
+          timestamp: record.timestamp,
+          isError: record.isError,
+          ...(record.anchor !== undefined ? { anchor: record.anchor } : {}),
+          text: minimalText,
+          textRange: minimalRange,
+          structuredTruncated: true,
+        };
+        cursor = minimalRange.complete
+          ? { position: entryOffset + 1, textOffset: 0 }
+          : { position: entryOffset, textOffset: minimalRange.end };
+        response = responseAt(output, cursor);
+      }
+    }
+    return response;
   }
 
   private async sessions(args: Record<string, unknown>): Promise<unknown> {

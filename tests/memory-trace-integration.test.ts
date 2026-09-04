@@ -162,8 +162,8 @@ describe("memory Fabric trace records", () => {
       "expand",
       { session: file, operationAddresses: ["e2/7"] },
       invocation(cwd),
-    ) as { expanded: Array<{ operationAddress?: string; ref?: string }> };
-    expect(providerExpanded.expanded).toMatchObject([{ operationAddress: "e2/7", ref: "agents.run" }]);
+    ) as { entries: Array<{ operationAddress?: string; ref?: string; tool?: string }> };
+    expect(providerExpanded.entries).toMatchObject([{ operationAddress: "e2/7", ref: "agents.run", tool: "run" }]);
   });
 
 
@@ -208,44 +208,40 @@ describe("memory Fabric trace records", () => {
       { scope: "project", branches: "all", ref: "agents.run" },
       invocation(cwd),
     ) as {
-      matchMode: string;
-      structuralFilters: Record<string, unknown>;
-      digestHits: Array<{
-        sessionFile: string;
-        sourceHash: string;
-        lineageFingerprint: string;
+      total: number;
+      hits: Array<{
         matchedStructuralEntries: number;
+        follow: { ref: string; args: Record<string, unknown> };
       }>;
-      text: string;
     };
-    expect(pointer.matchMode).toBe("structural");
-    expect(pointer.structuralFilters).toEqual({ ref: "agents.run" });
-    expect(pointer.digestHits).toHaveLength(1);
-    expect(pointer.digestHits[0]!.matchedStructuralEntries).toBe(1);
-    expect(pointer.text).toContain("selected by exact filters");
+    expect(pointer.total).toBe(1);
+    expect(pointer.hits).toHaveLength(1);
+    expect(pointer.hits[0]!.matchedStructuralEntries).toBe(1);
+    expect(pointer.hits[0]!.follow.ref).toBe("memory.recall");
 
     const hydrated = await provider.invoke(
       "recall",
-      {
-        scope: `session:${pointer.digestHits[0]!.sessionFile}`,
-        branches: "all",
-        expectedSourceHash: pointer.digestHits[0]!.sourceHash,
-        expectedLineageFingerprint: pointer.digestHits[0]!.lineageFingerprint,
-        ref: "agents.run",
-      },
+      pointer.hits[0]!.follow.args,
       invocation(cwd),
-    ) as { matchMode: string; segments: Array<{ exactMatches: Array<{ operationAddress: string }> }> };
-    expect(hydrated.matchMode).toBe("structural");
-    expect(hydrated.segments.flatMap((segment) => segment.exactMatches))
-      .toEqual([{ index: expect.any(Number), entryId: "e2/7", operationAddress: "e2/7" }]);
+    ) as { hits: Array<{ index: number; entryId: string; operationAddress: string }> };
+    expect(hydrated.hits).toEqual([expect.objectContaining({
+      kind: "entry",
+      entryId: "e2/7",
+      operationAddress: "e2/7",
+      ref: "agents.run",
+      provider: "agents",
+      action: "run",
+      outcome: "succeeded",
+      follow: expect.objectContaining({ ref: "memory.expand" }),
+    })]);
 
     const absent = await provider.invoke(
       "recall",
       { scope: "project", branches: "all", ref: "pi.grep" },
       invocation(cwd),
-    ) as { matchedCount: number; text: string };
-    expect(absent.matchedCount).toBe(0);
-    expect(absent.text).toContain("No invocations selected by exact structural filters");
+    ) as { total: number; hits: unknown[] };
+    expect(absent.total).toBe(0);
+    expect(absent.hits).toEqual([]);
   });
 
   it("ignores malformed and unknown trace versions instead of adapting audits", () => {

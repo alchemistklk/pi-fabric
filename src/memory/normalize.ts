@@ -725,6 +725,11 @@ export interface ExpandSessionSelection {
 export interface ExpandedSessionEntry {
   index: number;
   entryId: string | null;
+  parentId: string | null;
+  type: string;
+  role: string | null;
+  timestamp: number | null;
+  isError: boolean;
   text: string;
   parentEntryId?: string | null;
   operationAddress?: string;
@@ -763,6 +768,11 @@ export const expandSessionEntries = (
     .map((entry) => ({
       index: entry.index,
       entryId: entry.entryId,
+      parentId: entry.parentId,
+      type: entry.type,
+      role: entry.role,
+      timestamp: entry.timestamp,
+      isError: entry.isError,
       text: entry.text,
       ...(entry.parentEntryId !== undefined ? { parentEntryId: entry.parentEntryId } : {}),
       ...(entry.operationAddress ? { operationAddress: entry.operationAddress } : {}),

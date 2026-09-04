@@ -211,6 +211,154 @@ return Promise.all([
     ]);
   });
 
+
+  it("walks normalized memory in guest code with chunk reassembly and early stop", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const result = await new QuickJsRuntime().execute(
+      `
+const entries = [];
+const walk = await memory.walk(
+  { session: "session", branches: "all", maxChars: 3 },
+  async (entry, index) => {
+    const current = await state.get();
+    entries.push({
+      stateHead: current.head,
+      index: entry.index,
+      visitorIndex: index,
+      parentId: entry.parentId,
+      tool: entry.tool,
+      text: entry.text,
+      textRange: entry.textRange,
+    });
+    return index === 0;
+  },
+);
+return { entries, walk };
+`,
+      async (ref, args) => {
+        if (ref === "state.get") return { head: "nested" };
+        expect(ref).toBe("memory.expand");
+        calls.push(args);
+        if (calls.length === 1) {
+          return {
+            session: "/tmp/session.jsonl",
+            sourceHash: "source-1",
+            lineageFingerprint: "lineage-1",
+            branches: "all",
+            entryCount: 3,
+            entries: [],
+            next: null,
+          };
+        }
+        if (calls.length === 2) {
+          expect(args).toEqual(expect.objectContaining({
+            session: "/tmp/session.jsonl",
+            expectedSourceHash: "source-1",
+            expectedLineageFingerprint: "lineage-1",
+            entryRange: { first: 0, last: 2 },
+          }));
+          return {
+            entries: [{
+              index: 0,
+              entryId: "e0",
+              parentId: null,
+              type: "message",
+              role: "assistant",
+              timestamp: 1,
+              isError: false,
+              tool: "read",
+              text: "hel",
+              textRange: { start: 0, end: 3, total: 5, complete: false },
+            }],
+            next: {
+              ref: "memory.expand",
+              args: {
+                session: "/tmp/session.jsonl",
+                expectedSourceHash: "source-1",
+                expectedLineageFingerprint: "lineage-1",
+                branches: "all",
+                entryRange: { first: 0, last: 2 },
+                entryOffset: 0,
+                textOffset: 3,
+              },
+            },
+          };
+        }
+        if (calls.length === 3) {
+          return {
+            entries: [
+              {
+                index: 0,
+                entryId: "e0",
+                parentId: null,
+                type: "message",
+                role: "assistant",
+                timestamp: 1,
+                isError: false,
+                tool: "read",
+                text: "lo",
+                textRange: { start: 3, end: 5, total: 5, complete: true },
+              },
+              {
+                index: 1,
+                entryId: "e1",
+                parentId: "e0",
+                type: "message",
+                role: "toolResult",
+                timestamp: 2,
+                isError: false,
+                tool: "read",
+                text: "world",
+                textRange: { start: 0, end: 5, total: 5, complete: true },
+              },
+            ],
+            next: {
+              ref: "memory.expand",
+              args: { session: "/tmp/session.jsonl", entryRange: { first: 0, last: 2 }, entryOffset: 2 },
+            },
+          };
+        }
+        throw new Error("memory.walk ignored early termination");
+      },
+      options,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({
+      entries: [
+        {
+          stateHead: "nested",
+          index: 0,
+          visitorIndex: 0,
+          parentId: null,
+          tool: "read",
+          text: "hello",
+          textRange: { start: 0, end: 5, total: 5, complete: true },
+        },
+        {
+          stateHead: "nested",
+          index: 1,
+          visitorIndex: 1,
+          parentId: "e0",
+          tool: "read",
+          text: "world",
+          textRange: { start: 0, end: 5, total: 5, complete: true },
+        },
+      ],
+      walk: { visited: 2, stopped: true },
+    });
+    expect(calls).toHaveLength(3);
+  });
+
+  it("rejects a partial-entry memory.walk start", async () => {
+    const result = await new QuickJsRuntime().execute(
+      'return memory.walk({ session: "session", indices: [1], textOffset: 2 }, () => {});',
+      async () => { throw new Error("host call should not run"); },
+      options,
+    );
+    expect(result.error).toContain("must start at text offset 0");
+  });
+
   it("routes JavaScript-safe MCP aliases through the direct MCP proxy", async () => {
     const result = await new QuickJsRuntime().execute(
       'return mcp.fal_ai.get_model_schema({ endpoint_id: "openai/gpt-image-2" });',

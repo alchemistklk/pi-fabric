@@ -61,8 +61,9 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 
 | Call | Resolves to |
 |------|-------------|
-| `memory.recall(args?)` | `{scope?,branches?,query?,queryMode?,matchMode?,structuralFilters?,matchedCount?,totalMatches?,totalItems?,segmentCount?,segments?,digestHits?,items?,page?,pageSize?,hasNext?,coverage?,text?,error?}` |
-| `memory.expand(args)` | `{session?,sourceHash?,branches?,lineageFingerprint?,expanded?:unknown[],error?}` |
+| `memory.recall(args?)` | `{total,hits:MemoryRecallHit[],next:{ref:"memory.recall",args}|null,coverage:MemoryCoverage,error?}` |
+| `memory.expand(args)` | `{session?,sourceHash?,branches?,lineageFingerprint?,entryCount?,entries:ExpandedSessionEntry[],next?:{ref:"memory.expand",args}|null,error?}` |
+| `memory.walk(args, visitor)` | `{visited,stopped,error?}`; guest-local paging and full-entry reassembly over `memory.expand` |
 | `memory.sessions(args?)` | `{scope?,branches?,sessions?:SessionInfo[],error?}`; slice `result.sessions ?? []`, not the wrapper |
 | `state.transition(args)` | `{event:FabricMeshEvent,head:unknown}` |
 | `state.get()` | `{head,goal,complexity,certification,recentLabels:string[]}` |
@@ -84,11 +85,13 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `compact.status()` | `{pending?:CompactIntent,last?:{at,requestedBy,status,summary?,tokensBefore?,estimatedTokensAfter?,error?}}` |
 | `compact.cancel()` | `{cancelled:true}` |
 
-`memory.recall` structural filters (`ref`, `provider`, `action`, `outcome`) use exact persisted trace fields. With no `query`, `matchMode` is `"structural"`; with a lexical/regex query it is `"combined"`. Use `tools.catalog()`/`tools.search()` only to choose a current action head—catalog descriptions are navigation metadata and never become session evidence.
+`memory.recall` multi-term literal queries default to ranked `queryMatch: "any"` so wording differences do not hide evidence; use `"all"` to require every canonical term in one indexed entry, and `queryMode: "phrase"` when adjacency matters. Results are hard-bounded either way. Structural filters (`ref`, `provider`, `action`, `outcome`) use exact persisted trace fields. Use `tools.catalog()`/`tools.search()` only to choose a current action head—catalog descriptions are navigation metadata and never become session evidence.
 
-`memory.expand(args)` requires `session` (a `SessionInfo.id` or `.file` round-trips) plus a selector: `indices`, `entryIds`, `operationAddresses`, or `entryRange:{first,last}` — get them from `memory.recall` hits; expansion has no before/after window argument. `memory.sessions` accepts an optional `limit`.
+Recall returns one bounded flat hit stream. Every hit has the same copy-ready `{ref,args}` field: `await tools.call(hit.follow)` expands an entry or resolves a cold session. Continue any result with `await tools.call(result.next)` when `next !== null`; `total` is the retained pre-page hit count. Do not locate or parse Pi session JSONL yourself: follow calls, integrity bindings, and continuations are the supported retrieval API.
 
-Stable-provider arguments normalize near-miss spellings the way `pi.*` does: known aliases and casing/singular variants repair to the canonical key, numeric strings coerce for numeric fields, and scope spellings such as `cwd` repair to `project`. Unknown keys are never silently ignored—they fail validation with the offending property path named (e.g. `/before: must NOT have additional properties`).
+`memory.expand(args)` requires `session` plus a selector: `indices`, `entryIds`, `operationAddresses`, or `entryRange:{first,last}`. Optional `before`/`after` add adjacent entries. It returns normalized records in `entries`, with one uniform `tool` field and Pi `parentId` links. Long entries use lossless `textRange` chunks. For arbitrary filter/map/reduce/join/traversal work, use guest-local `memory.walk(args, async (entry, index) => { ... })`: it follows every expansion page, reassembles complete entries, awaits nested tool calls, and stops early when the visitor returns `false`. `memory.sessions` accepts an optional `limit`.
+
+Stable-provider arguments normalize near-miss spellings the way `pi.*` does: known aliases and casing/singular variants repair to the canonical key, numeric strings coerce for numeric fields, and scope spellings such as `cwd` repair to `project`. Unknown keys are never silently ignored—they fail validation with the offending property path named (e.g. `/befroe: must NOT have additional properties`).
 
 `SessionInfo` is `{id,file,cwd,mtime,entryCount,tier:"hot"|"cold",branches,lineageFingerprint}`. Memory failures are returned in `error: {code,message,...}`; ambiguous-session failures may return only `{error}`. Check `error` before relying on optional success fields.
 

@@ -438,14 +438,152 @@ globalThis["π"] = new Proxy(__piStrings, {
 // their known actions typed while the registry remains the runtime authority.
 // extensions' per-tool surface is additionally rendered from the captured
 // catalog by guestTypeDeclarations (runtime/dynamic-guest-types.ts).
-const __providerProxy = (provider) => new Proxy({}, {
-  get(_target, property) {
+const __memorySelectionKeys = [
+  "indices",
+  "entryIds",
+  "operationAddresses",
+  "entryRange",
+  "index",
+  "entry_ids",
+  "operation_addresses",
+  "entry_range",
+];
+const __hasMemorySelection = (args) => __memorySelectionKeys.some((key) => {
+  const value = args[key];
+  if (Array.isArray(value)) return value.length > 0;
+  return value !== undefined && value !== null;
+});
+const __memoryWalk = async (args, visitor) => {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new TypeError("memory.walk expects an expansion options object");
+  }
+  if (typeof visitor !== "function") {
+    throw new TypeError("memory.walk expects a visitor function as its second argument");
+  }
+
+  let request = { ...args };
+  if (Number(request.textOffset ?? request.text_offset ?? 0) !== 0) {
+    throw new TypeError("memory.walk must start at text offset 0 to yield complete entries");
+  }
+  if (!__hasMemorySelection(request)) {
+    if (request.entryOffset !== undefined || request.entry_offset !== undefined ||
+        request.textOffset !== undefined || request.text_offset !== undefined) {
+      throw new TypeError("memory.walk continuation offsets require an explicit selection");
+    }
+    if (Number(request.before ?? 0) > 0 || Number(request.after ?? 0) > 0) {
+      throw new TypeError("memory.walk before/after requires an explicit selection");
+    }
+    const head = await __call("memory.expand", request);
+    if (!head || typeof head !== "object") {
+      throw new Error("memory.expand returned an invalid metadata response");
+    }
+    if (head.error) return { visited: 0, stopped: false, error: head.error };
+    if (!Number.isSafeInteger(head.entryCount) || head.entryCount < 0) {
+      throw new Error("memory.expand metadata omitted a valid entryCount");
+    }
+    if (head.entryCount === 0) return { visited: 0, stopped: false };
+    request = {
+      ...request,
+      session: head.session ?? request.session,
+      expectedSourceHash: head.sourceHash,
+      expectedLineageFingerprint: head.lineageFingerprint,
+      branches: head.branches,
+      entryRange: { first: 0, last: head.entryCount - 1 },
+    };
+  }
+
+  let visited = 0;
+  let pending = null;
+  let pendingStart = 0;
+  let pendingEnd = 0;
+  let pendingTotal = 0;
+  const seen = new Set([JSON.stringify({ ref: "memory.expand", args: request })]);
+  let page = await __call("memory.expand", request);
+
+  while (true) {
+    if (!page || typeof page !== "object") {
+      throw new Error("memory.expand returned an invalid page");
+    }
+    if (page.error) return { visited, stopped: false, error: page.error };
+    if (!Array.isArray(page.entries)) {
+      throw new Error("memory.expand page omitted entries");
+    }
+
+    for (const chunk of page.entries) {
+      if (!chunk || typeof chunk !== "object" || typeof chunk.text !== "string") {
+        throw new Error("memory.expand returned an invalid entry chunk");
+      }
+      const range = chunk.textRange;
+      if (!range || typeof range !== "object" ||
+          !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) ||
+          !Number.isSafeInteger(range.total) || range.start < 0 ||
+          range.end < range.start || range.total < range.end) {
+        throw new Error("memory.expand returned an invalid textRange");
+      }
+      if (chunk.text.length !== range.end - range.start) {
+        throw new Error("memory.expand entry chunk disagrees with textRange");
+      }
+
+      if (pending === null) {
+        pending = { ...chunk, text: "" };
+        pendingStart = range.start;
+        pendingEnd = range.start;
+        pendingTotal = range.total;
+      } else if (pending.index !== chunk.index) {
+        throw new Error("memory.expand advanced before completing an entry");
+      }
+      if (range.start !== pendingEnd || range.total !== pendingTotal) {
+        throw new Error("memory.expand returned discontinuous entry chunks");
+      }
+      for (const key of Object.keys(chunk)) {
+        if (pending[key] === undefined) pending[key] = chunk[key];
+      }
+      pending.text += chunk.text;
+      pendingEnd = range.end;
+
+      if (range.complete) {
+        pending.textRange = {
+          start: pendingStart,
+          end: pendingEnd,
+          total: pendingTotal,
+          complete: true,
+        };
+        const entry = pending;
+        pending = null;
+        const keepGoing = await visitor(entry, visited);
+        visited += 1;
+        if (keepGoing === false) return { visited, stopped: true };
+      }
+    }
+
+    if (page.next === null || page.next === undefined) {
+      if (pending !== null) {
+        throw new Error("memory.expand ended before completing an entry");
+      }
+      return { visited, stopped: false };
+    }
+    if (page.next.ref !== "memory.expand" || !page.next.args ||
+        typeof page.next.args !== "object" || Array.isArray(page.next.args)) {
+      throw new Error("memory.expand returned an invalid continuation");
+    }
+    const continuationKey = JSON.stringify(page.next);
+    if (seen.has(continuationKey)) {
+      throw new Error("memory.expand returned a cyclic continuation");
+    }
+    seen.add(continuationKey);
+    page = await __call(page.next.ref, page.next.args);
+  }
+};
+
+const __providerProxy = (provider, local = {}) => new Proxy(local, {
+  get(target, property) {
     if (property === "then" || typeof property === "symbol") return undefined;
+    if (Object.prototype.hasOwnProperty.call(target, property)) return target[property];
     return (args = {}) => __call(provider + "." + String(property), args);
   },
 });
 globalThis.extensions = __providerProxy("extensions");
-globalThis.memory = __providerProxy("memory");
+globalThis.memory = __providerProxy("memory", { walk: __memoryWalk });
 globalThis.state = __providerProxy("state");
 globalThis.schema = __providerProxy("schema");
 globalThis.components = __providerProxy("components");

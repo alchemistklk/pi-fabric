@@ -34,7 +34,7 @@ const ACTION_SYNONYM_CLASSES: ReadonlyArray<ReadonlyArray<string>> = [
   // memory.recall and its spilled search verbs.
   ["recall", "search", "find", "query", "lookup", "grep", "scan", "locate"],
   // memory.expand / read-one-entry verbs.
-  ["expand", "get", "read", "fetch", "load", "view", "show", "hydrate"],
+  ["expand", "get", "read", "fetch", "load", "view", "show"],
   // memory.sessions and list-style catalog reads.
   ["sessions", "list", "ls", "enumerate", "index"],
   // state.transition / mesh.put write verbs.
