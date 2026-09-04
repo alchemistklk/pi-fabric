@@ -1,4 +1,4 @@
-import { ActorManager } from "../actors/manager.js";
+import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent } from "../actors/types.js";
 import type {
@@ -1088,38 +1088,7 @@ export class AgentsProvider implements FabricProvider {
           return this.globalActors.create(actorRequest(createArgs, context, this.manager, false));
         }
         const request = actorRequest(createArgs, context, this.manager);
-        if (request.residency === "durable" && !this.residency) {
-          const client = this.#residentActorClient();
-          const actor = await client.createActor(request);
-          context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
-          return actor;
-        }
-        if (request.residency === "durable") {
-          await this.#resident().ensureHost();
-          let actor: Awaited<ReturnType<ActorManager["create"]>>;
-          try {
-            actor = await this.actorManager.create(request);
-            if (actor.residency === "durable") await this.#activateDurableActor(actor);
-          } catch (error) {
-            if (
-              !(error instanceof Error) ||
-              !error.message.includes("registry is owned by another host")
-            ) {
-              throw error;
-            }
-            // The registry already transferred to the resident host (a prior
-            // durable was created and ceded to it). Route the authoritative
-            // create over the residency file protocol instead of failing:
-            // the resident host creates it as the registry owner.
-            const config = this.#resident().options.config;
-            const client = new ResidentActorClient(config.meshRoot, config.rootId);
-            actor = await client.createActor(request);
-          }
-          this.participants.scheduleRefresh();
-          context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
-          return actor;
-        }
-        const actor = await this.actorManager.create(request);
+        const actor = await this.#createActor(request);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1300,9 +1269,8 @@ export class AgentsProvider implements FabricProvider {
         const as =
           typeof args.as === "string" && args.as.trim() ? args.as.trim() : undefined;
         const request = this.globalActors.toRequest(def, as);
-        if (request.residency === "durable") await this.#resident().ensureHost();
-        const actor = await this.actorManager.create(request);
-        if (actor.residency === "durable") await this.#activateDurableActor(actor);
+        const actor = await this.#createActor(request);
+        this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
       }
@@ -1608,6 +1576,22 @@ export class AgentsProvider implements FabricProvider {
       ...(actor ? { actor } : {}),
       ...(participant?.kind === "actor" ? { participant } : {}),
     };
+  }
+
+  async #createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+    if (request.residency !== "durable") return this.actorManager.create(request);
+    if (!this.residency) return this.#residentActorClient().createActor(request);
+
+    await this.residency.ensureHost();
+    let actor: FabricActorInfo;
+    try {
+      actor = await this.actorManager.create(request);
+    } catch (error) {
+      if (!(error instanceof ActorRegistryOwnershipError)) throw error;
+      return this.residency.createActor(request);
+    }
+    await this.#activateDurableActor(actor);
+    return actor;
   }
 
   #residentActorClient(): ResidentActorClient {

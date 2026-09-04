@@ -465,8 +465,48 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     await state.participants.close();
   });
 
-  it("creates multiple durable actors through nested recruitment", { timeout: 45_000 }, async () => {
+  it("creates durable actors through root and nested owner channels while Main owns the registry", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-recruitment");
+    const agents = new AgentManager(repo, state.config.agents, {
+      workerPath: fakeWorker,
+      runRoot: path.join(state.root, "recruitment-runs"),
+      mainAgentId: state.identity.id,
+      meshRoot: state.config.meshRoot,
+      projectRoot: repo,
+      hostId: state.identity.id,
+      identityId: state.identity.id,
+    });
+    const canManage = (id: string): boolean | undefined => {
+      const participant = state.participants.get(id);
+      return participant ? participant.ownerHostId === state.identity.id : undefined;
+    };
+    const actors = new ActorManager(
+      state.config.sessionId,
+      state.identity,
+      state.mesh,
+      state.meshConfig,
+      agents,
+      () => {},
+      {
+        actorRoot: state.config.actorRoot,
+        persistent: true,
+        canManageActor: canManage,
+        claimResidency: "session",
+        rootId: state.identity.id,
+      },
+    );
+    state.participants.registerSource(() =>
+      actors.listOwned().map((actor) =>
+        actorParticipantRecord(
+          actor,
+          state.identity.id,
+          state.identity.id,
+          state.identity.id,
+          state.identity.id,
+        ),
+      ),
+    );
+    actors.subscribe(() => state.participants.scheduleRefresh());
     const client = new ResidencyClient({
       config: state.config,
       mesh: state.mesh,
@@ -474,40 +514,53 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       mainAgent: state.mainAgent,
       hostPath,
     });
-    const bootstrap = await client.spawnAgent({
-      task: "Start the resident host.",
-      name: "recruitment-bootstrap",
-      residency: "durable",
-    });
-    const recruitment = new ResidentActorClient(
-      state.config.meshRoot,
-      state.identity.id,
-    );
 
-    const actors = await Promise.all([
-      recruitment.createActor({
+    try {
+      const mainOwned = await actors.create({
+        name: "main registry owner",
+        instructions: "Keep the local registry guarded.",
+        residency: "session",
+      });
+      await state.participants.refresh();
+      expect(state.participants.get(mainOwned.id)?.ownerHostId).toBe(state.identity.id);
+
+      const first = await client.createActor({
         name: "recruited architect",
         instructions: "Design the bounded change.",
         residency: "durable",
-      }),
-      recruitment.createActor({
+      });
+      expect(state.participants.get(first.id)).toMatchObject({
+        ownerHostId: client.hostId,
+        residency: "durable",
+      });
+
+      const recruitment = new ResidentActorClient(
+        state.config.meshRoot,
+        state.identity.id,
+      );
+      const second = await recruitment.createActor({
         name: "recruited advisor",
         instructions: "Challenge the design.",
         residency: "durable",
-      }),
-    ]);
+      });
+      await waitFor(() => state.participants.get(second.id)?.ownerHostId === client.hostId);
 
-    expect(actors.map((actor) => actor.name).sort()).toEqual([
-      "recruited advisor",
-      "recruited architect",
-    ]);
-    expect(actors.every((actor) => actor.residency === "durable")).toBe(true);
-    expect(new Set(actors.map((actor) => actor.sessionFile)).size).toBe(2);
+      const residentActors = [first, second];
+      expect(residentActors.map((actor) => actor.name).sort()).toEqual([
+        "recruited advisor",
+        "recruited architect",
+      ]);
+      expect(residentActors.every((actor) => actor.residency === "durable")).toBe(true);
+      expect(new Set(residentActors.map((actor) => actor.sessionFile)).size).toBe(2);
 
-    for (const actor of actors) await client.removeActor(actor.id);
-    await client.cleanupAgent(bootstrap.id);
-    await client.close();
-    await state.participants.close();
+      for (const actor of residentActors) await client.removeActor(actor.id);
+      await actors.remove(mainOwned.id);
+    } finally {
+      await client.close();
+      await actors.close();
+      await agents.close();
+      await state.participants.close();
+    }
   });
 
   it("applies live model guidance snapshots to durable participants", { timeout: 45_000 }, async () => {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -508,7 +508,7 @@ describe("ActorManager", () => {
     expect(() => peer.tell(actor.id, "blocked")).toThrow("owned by another host");
     await expect(
       peer.create({ name: "blocked-create", instructions: "Should fail." }),
-    ).rejects.toThrow("registry is owned by another host");
+    ).rejects.toThrow(ActorRegistryOwnershipError);
   });
 
   it("creates via the registry-owner channel while a live foreign actor holds the registry", async () => {
@@ -546,9 +546,20 @@ describe("ActorManager", () => {
     await expect(
       peer.create({ name: "blocked", instructions: "Guard stays for plain callers." }),
     ).rejects.toThrow("registry is owned by another host");
-    // The resident host control channel creates as the registry owner.
+    // The bypass cannot be used for a session-scoped actor.
+    await expect(
+      peer.create(
+        { name: "blocked-session", instructions: "Keep session creation guarded." },
+        { asRegistryOwner: true },
+      ),
+    ).rejects.toThrow(ActorRegistryOwnershipError);
+    // The resident host control channel creates a durable as registry owner.
     const created = await peer.create(
-      { name: "via-owner-channel", instructions: "Created as the registry owner." },
+      {
+        name: "via-owner-channel",
+        instructions: "Created as the registry owner.",
+        residency: "durable",
+      },
       { asRegistryOwner: true },
     );
     expect(created.name).toBe("via-owner-channel");

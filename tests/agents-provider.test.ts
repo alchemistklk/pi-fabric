@@ -4,7 +4,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
-import type { FabricActorRequest } from "../src/actors/types.js";
+import type { FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type {
@@ -25,7 +25,6 @@ import type {
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
-import { RESIDENT_HOST_FORMAT, residentRoot } from "../src/residency/protocol.js";
 import type { ResidencyClient } from "../src/residency/client.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -374,10 +373,8 @@ describe("AgentsProvider runner support", () => {
     expect(actors.list()).toEqual([]);
   });
 
-  it("routes a durable create through the resident host when the local registry is already owned", async () => {
+  it("routes durable creates and imports when the local registry is already owned", async () => {
     const state = setup();
-    const rootId = state.identity.id;
-    const meshRoot = state.mesh.root;
     // Simulate the transferred registry: a live foreign actor over the shared
     // registry makes the local manager's create guard throw.
     const peerIdentity: MeshIdentity = {
@@ -426,35 +423,31 @@ describe("AgentsProvider runner support", () => {
     actorManagers.push(guardedActors);
     await waitFor(() => guardedActors.list().some((entry) => entry.id === foreign.id));
 
-    // Fake resident host over the real file protocol.
-    const hostDir = residentRoot(meshRoot, rootId);
-    fs.mkdirSync(path.join(hostDir, "responses"), { recursive: true });
-    fs.writeFileSync(path.join(hostDir, "owner.json"), JSON.stringify({ pid: process.pid }));
-    const seen: Array<{ operation?: string; requestId: string }> = [];
-    const poller = setInterval(() => {
-      for (const file of fs.readdirSync(path.join(hostDir, "requests"))) {
-        if (!file.endsWith(".json")) continue;
-        const command = JSON.parse(
-          fs.readFileSync(path.join(hostDir, "requests", file), "utf8"),
-        ) as { operation?: string; requestId: string };
-        if (seen.some((item) => item.requestId === command.requestId)) continue;
-        seen.push(command);
-        fs.writeFileSync(
-          path.join(hostDir, "responses", file),
-          JSON.stringify({
-            format: RESIDENT_HOST_FORMAT,
-            requestId: command.requestId,
-            ok: true,
-            actor: { id: "resident-actor-1", name: "second-durable", status: "idle" },
-            completedAt: Date.now(),
-          }),
-        );
-      }
-    }, 25);
-
+    let sequence = 0;
+    const createActor = vi.fn(async (request: FabricActorRequest): Promise<FabricActorInfo> => {
+      const now = Date.now();
+      sequence += 1;
+      return {
+        id: `resident-actor-${sequence}`,
+        name: request.name,
+        status: "idle",
+        runner: request.runner ?? "pi",
+        events: request.events ?? [],
+        topics: request.topics ?? [],
+        delivery: request.delivery ?? "mailbox",
+        responseMode: request.responseMode ?? "text",
+        triggerTurn: request.triggerTurn ?? false,
+        coalesce: request.coalesce ?? true,
+        residency: "durable",
+        queued: 0,
+        messages: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
     const residency = {
-      ensureHost: async () => {},
-      options: { config: { meshRoot, rootId } },
+      ensureHost: vi.fn(async () => undefined),
+      createActor,
     } as unknown as ResidencyClient;
     const provider = new AgentsProvider(
       state.agents,
@@ -470,21 +463,78 @@ describe("AgentsProvider runner support", () => {
       () => DEFAULT_FABRIC_CONFIG.models,
     );
 
-    try {
-      const actor = (await provider.invoke(
+    const created = (await provider.invoke(
+      "create",
+      {
+        name: "second-durable",
+        instructions: "Created via the resident host.",
+        residency: "durable",
+      },
+      context,
+    )) as FabricActorInfo;
+    state.globalActors.create({
+      name: "durable-template",
+      instructions: "Imported via the resident host.",
+      residency: "durable",
+    });
+    const imported = (await provider.invoke(
+      "import",
+      { name: "durable-template" },
+      context,
+    )) as FabricActorInfo;
+
+    expect(created).toMatchObject({ id: "resident-actor-1", name: "second-durable" });
+    expect(imported).toMatchObject({ id: "resident-actor-2", name: "durable-template" });
+    expect(createActor).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ name: "second-durable", residency: "durable" }),
+    );
+    expect(createActor).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ name: "durable-template", residency: "durable" }),
+    );
+  });
+
+  it("does not reroute a failed local durable activation", async () => {
+    const state = setup();
+    const activationError = new Error(
+      "Fabric actor registry is owned by another host after local creation",
+    );
+    const createActor = vi.fn();
+    const residency = {
+      ensureHost: vi.fn(async () => undefined),
+      ensureActor: vi.fn(async () => {
+        throw activationError;
+      }),
+      removeActor: vi.fn(async () => ({ removed: true })),
+      createActor,
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(
+      state.agents,
+      state.actors,
+      state.globalActors,
+      state.mainAgent,
+      state.participants,
+      state.control,
+      state.lifecycle,
+      undefined,
+      residency,
+      undefined,
+      () => DEFAULT_FABRIC_CONFIG.models,
+    );
+
+    await expect(
+      provider.invoke(
         "create",
-        { name: "second-durable", instructions: "Created via the resident host.", residency: "durable" },
+        {
+          name: "activation-failure",
+          instructions: "Do not reroute this failed transfer.",
+          residency: "durable",
+        },
         context,
-      )) as { id: string; name: string };
-      expect(actor.id).toBe("resident-actor-1");
-      expect(actor.name).toBe("second-durable");
-      expect(seen).toHaveLength(1);
-      expect(seen[0]?.operation).toBe("createActor");
-    } finally {
-      clearInterval(poller);
-      fs.rmSync(path.join(hostDir, "requests"), { recursive: true, force: true });
-      fs.rmSync(path.join(hostDir, "responses"), { recursive: true, force: true });
-    }
+      ),
+    ).rejects.toBe(activationError);
+    expect(createActor).not.toHaveBeenCalled();
   });
   it("lists live peer sessions separately from Main", async () => {
     const peer: FabricPeerInfo = {

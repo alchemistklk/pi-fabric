@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { resolveAgentCwd, validateAgentCwdRequest } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
@@ -186,6 +187,21 @@ export class ResidencyClient {
   async ensureActor(id: string): Promise<void> {
     await this.ensureHost();
     await this.#waitForParticipant(id, "actor");
+  }
+
+  async createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+    await this.ensureHost();
+    const response = await this.#command({
+      format: RESIDENT_HOST_FORMAT,
+      operation: "createActor",
+      requestId: randomUUID(),
+      rootId: this.options.config.rootId,
+      request,
+      createdAt: Date.now(),
+    });
+    if (!response.actor) throw new Error("Fabric resident host returned no actor");
+    await this.#waitForParticipant(response.actor.id, "actor");
+    return response.actor;
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {

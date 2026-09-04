@@ -258,6 +258,13 @@ const asDirective = (result: AgentRunResult): FabricActorDirective => {
   return directive as FabricActorDirective;
 };
 
+export class ActorRegistryOwnershipError extends Error {
+  constructor() {
+    super("Fabric actor registry is owned by another host");
+    this.name = "ActorRegistryOwnershipError";
+  }
+}
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
@@ -373,25 +380,25 @@ export class ActorManager {
   }
 
   /**
-   * Create an actor. The asRegistryOwner option is reserved for the resident
-   * host control channel (residency file protocol): that host already IS the
-   * authoritative registry owner, so the foreign-live-actor guard - which
-   * protects against concurrent local starters - must not veto creates that
-   * arrive over that channel (e.g. while a ceded-but-not-yet-adopted durable
-   * still carries its creating root lineage).
+   * Create an actor. The asRegistryOwner option is reserved for explicitly
+   * durable requests arriving through the resident host control channel. That
+   * host already is the authoritative registry owner, so the foreign-live-actor
+   * guard—which protects against concurrent local starters—must not veto the
+   * request while a transferred actor still advertises its creating host.
    */
   async create(
     request: FabricActorRequest,
     { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
   ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
+    const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
     if (
-      !asRegistryOwner &&
+      !registryOwnerCreate &&
       [...this.#actors.values()].some(
         (actor) => actor.status !== "stopped" && !this.#canManage(actor.id),
       )
     ) {
-      throw new Error("Fabric actor registry is owned by another host");
+      throw new ActorRegistryOwnershipError();
     }
     if (!this.meshConfig.enabled) throw new Error("Fabric mesh and actors are disabled");
     const name = request.name.trim();
