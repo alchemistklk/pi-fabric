@@ -205,7 +205,7 @@ describe("memory active lineage and privacy policy", () => {
       sessionHeader("expand-tree", cwd),
       message("root", null, "root", 0),
       message("off-lineage", "root", "OFF_LINEAGE_EXPAND_21", 1),
-      message("active-leaf", "root", "ACTIVE_POINTER_FACT_22", 2),
+      message("active-leaf", "root", `ACTIVE_POINTER_FACT_22 ${"x".repeat(2_000)}`, 2),
     ]);
     let live = {
       entries: [{ id: "root" }, { id: "active-leaf" }],
@@ -245,18 +245,19 @@ describe("memory active lineage and privacy policy", () => {
       hits: Array<{ follow: { args: { expectedSourceHash: string; expectedLineageFingerprint: string } } }>;
     };
     const pointer = recalled.hits[0]!.follow.args;
+    const firstPage = await provider.invoke(
+      "expand",
+      { ...pointer, entryIds: ["active-leaf"], maxChars: 256 },
+      invocation(cwd),
+    ) as { next: { args: Record<string, unknown> } | null };
+    expect(firstPage.next).not.toBeNull();
     live = {
       entries: [{ id: "root" }, { id: "off-lineage" }],
       leafId: "off-lineage",
     };
     const staleLineage = await provider.invoke(
       "expand",
-      {
-        session: file,
-        expectedSourceHash: pointer.expectedSourceHash,
-        expectedLineageFingerprint: pointer.expectedLineageFingerprint,
-        entryIds: ["active-leaf"],
-      },
+      firstPage.next!.args,
       invocation(cwd),
     ) as { error: { code: string; actualLineageFingerprint: string } };
     expect(staleLineage.error.code).toBe("stale_pointer");

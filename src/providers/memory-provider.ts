@@ -5,6 +5,7 @@ import type {
   FabricProviderListRequest,
 } from "../protocol.js";
 import type { FabricMemoryConfig } from "../config.js";
+import fs from "node:fs";
 import path from "node:path";
 import {
   AmbiguousSessionError,
@@ -25,12 +26,19 @@ import {
 } from "../memory/context.js";
 import type { LiveSessionBranch, MemoryBranches } from "../memory/lineage.js";
 import { reconstructSessionLineage } from "../memory/lineage.js";
-import { expandSessionEntriesChecked, normalizeSession } from "../memory/normalize.js";
+import {
+  expandSessionEntriesChecked,
+  normalizeSession,
+  type ExpandedSessionEntry,
+  type ExpandSessionSelection,
+  type NormalizedEntry,
+} from "../memory/normalize.js";
 import {
   DEFAULT_HOT_SESSIONS,
   fingerprintSource,
   loadTieredIndex,
   type EntryRange,
+  type MemoryCoverage,
   type MemoryIndexOptions,
   type SearchFilters,
 } from "../memory/index.js";
@@ -40,6 +48,7 @@ import {
   DEFAULT_REGEX_MAX_PATTERN_BYTES,
   DEFAULT_REGEX_TIMEOUT_MS,
   searchMemoryIndex,
+  type SearchResult,
 } from "../memory/search.js";
 import type { MemoryQueryMatch, MemoryQueryMode } from "../memory/tokenize.js";
 import { actionArgNormalizer, type ArgNormalizationSpec } from "./arg-normalization.js";
@@ -51,6 +60,156 @@ const EXPAND_MAX_ENTRIES = 20;
 const EXPAND_MAX_CONTEXT = 100;
 const EXPAND_MAX_EXACT_SELECTORS = 100;
 const SESSIONS_MAX = 500;
+const CONTINUATION_CACHE_TTL_MS = 5 * 60_000;
+const EXPANSION_SNAPSHOT_LIMIT = 2;
+const EXPANSION_SELECTION_LIMIT = 16;
+
+interface SourceIdentity {
+  device: bigint;
+  inode: bigint;
+  size: bigint;
+  modifiedAt: bigint;
+  changedAt: bigint;
+}
+
+interface SourceObservation {
+  file: string;
+  identity: SourceIdentity;
+  liveBranchSignature: string | null;
+}
+
+type LiveBranchResolver = MemoryIndexOptions["liveBranchForFile"];
+
+type CanonicalExpansionSelection = ExpandSessionSelection & {
+  before?: number;
+  after?: number;
+};
+
+interface ResolvedExpansionSelection {
+  entries: ExpandedSessionEntry[];
+  canonical: CanonicalExpansionSelection;
+  anchorIndex: number | null;
+}
+
+interface ExpansionSnapshot {
+  file: string;
+  branches: MemoryBranches;
+  sourceHash: string;
+  lineageFingerprint: string;
+  observation: SourceObservation;
+  entries: readonly NormalizedEntry[];
+  selections: Map<string, ResolvedExpansionSelection>;
+  touchedAt: number;
+}
+
+interface RecallContinuationCache {
+  key: string;
+  result: SearchResult;
+  coverage: MemoryCoverage;
+  requestArgs: MemoryRecallCallArgs;
+  observations: SourceObservation[];
+  touchedAt: number;
+}
+
+const sourceIdentity = (file: string): SourceIdentity | null => {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    if (!stat.isFile()) return null;
+    return {
+      device: stat.dev,
+      inode: stat.ino,
+      size: stat.size,
+      modifiedAt: stat.mtimeNs,
+      changedAt: stat.ctimeNs,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const sameSourceIdentity = (left: SourceIdentity, right: SourceIdentity): boolean =>
+  left.device === right.device &&
+  left.inode === right.inode &&
+  left.size === right.size &&
+  left.modifiedAt === right.modifiedAt &&
+  left.changedAt === right.changedAt;
+
+const liveBranchSignature = (branch: LiveSessionBranch | undefined): string | null =>
+  branch ? `${branch.leafId ?? ""}\0${branch.entries.length}` : null;
+
+const observeSource = (
+  file: string,
+  branches: MemoryBranches,
+  liveBranch: LiveSessionBranch | undefined,
+): SourceObservation | null => {
+  const identity = sourceIdentity(file);
+  if (!identity) return null;
+  return {
+    file: path.resolve(file),
+    identity,
+    liveBranchSignature: branches === "active" ? liveBranchSignature(liveBranch) : null,
+  };
+};
+
+const observeSources = (
+  refs: readonly SessionRef[],
+  branches: MemoryBranches,
+  liveResolver: LiveBranchResolver,
+): SourceObservation[] | null => {
+  const observations: SourceObservation[] = [];
+  for (const ref of refs) {
+    const liveBranch = branches === "active" ? liveResolver?.(ref.file) : undefined;
+    const observation = observeSource(ref.file, branches, liveBranch);
+    if (!observation) return null;
+    observations.push(observation);
+  }
+  return observations;
+};
+
+const sameSourceObservation = (left: SourceObservation, right: SourceObservation): boolean =>
+  left.file === right.file &&
+  sameSourceIdentity(left.identity, right.identity) &&
+  left.liveBranchSignature === right.liveBranchSignature;
+
+const sameSourceObservations = (
+  left: readonly SourceObservation[],
+  right: readonly SourceObservation[],
+): boolean => left.length === right.length && left.every((item, index) =>
+  sameSourceObservation(item, right[index]!)
+);
+
+const recallContinuationKey = (args: MemoryRecallCallArgs): string => JSON.stringify([
+  args.query ?? null,
+  args.queryMode ?? "literal",
+  args.queryMatch ?? null,
+  args.expectedSourceHash ?? null,
+  args.expectedLineageFingerprint ?? null,
+  args.branches ?? "active",
+  args.scope ?? "session",
+  args.pageSize ?? RECALL_DEFAULT_PAGE_SIZE,
+  args.snippetChars ?? RECALL_DEFAULT_SNIPPET_CHARS,
+  args.role ?? null,
+  args.tool ?? null,
+  args.ref ?? null,
+  args.provider ?? null,
+  args.action ?? null,
+  args.outcome ?? null,
+  args.since ?? null,
+  args.until ?? null,
+  args.entryRange ? [args.entryRange.first, args.entryRange.last] : null,
+]);
+
+const expansionSnapshotKey = (file: string, branches: MemoryBranches): string =>
+  `${path.resolve(file)}\0${branches}`;
+
+const expansionSelectionKey = (selection: CanonicalExpansionSelection): string => JSON.stringify([
+  selection.indices ?? null,
+  selection.entryIds ?? null,
+  selection.operationAddresses ?? null,
+  selection.entryRange ? [selection.entryRange.first, selection.entryRange.last] : null,
+  selection.before ?? 0,
+  selection.after ?? 0,
+]);
 
 const errorOutputSchema = {
   type: "object",
@@ -647,7 +806,90 @@ export class MemoryProvider implements FabricProvider {
   readonly description =
     "Cross-session memory: a search engine over every Pi session timeline on this machine";
 
+  private recallContinuation: RecallContinuationCache | undefined;
+  private readonly expansionSnapshots = new Map<string, ExpansionSnapshot>();
+
   constructor(private readonly context: MemoryProviderContext) {}
+
+  private cachedRecallContinuation(
+    key: string,
+    observations: SourceObservation[] | null,
+  ): RecallContinuationCache | undefined {
+    const cached = this.recallContinuation;
+    if (!cached || cached.key !== key) return undefined;
+    if (
+      !observations ||
+      Date.now() - cached.touchedAt > CONTINUATION_CACHE_TTL_MS ||
+      !sameSourceObservations(cached.observations, observations)
+    ) {
+      this.recallContinuation = undefined;
+      return undefined;
+    }
+    cached.touchedAt = Date.now();
+    return cached;
+  }
+
+  private rememberRecallContinuation(cached: RecallContinuationCache): void {
+    this.recallContinuation = cached;
+  }
+
+  private forgetRecallContinuation(cached: RecallContinuationCache): void {
+    if (this.recallContinuation === cached) this.recallContinuation = undefined;
+  }
+
+  private cachedExpansionSnapshot(
+    file: string,
+    branches: MemoryBranches,
+    observation: SourceObservation | null,
+  ): ExpansionSnapshot | undefined {
+    const key = expansionSnapshotKey(file, branches);
+    const cached = this.expansionSnapshots.get(key);
+    if (!cached) return undefined;
+    if (
+      !observation ||
+      Date.now() - cached.touchedAt > CONTINUATION_CACHE_TTL_MS ||
+      !sameSourceObservation(cached.observation, observation)
+    ) {
+      this.expansionSnapshots.delete(key);
+      return undefined;
+    }
+    cached.touchedAt = Date.now();
+    this.expansionSnapshots.delete(key);
+    this.expansionSnapshots.set(key, cached);
+    return cached;
+  }
+
+  private rememberExpansionSnapshot(snapshot: ExpansionSnapshot): void {
+    const key = expansionSnapshotKey(snapshot.file, snapshot.branches);
+    this.expansionSnapshots.delete(key);
+    this.expansionSnapshots.set(key, snapshot);
+    while (this.expansionSnapshots.size > EXPANSION_SNAPSHOT_LIMIT) {
+      const oldest = this.expansionSnapshots.keys().next().value;
+      if (oldest === undefined) break;
+      this.expansionSnapshots.delete(oldest);
+    }
+  }
+
+  private rememberExpansionSelection(
+    snapshot: ExpansionSnapshot,
+    keys: readonly string[],
+    selection: ResolvedExpansionSelection,
+  ): void {
+    for (const key of new Set(keys)) {
+      snapshot.selections.delete(key);
+      snapshot.selections.set(key, selection);
+    }
+    while (snapshot.selections.size > EXPANSION_SELECTION_LIMIT) {
+      const oldest = snapshot.selections.keys().next().value;
+      if (oldest === undefined) break;
+      snapshot.selections.delete(oldest);
+    }
+  }
+
+  private forgetExpansionSnapshot(snapshot: ExpansionSnapshot): void {
+    const key = expansionSnapshotKey(snapshot.file, snapshot.branches);
+    if (this.expansionSnapshots.get(key) === snapshot) this.expansionSnapshots.delete(key);
+  }
 
   async list(
     request: FabricProviderListRequest,
@@ -784,27 +1026,6 @@ export class MemoryProvider implements FabricProvider {
     if ((expectedSourceHash !== undefined || expectedLineageFingerprint !== undefined) && !hydrate) {
       throw new Error("memory.recall integrity expectations require scope session:<id-or-path>");
     }
-    if (hydrate && refs[0]) {
-      const state = fingerprintSource(refs[0].file);
-      const lineage = reconstructSessionLineage(
-        refs[0].file,
-        branches,
-        liveResolver?.(refs[0].file),
-      );
-      const sourceChanged = expectedSourceHash !== undefined &&
-        state?.sourceHash !== expectedSourceHash;
-      const lineageChanged = expectedLineageFingerprint !== undefined &&
-        lineage.fingerprint !== expectedLineageFingerprint;
-      if (state && (sourceChanged || lineageChanged)) {
-        return recallFailure(stalePointerError(
-          refs[0].file,
-          expectedSourceHash,
-          state.sourceHash,
-          expectedLineageFingerprint,
-          lineage.fingerprint,
-        ));
-      }
-    }
 
     const rawRange = args.entryRange;
     const entryRange = rawRange && typeof rawRange === "object" && !Array.isArray(rawRange)
@@ -830,6 +1051,100 @@ export class MemoryProvider implements FabricProvider {
     }
     const selectedRange: EntryRange | undefined =
       typeof first === "number" && typeof last === "number" ? { first, last } : undefined;
+    const filters: SearchFilters = {};
+    if (role) filters.role = role;
+    if (tool) filters.tool = tool;
+    if (ref) filters.ref = ref;
+    if (provider) filters.provider = provider;
+    if (action) filters.action = action;
+    if (outcome) filters.outcome = outcome;
+    if (since !== undefined) filters.since = since;
+    if (until !== undefined) filters.until = until;
+    const baseRequestArgs: MemoryRecallCallArgs = {
+      ...(query === undefined ? {} : { query }),
+      queryMode,
+      ...(queryMode === "literal" ? { queryMatch } : {}),
+      ...(expectedSourceHash ? { expectedSourceHash } : {}),
+      ...(expectedLineageFingerprint ? { expectedLineageFingerprint } : {}),
+      branches,
+      scope: scope ?? "session",
+      ...(offset === undefined ? {} : { offset }),
+      pageSize,
+      snippetChars,
+      ...(role ? { role } : {}),
+      ...(tool ? { tool } : {}),
+      ...(ref ? { ref } : {}),
+      ...(provider ? { provider } : {}),
+      ...(action ? { action } : {}),
+      ...(outcome ? { outcome } : {}),
+      ...(since !== undefined ? { since } : {}),
+      ...(until !== undefined ? { until } : {}),
+      ...(selectedRange ? { entryRange: selectedRange } : {}),
+    };
+    const updateProgress = (searchResult: SearchResult): void => {
+      invocationContext.update(
+        searchResult.matchMode === "structural"
+          ? `memory.recall: ${searchResult.matchedCount} structural matches`
+          : searchResult.matchMode === "combined"
+            ? `memory.recall: ${searchResult.matchedCount} filtered matches`
+            : query
+              ? `memory.recall: ${searchResult.matchedCount} matches`
+              : `memory.recall: ${searchResult.matchedCount} recent entries`,
+      );
+    };
+    const observationsBefore = observeSources(refs, branches, liveResolver);
+    const cached = offset === undefined
+      ? undefined
+      : this.cachedRecallContinuation(
+          recallContinuationKey(baseRequestArgs),
+          observationsBefore,
+        );
+    if (cached) {
+      const response = presentRecall({
+        result: cached.result,
+        ...(query === undefined ? {} : { query }),
+        queryMode,
+        coverage: cached.coverage,
+        ...(offset === undefined ? {} : { offset }),
+        pageSize,
+        snippetChars,
+        requestArgs: cached.requestArgs,
+      });
+      const observationsAfterCachedPage = observeSources(refs, branches, liveResolver);
+      if (
+        observationsBefore &&
+        observationsAfterCachedPage &&
+        sameSourceObservations(observationsBefore, observationsAfterCachedPage)
+      ) {
+        if (response.next === null) this.forgetRecallContinuation(cached);
+        updateProgress(cached.result);
+        return response;
+      }
+      this.forgetRecallContinuation(cached);
+    }
+
+    if (hydrate && refs[0]) {
+      const state = fingerprintSource(refs[0].file);
+      const lineage = reconstructSessionLineage(
+        refs[0].file,
+        branches,
+        liveResolver?.(refs[0].file),
+      );
+      const sourceChanged = expectedSourceHash !== undefined &&
+        state?.sourceHash !== expectedSourceHash;
+      const lineageChanged = expectedLineageFingerprint !== undefined &&
+        lineage.fingerprint !== expectedLineageFingerprint;
+      if (state && (sourceChanged || lineageChanged)) {
+        return recallFailure(stalePointerError(
+          refs[0].file,
+          expectedSourceHash,
+          state.sourceHash,
+          expectedLineageFingerprint,
+          lineage.fingerprint,
+        ));
+      }
+    }
+
     const index = loadTieredIndex(
       refs,
       resolveTierRefs(refs, this.context),
@@ -863,15 +1178,6 @@ export class MemoryProvider implements FabricProvider {
       ));
     }
 
-    const filters: SearchFilters = {};
-    if (role) filters.role = role;
-    if (tool) filters.tool = tool;
-    if (ref) filters.ref = ref;
-    if (provider) filters.provider = provider;
-    if (action) filters.action = action;
-    if (outcome) filters.outcome = outcome;
-    if (since !== undefined) filters.since = since;
-    if (until !== undefined) filters.until = until;
     const searchQuery = {
       ...(query === undefined ? {} : { query }),
       queryMode,
@@ -909,9 +1215,7 @@ export class MemoryProvider implements FabricProvider {
         }
       : undefined;
     const requestArgs: MemoryRecallCallArgs = {
-      ...(query === undefined ? {} : { query }),
-      queryMode,
-      ...(queryMode === "literal" ? { queryMatch } : {}),
+      ...baseRequestArgs,
       ...((expectedSourceHash ?? continuationBinding?.sourceHash)
         ? { expectedSourceHash: expectedSourceHash ?? continuationBinding!.sourceHash }
         : {}),
@@ -921,20 +1225,9 @@ export class MemoryProvider implements FabricProvider {
               expectedLineageFingerprint ?? continuationBinding!.lineageFingerprint,
           }
         : {}),
-      branches,
-      scope: continuationBinding ? `session:${continuationBinding.file}` : scope ?? "session",
-      ...(offset === undefined ? {} : { offset }),
-      pageSize,
-      snippetChars,
-      ...(role ? { role } : {}),
-      ...(tool ? { tool } : {}),
-      ...(ref ? { ref } : {}),
-      ...(provider ? { provider } : {}),
-      ...(action ? { action } : {}),
-      ...(outcome ? { outcome } : {}),
-      ...(since !== undefined ? { since } : {}),
-      ...(until !== undefined ? { until } : {}),
-      ...(selectedRange ? { entryRange: selectedRange } : {}),
+      scope: continuationBinding
+        ? `session:${continuationBinding.file}`
+        : baseRequestArgs.scope ?? "session",
     };
     const response = presentRecall({
       result,
@@ -946,15 +1239,23 @@ export class MemoryProvider implements FabricProvider {
       snippetChars,
       requestArgs,
     });
-    invocationContext.update(
-      result.matchMode === "structural"
-        ? `memory.recall: ${result.matchedCount} structural matches`
-        : result.matchMode === "combined"
-          ? `memory.recall: ${result.matchedCount} filtered matches`
-          : query
-            ? `memory.recall: ${result.matchedCount} matches`
-            : `memory.recall: ${result.matchedCount} recent entries`,
-    );
+    const observationsAfter = observeSources(refs, branches, liveResolver);
+    if (
+      response.next !== null &&
+      observationsBefore &&
+      observationsAfter &&
+      sameSourceObservations(observationsBefore, observationsAfter)
+    ) {
+      this.rememberRecallContinuation({
+        key: recallContinuationKey(requestArgs),
+        result,
+        coverage,
+        requestArgs,
+        observations: observationsAfter,
+        touchedAt: Date.now(),
+      });
+    }
+    updateProgress(result);
     return response;
   }
 
@@ -1029,48 +1330,112 @@ export class MemoryProvider implements FabricProvider {
       };
     }
     const liveResolver = liveBranchResolver(this.context);
-    const initialState = fingerprintSource(ref.file);
-    const initialLineage = reconstructSessionLineage(
-      ref.file,
-      branches,
-      liveResolver?.(ref.file),
-    );
-    if (!initialState) {
-      return {
-        session: ref.file,
-        error: { code: "source_unavailable", message: `Session source is unavailable: ${ref.file}` },
-        entries: [],
-      };
+    const observedLiveBranch = branches === "active" ? liveResolver?.(ref.file) : undefined;
+    const observedSource = observeSource(ref.file, branches, observedLiveBranch);
+    let snapshot = this.cachedExpansionSnapshot(ref.file, branches, observedSource);
+    if (snapshot) {
+      const sourceChanged = expectedSourceHash !== undefined &&
+        snapshot.sourceHash !== expectedSourceHash;
+      const lineageChanged = expectedLineageFingerprint !== undefined &&
+        snapshot.lineageFingerprint !== expectedLineageFingerprint;
+      if (sourceChanged || lineageChanged) {
+        return {
+          session: ref.file,
+          branches,
+          error: stalePointerError(
+            ref.file,
+            expectedSourceHash,
+            snapshot.sourceHash,
+            expectedLineageFingerprint,
+            snapshot.lineageFingerprint,
+          ),
+          entries: [],
+        };
+      }
     }
-    const sourceChanged = expectedSourceHash !== undefined &&
-      initialState.sourceHash !== expectedSourceHash;
-    const lineageChanged = expectedLineageFingerprint !== undefined &&
-      initialLineage.fingerprint !== expectedLineageFingerprint;
-    if (sourceChanged || lineageChanged) {
-      return {
-        session: ref.file,
+
+    if (!snapshot) {
+      const initialState = fingerprintSource(ref.file);
+      if (!initialState) {
+        return {
+          session: ref.file,
+          error: { code: "source_unavailable", message: `Session source is unavailable: ${ref.file}` },
+          entries: [],
+        };
+      }
+      const initialLiveBranch = branches === "active" ? liveResolver?.(ref.file) : undefined;
+      const initialLineage = reconstructSessionLineage(
+        ref.file,
         branches,
-        error: stalePointerError(
-          ref.file,
-          expectedSourceHash,
-          initialState.sourceHash,
-          expectedLineageFingerprint,
-          initialLineage.fingerprint,
-        ),
-        entries: [],
+        initialLiveBranch,
+      );
+      const sourceChanged = expectedSourceHash !== undefined &&
+        initialState.sourceHash !== expectedSourceHash;
+      const lineageChanged = expectedLineageFingerprint !== undefined &&
+        initialLineage.fingerprint !== expectedLineageFingerprint;
+      if (sourceChanged || lineageChanged) {
+        return {
+          session: ref.file,
+          branches,
+          error: stalePointerError(
+            ref.file,
+            expectedSourceHash,
+            initialState.sourceHash,
+            expectedLineageFingerprint,
+            initialLineage.fingerprint,
+          ),
+          entries: [],
+        };
+      }
+
+      const normalized = normalizeSession(
+        ref.file,
+        Number.MAX_SAFE_INTEGER,
+        {
+          lineage: initialLineage,
+          indexThinking: true,
+          indexToolOutput: true,
+        },
+      ).entries;
+      const finalState = fingerprintSource(ref.file);
+      const finalLiveBranch = branches === "active" ? liveResolver?.(ref.file) : undefined;
+      const finalLineage = reconstructSessionLineage(
+        ref.file,
+        branches,
+        finalLiveBranch,
+      );
+      const finalObservation = observeSource(ref.file, branches, finalLiveBranch);
+      if (
+        !finalState ||
+        !finalObservation ||
+        finalState.sourceHash !== initialState.sourceHash ||
+        finalLineage.fingerprint !== initialLineage.fingerprint
+      ) {
+        return {
+          session: ref.file,
+          error: stalePointerError(
+            ref.file,
+            expectedSourceHash ?? initialState.sourceHash,
+            finalState?.sourceHash ?? "",
+            expectedLineageFingerprint ?? initialLineage.fingerprint,
+            finalLineage.fingerprint,
+          ),
+          entries: [],
+        };
+      }
+      snapshot = {
+        file: ref.file,
+        branches,
+        sourceHash: finalState.sourceHash,
+        lineageFingerprint: finalLineage.fingerprint,
+        observation: finalObservation,
+        entries: normalized,
+        selections: new Map(),
+        touchedAt: Date.now(),
       };
     }
 
-    const expansionOptions = {
-      lineage: initialLineage,
-      indexThinking: true,
-      indexToolOutput: true,
-    };
-    const entryCount = normalizeSession(
-      ref.file,
-      Number.MAX_SAFE_INTEGER,
-      expansionOptions,
-    ).entries.length;
+    const entryCount = snapshot.entries.length;
     const outOfBounds = indices.find((index) => index >= entryCount);
     if (outOfBounds !== undefined) {
       return {
@@ -1095,106 +1460,86 @@ export class MemoryProvider implements FabricProvider {
       if (before > 0 || after > 0) {
         throw new Error("memory.expand before/after requires one selected anchor");
       }
+      this.forgetExpansionSnapshot(snapshot);
       return {
         session: ref.file,
-        sourceHash: initialState.sourceHash,
+        sourceHash: snapshot.sourceHash,
         branches,
-        lineageFingerprint: initialLineage.fingerprint,
+        lineageFingerprint: snapshot.lineageFingerprint,
         entryCount,
         entries: [],
         next: null,
       };
     }
 
-    const requestedSelection: {
-      indices?: number[];
-      entryIds?: string[];
-      operationAddresses?: string[];
-      entryRange?: { first: number; last: number };
-    } = {};
+    const requestedSelection: ExpandSessionSelection = {};
     if (indices.length > 0) requestedSelection.indices = indices;
     if (entryIds.length > 0) requestedSelection.entryIds = entryIds;
     if (operationAddresses.length > 0) requestedSelection.operationAddresses = operationAddresses;
     if (typeof first === "number" && typeof last === "number") {
       requestedSelection.entryRange = { first, last };
     }
-    let expansion = expandSessionEntriesChecked(ref.file, requestedSelection, expansionOptions);
-    if ("error" in expansion) {
-      return {
-        session: ref.file,
-        sourceHash: initialState.sourceHash,
-        branches,
-        lineageFingerprint: initialLineage.fingerprint,
-        error: expansion.error,
-        entries: [],
-      };
-    }
-
-    let anchorIndex: number | null = null;
-    let canonicalSelection: {
-      indices?: number[];
-      entryIds?: string[];
-      operationAddresses?: string[];
-      entryRange?: EntryRange;
-      before?: number;
-      after?: number;
+    const requestedWithContext: CanonicalExpansionSelection = {
+      ...requestedSelection,
+      ...(before > 0 ? { before } : {}),
+      ...(after > 0 ? { after } : {}),
     };
-    if (before > 0 || after > 0) {
-      if (expansion.expanded.length !== 1) {
-        throw new Error("memory.expand before/after requires exactly one resolved anchor");
-      }
-      anchorIndex = expansion.expanded[0]!.index;
-      const contextRange = {
-        first: Math.max(0, anchorIndex - before),
-        last: Math.min(Math.max(0, entryCount - 1), anchorIndex + after),
-      };
-      canonicalSelection = { ...requestedSelection, before, after };
-      expansion = expandSessionEntriesChecked(
-        ref.file,
-        { entryRange: contextRange },
-        expansionOptions,
-      );
+    const requestedKey = expansionSelectionKey(requestedWithContext);
+    let resolved = snapshot.selections.get(requestedKey);
+    if (!resolved) {
+      let expansion = expandSessionEntriesChecked(snapshot.entries, requestedSelection);
       if ("error" in expansion) {
         return {
           session: ref.file,
-          sourceHash: initialState.sourceHash,
+          sourceHash: snapshot.sourceHash,
           branches,
-          lineageFingerprint: initialLineage.fingerprint,
+          lineageFingerprint: snapshot.lineageFingerprint,
           error: expansion.error,
           entries: [],
         };
       }
-    } else if (requestedSelection.entryRange) {
-      canonicalSelection = { entryRange: requestedSelection.entryRange };
-    } else {
-      canonicalSelection = { indices: expansion.expanded.map((entry) => entry.index) };
+
+      let anchorIndex: number | null = null;
+      let canonical: CanonicalExpansionSelection;
+      if (before > 0 || after > 0) {
+        if (expansion.expanded.length !== 1) {
+          throw new Error("memory.expand before/after requires exactly one resolved anchor");
+        }
+        anchorIndex = expansion.expanded[0]!.index;
+        const contextRange = {
+          first: Math.max(0, anchorIndex - before),
+          last: Math.min(Math.max(0, entryCount - 1), anchorIndex + after),
+        };
+        canonical = requestedWithContext;
+        expansion = expandSessionEntriesChecked(snapshot.entries, { entryRange: contextRange });
+        if ("error" in expansion) {
+          return {
+            session: ref.file,
+            sourceHash: snapshot.sourceHash,
+            branches,
+            lineageFingerprint: snapshot.lineageFingerprint,
+            error: expansion.error,
+            entries: [],
+          };
+        }
+      } else if (requestedSelection.entryRange) {
+        canonical = { entryRange: requestedSelection.entryRange };
+      } else {
+        canonical = { indices: expansion.expanded.map((entry) => entry.index) };
+      }
+      resolved = { entries: expansion.expanded, canonical, anchorIndex };
+      this.rememberExpansionSelection(
+        snapshot,
+        [requestedKey, expansionSelectionKey(canonical)],
+        resolved,
+      );
     }
 
-    const finalState = fingerprintSource(ref.file);
-    const finalLineage = reconstructSessionLineage(
-      ref.file,
-      branches,
-      liveResolver?.(ref.file),
-    );
-    if (
-      !finalState ||
-      finalState.sourceHash !== initialState.sourceHash ||
-      finalLineage.fingerprint !== initialLineage.fingerprint
-    ) {
-      return {
-        session: ref.file,
-        error: stalePointerError(
-          ref.file,
-          expectedSourceHash ?? initialState.sourceHash,
-          finalState?.sourceHash ?? "",
-          expectedLineageFingerprint ?? initialLineage.fingerprint,
-          finalLineage.fingerprint,
-        ),
-        entries: [],
-      };
-    }
-
-    const selected = expansion.expanded;
+    const selected = resolved.entries;
+    const canonicalSelection = resolved.canonical;
+    const anchorIndex = resolved.anchorIndex;
+    const finalState = snapshot;
+    const finalLineage = { fingerprint: snapshot.lineageFingerprint };
     if (entryOffset > selected.length) {
       return {
         session: ref.file,
@@ -1386,6 +1731,39 @@ export class MemoryProvider implements FabricProvider {
           : { position: entryOffset, textOffset: minimalRange.end };
         response = responseAt(output, cursor);
       }
+    }
+
+    const endingLiveBranch = branches === "active" ? liveResolver?.(ref.file) : undefined;
+    const endingObservation = observeSource(ref.file, branches, endingLiveBranch);
+    if (!endingObservation || !sameSourceObservation(snapshot.observation, endingObservation)) {
+      this.forgetExpansionSnapshot(snapshot);
+      const actualState = fingerprintSource(ref.file);
+      const actualLineage = reconstructSessionLineage(ref.file, branches, endingLiveBranch);
+      if (
+        !actualState ||
+        !endingObservation ||
+        actualState.sourceHash !== snapshot.sourceHash ||
+        actualLineage.fingerprint !== snapshot.lineageFingerprint
+      ) {
+        return {
+          session: ref.file,
+          error: stalePointerError(
+            ref.file,
+            expectedSourceHash ?? snapshot.sourceHash,
+            actualState?.sourceHash ?? "",
+            expectedLineageFingerprint ?? snapshot.lineageFingerprint,
+            actualLineage.fingerprint,
+          ),
+          entries: [],
+        };
+      }
+      snapshot.observation = endingObservation;
+    }
+    if (response.next === null) {
+      this.forgetExpansionSnapshot(snapshot);
+    } else {
+      snapshot.touchedAt = Date.now();
+      this.rememberExpansionSnapshot(snapshot);
     }
     return response;
   }

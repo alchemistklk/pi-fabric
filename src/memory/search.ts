@@ -6,7 +6,6 @@ import { bm25Score, recentEntries, type ScoredEntry } from "./index.js";
 import { executeBoundedRegex, type RegexExecutionError } from "./regex.js";
 import {
   compareLexical,
-  lexicalTermCounts,
   normalizeMemoryPhrase,
   planMemoryQuery,
   type MemoryQueryMatch,
@@ -185,10 +184,7 @@ const collectTermMatches = (
 ): LocatedEntry[] => {
   const scored: ScoredEntry[] = bm25Score(shards, terms, filters, maxEntries);
   const selected = match === "all"
-    ? scored.filter((item) => {
-        const counts = lexicalTermCounts(item.entry.text);
-        return terms.every((term) => (counts.get(term) ?? 0) > 0);
-      })
+    ? scored.filter((item) => item.matchedTerms === terms.length)
     : scored;
   return selected.map((item) => ({
     entry: item.entry,

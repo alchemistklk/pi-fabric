@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   assistantText,
   assistantToolCall,
@@ -31,6 +31,7 @@ const makeTempDir = (prefix: string): string => {
 };
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -714,7 +715,12 @@ describe("MemoryProvider", () => {
       "3_broad.jsonl",
       entries,
     );
-    const first = await provider().invoke(
+    const memory = provider();
+    const readFile = vi.spyOn(fs, "readFileSync");
+    const sourceReads = (): number => readFile.mock.calls.filter(
+      ([candidate]) => path.resolve(String(candidate)) === path.resolve(file),
+    ).length;
+    const first = await memory.invoke(
       "recall",
       {
         scope: `session:${file}`,
@@ -742,16 +748,18 @@ describe("MemoryProvider", () => {
       offset: first.hits.length,
     }));
 
-    const second = await provider().invoke("recall", first.next!.args, invocationContext(cwd)) as {
+    const readsAfterFirstPage = sourceReads();
+    const second = await memory.invoke("recall", first.next!.args, invocationContext(cwd)) as {
       hits: Array<{ index: number }>;
     };
     expect(second.hits[0]!.index).not.toBe(first.hits[0]!.index);
+    expect(sourceReads()).toBe(readsAfterFirstPage);
 
     fs.appendFileSync(
       file,
       `${JSON.stringify(msg("late", parent, ts(700), assistantText("late browser result")))}\n`,
     );
-    const stale = await provider().invoke("recall", first.next!.args, invocationContext(cwd)) as {
+    const stale = await memory.invoke("recall", first.next!.args, invocationContext(cwd)) as {
       error: { code: string };
       hits: unknown[];
     };
@@ -767,13 +775,15 @@ describe("MemoryProvider", () => {
       msg("target", "before", ts(1), assistantText(longText)),
       msg("after", "target", ts(2), userMessage("after context")),
     ]);
-    const recalled = await provider().invoke(
+    const memory = provider();
+    const recalled = await memory.invoke(
       "recall",
       { scope: `session:${file}`, query: "TARGET_CONTEXT_TOKEN" },
       invocationContext(cwd),
     ) as { hits: Array<{ follow: { args: Record<string, unknown> } }> };
 
-    let expanded = await provider().invoke(
+    const readFile = vi.spyOn(fs, "readFileSync");
+    let expanded = await memory.invoke(
       "expand",
       { ...recalled.hits[0]!.follow.args, before: 2, after: 2 },
       invocationContext(cwd),
@@ -793,17 +803,51 @@ describe("MemoryProvider", () => {
       }
       if (expanded.next === null) break;
       expect(expanded.next).not.toBeNull();
-      expanded = await provider().invoke(
+      expanded = await memory.invoke(
         "expand",
         expanded.next!.args,
         invocationContext(cwd),
       ) as typeof expanded;
     }
+    const sourceReads = readFile.mock.calls.filter(
+      ([candidate]) => path.resolve(String(candidate)) === path.resolve(file),
+    ).length;
     expect(calls).toBeGreaterThan(1);
+    expect(sourceReads).toBeLessThanOrEqual(5);
     expect(anchorChunks).toBeGreaterThan(1);
     expect(textByIndex.get(0)).toBe("before context");
     expect(textByIndex.get(1)).toBe(longText);
     expect(textByIndex.get(2)).toBe("after context");
+  });
+
+  it("invalidates cached expansion pages when the session changes", async () => {
+    const file = writeSessionFile(
+      path.join(agentDir, "sessions", encodeCwdDir(cwd)),
+      "5_stale-expansion.jsonl",
+      [
+        sessionHeader("stale-expansion", cwd),
+        msg("entry", null, ts(0), assistantText(`stable ${"x".repeat(2_000)}`)),
+      ],
+    );
+    const memory = provider();
+    const first = await memory.invoke(
+      "expand",
+      { session: file, indices: [0], maxChars: 256 },
+      invocationContext(cwd),
+    ) as { next: { args: Record<string, unknown> } | null };
+    expect(first.next).not.toBeNull();
+
+    fs.appendFileSync(
+      file,
+      `${JSON.stringify(msg("late", "entry", ts(1), assistantText("changed")))}\n`,
+    );
+    const stale = await memory.invoke(
+      "expand",
+      first.next!.args,
+      invocationContext(cwd),
+    ) as { error: { code: string }; entries: unknown[] };
+    expect(stale.error.code).toBe("stale_pointer");
+    expect(stale.entries).toEqual([]);
   });
 
   it("hard-bounds expansion metadata while preserving lossless text continuations", async () => {

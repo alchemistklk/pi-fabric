@@ -300,7 +300,11 @@ type RecallCandidate =
   | { kind: "entry"; segment: SearchSegment; item: SearchSegmentEntry }
   | { kind: "session"; digest: DigestHit };
 
+const recallCandidateCache = new WeakMap<SearchResult, RecallCandidate[]>();
+
 const flattenCandidates = (result: SearchResult): RecallCandidate[] => {
+  const cached = recallCandidateCache.get(result);
+  if (cached) return cached;
   const candidates: RecallCandidate[] = [];
   for (const item of result.items) {
     if (item.kind === "digest") {
@@ -330,6 +334,7 @@ const flattenCandidates = (result: SearchResult): RecallCandidate[] => {
     }
     return 0;
   });
+  recallCandidateCache.set(result, candidates);
   return candidates;
 };
 
