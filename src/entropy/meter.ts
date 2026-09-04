@@ -53,111 +53,130 @@ interface RefAccumulator {
 // traces, measured against the same surface.
 type EntropyReportCore = Omit<EntropyReport, "byModel">;
 
-const measureOnce = (input: EntropyMeterInput): EntropyReportCore => {
+interface MeasureState {
+  surfaceByRef: Map<string, unknown>;
+  lexiconByRef: Map<string, number>;
+  lexiconRows: number;
+  totals: EntropyTotals;
+  refs: Map<string, RefAccumulator>;
+  taskSequences: Map<string, Map<string, number>>;
+  churnPairs: number;
+  churnSum: number;
+}
+
+const createMeasureState = (input: EntropyMeterInput): MeasureState => {
   const surfaceByRef = new Map<string, unknown>();
   if (input.surface) {
     for (const action of input.surface.actions) surfaceByRef.set(action.ref, action.inputSchema);
   }
-
   const lexiconByRef = new Map<string, number>();
   let lexiconRows = 0;
   for (const row of input.repairs ?? []) {
     lexiconByRef.set(row.ref, (lexiconByRef.get(row.ref) ?? 0) + 1);
     lexiconRows += 1;
   }
-
-  const totals: EntropyTotals = {
-    traces: input.traces.length,
-    operations: 0,
-    actionOperations: 0,
-    discoveryOperations: 0,
-    workflowOperations: 0,
-    succeeded: 0,
-    failed: 0,
-    aborted: 0,
-    timedOut: 0,
-    invocationRejections: 0,
-    invocationRejectionsPer1k: 0,
-  };
-
-  const refs = new Map<string, RefAccumulator>();
-  const taskSequences = new Map<string, Map<string, number>>();
-  let churnPairs = 0;
-  let churnSum = 0;
-
-  const accumulator = (ref: string): RefAccumulator => {
-    const existing = refs.get(ref);
-    if (existing) return existing;
-    const created: RefAccumulator = {
-      calls: 0,
+  return {
+    surfaceByRef,
+    lexiconByRef,
+    lexiconRows,
+    totals: {
+      traces: input.traces.length,
+      operations: 0,
+      actionOperations: 0,
+      discoveryOperations: 0,
+      workflowOperations: 0,
       succeeded: 0,
       failed: 0,
-      signatures: new Map<string, number>(),
-      stages: new Map<string, number>(),
-      churnPairs: 0,
-      churnSum: 0,
-    };
-    refs.set(ref, created);
-    return created;
+      aborted: 0,
+      timedOut: 0,
+      invocationRejections: 0,
+      invocationRejectionsPer1k: 0,
+    },
+    refs: new Map(),
+    taskSequences: new Map(),
+    churnPairs: 0,
+    churnSum: 0,
   };
+};
 
-  for (const sourceTrace of input.traces) {
-    const taskKey = sourceTrace.taskKey ?? DEFAULT_TASK_KEY;
-    const sequence: string[] = [];
-    const pendingFailed = new Map<string, string>();
-    for (const operation of sourceTrace.operations) {
-      totals.operations += 1;
-      if (operation.ref.startsWith(DISCOVERY_PREFIX)) {
-        totals.discoveryOperations += 1;
-        continue;
-      }
-      if (operation.ref.startsWith(WORKFLOW_PREFIX)) {
-        totals.workflowOperations += 1;
-        continue;
-      }
-      totals.actionOperations += 1;
-      sequence.push(operation.ref);
-      const acc = accumulator(operation.ref);
-      acc.calls += 1;
-      if (operation.outcome === "succeeded") {
-        totals.succeeded += 1;
-        acc.succeeded += 1;
-      } else if (operation.outcome === "failed") {
-        totals.failed += 1;
-        acc.failed += 1;
-      } else if (operation.outcome === "aborted") {
-        totals.aborted += 1;
-      } else {
-        totals.timedOut += 1;
-      }
-      const signature = shapeSignature(operation.args);
-      acc.signatures.set(signature, (acc.signatures.get(signature) ?? 0) + 1);
-      if (operation.outcome === "failed") {
-        const stage = operation.failureStage ?? "unknown";
-        acc.stages.set(stage, (acc.stages.get(stage) ?? 0) + 1);
-        if (ENTROPY_INVOCATION_STAGES.includes(stage)) totals.invocationRejections += 1;
-      }
-      const pending = pendingFailed.get(operation.ref);
-      if (pending !== undefined) {
-        const distance = signatureDistance(pending, signature);
-        acc.churnPairs += 1;
-        acc.churnSum += distance;
-        churnPairs += 1;
-        churnSum += distance;
-        pendingFailed.delete(operation.ref);
-      }
-      if (operation.outcome === "failed") pendingFailed.set(operation.ref, signature);
+const accumulatorFor = (state: MeasureState, ref: string): RefAccumulator => {
+  const existing = state.refs.get(ref);
+  if (existing) return existing;
+  const created: RefAccumulator = {
+    calls: 0,
+    succeeded: 0,
+    failed: 0,
+    signatures: new Map<string, number>(),
+    stages: new Map<string, number>(),
+    churnPairs: 0,
+    churnSum: 0,
+  };
+  state.refs.set(ref, created);
+  return created;
+};
+
+const accumulateTrace = (state: MeasureState, sourceTrace: EntropyTraceInput): void => {
+  const taskKey = sourceTrace.taskKey ?? DEFAULT_TASK_KEY;
+  const sequence: string[] = [];
+  const pendingFailed = new Map<string, string>();
+  for (const operation of sourceTrace.operations) {
+    state.totals.operations += 1;
+    if (operation.ref.startsWith(DISCOVERY_PREFIX)) {
+      state.totals.discoveryOperations += 1;
+      continue;
     }
-    if (sequence.length > 0) {
-      const key = sequence.join("→");
-      const perTask = taskSequences.get(taskKey) ?? new Map<string, number>();
-      perTask.set(key, (perTask.get(key) ?? 0) + 1);
-      taskSequences.set(taskKey, perTask);
+    if (operation.ref.startsWith(WORKFLOW_PREFIX)) {
+      state.totals.workflowOperations += 1;
+      continue;
     }
+    state.totals.actionOperations += 1;
+    sequence.push(operation.ref);
+    const acc = accumulatorFor(state, operation.ref);
+    acc.calls += 1;
+    if (operation.outcome === "succeeded") {
+      state.totals.succeeded += 1;
+      acc.succeeded += 1;
+    } else if (operation.outcome === "failed") {
+      state.totals.failed += 1;
+      acc.failed += 1;
+    } else if (operation.outcome === "aborted") {
+      state.totals.aborted += 1;
+    } else {
+      state.totals.timedOut += 1;
+    }
+    const signature = shapeSignature(operation.args);
+    acc.signatures.set(signature, (acc.signatures.get(signature) ?? 0) + 1);
+    if (operation.outcome === "failed") {
+      const stage = operation.failureStage ?? "unknown";
+      acc.stages.set(stage, (acc.stages.get(stage) ?? 0) + 1);
+      if (ENTROPY_INVOCATION_STAGES.includes(stage)) state.totals.invocationRejections += 1;
+    }
+    const pending = pendingFailed.get(operation.ref);
+    if (pending !== undefined) {
+      const distance = signatureDistance(pending, signature);
+      acc.churnPairs += 1;
+      acc.churnSum += distance;
+      state.churnPairs += 1;
+      state.churnSum += distance;
+      pendingFailed.delete(operation.ref);
+    }
+    if (operation.outcome === "failed") pendingFailed.set(operation.ref, signature);
   }
+  if (sequence.length > 0) {
+    const key = sequence.join("→");
+    const perTask = state.taskSequences.get(taskKey) ?? new Map<string, number>();
+    perTask.set(key, (perTask.get(key) ?? 0) + 1);
+    state.taskSequences.set(taskKey, perTask);
+  }
+};
 
-  // Sorted iteration keeps every downstream sum independent of input order.
-  const refEntries = [...refs.entries()].sort(([left], [right]) => compareCodeUnits(left, right));
+const finalizeMeasure = (
+  input: EntropyMeterInput,
+  state: MeasureState,
+): EntropyReportCore => {
+  const refEntries = [...state.refs.entries()].sort(([left], [right]) =>
+    compareCodeUnits(left, right),
+  );
   const refReports: EntropyRefReport[] = [];
   let staticFreedomTotal = 0;
   let staticWeighted = 0;
@@ -168,9 +187,9 @@ const measureOnce = (input: EntropyMeterInput): EntropyReportCore => {
     const shapeEntropyBits = shannonEntropyBits([...acc.signatures.values()]);
     const failureStageEntropyBits = shannonEntropyBits([...acc.stages.values()]);
     const refChurnRate = acc.churnPairs > 0 ? roundMetric(acc.churnSum / acc.churnPairs) : 0;
-    const lexicon = lexiconByRef.get(ref) ?? 0;
-    const staticFreedom = surfaceByRef.has(ref)
-      ? staticFreedomFromSchema(surfaceByRef.get(ref))
+    const lexicon = state.lexiconByRef.get(ref) ?? 0;
+    const staticFreedom = state.surfaceByRef.has(ref)
+      ? staticFreedomFromSchema(state.surfaceByRef.get(ref))
       : 0;
     staticFreedomTotal += staticFreedom;
     staticWeighted += ENTROPY_WEIGHTS.staticFreedom * staticFreedom;
@@ -205,37 +224,31 @@ const measureOnce = (input: EntropyMeterInput): EntropyReportCore => {
     });
   }
 
-  const navigationRatio =
-    totals.actionOperations > 0
-      ? roundMetric(totals.discoveryOperations / totals.actionOperations)
-      : 0;
+  const navigationRatio = state.totals.actionOperations > 0
+    ? roundMetric(state.totals.discoveryOperations / state.totals.actionOperations)
+    : 0;
   let flowWeighted = 0;
   let flowOccurrences = 0;
-  for (const perTask of taskSequences.values()) {
+  for (const perTask of state.taskSequences.values()) {
     const counts = [...perTask.values()];
     const occurrences = counts.reduce((sum, value) => sum + value, 0);
     flowWeighted += shannonEntropyBits(counts) * occurrences;
     flowOccurrences += occurrences;
   }
-  const flowEntropyBits = flowOccurrences > 0 ? roundMetric(flowWeighted / flowOccurrences) : 0;
-  totals.invocationRejectionsPer1k =
-    totals.actionOperations > 0
-      ? roundMetric((totals.invocationRejections / totals.actionOperations) * 1000)
-      : 0;
-
+  const flowEntropyBits = flowOccurrences > 0
+    ? roundMetric(flowWeighted / flowOccurrences)
+    : 0;
+  state.totals.invocationRejectionsPer1k = state.totals.actionOperations > 0
+    ? roundMetric((state.totals.invocationRejections / state.totals.actionOperations) * 1000)
+    : 0;
   const score = roundMetric(
     (scoreSum +
       ENTROPY_WEIGHTS.navigation * navigationRatio +
       ENTROPY_WEIGHTS.flow * flowEntropyBits) /
-      Math.max(1, totals.succeeded),
+      Math.max(1, state.totals.succeeded),
   );
-  // Decomposition: the surface share prices the potential the corpus used;
-  // everything else is freedom models actually exercised. Good is
-  // behavioralScore → 0 with staticScore shrinking only through compiled
-  // surface changes.
-  const staticScore = roundMetric(staticWeighted / Math.max(1, totals.succeeded));
+  const staticScore = roundMetric(staticWeighted / Math.max(1, state.totals.succeeded));
   const behavioralScore = roundMetric(score - staticScore);
-
   const sortedRefs = [...refReports].sort(
     (left, right) => right.score - left.score || compareCodeUnits(left.ref, right.ref),
   );
@@ -243,20 +256,29 @@ const measureOnce = (input: EntropyMeterInput): EntropyReportCore => {
   return {
     metricVersion: ENTROPY_METRIC_VERSION,
     catalogDigest: input.catalogDigest ?? "",
-    totals,
-    shapeEntropyBits:
-      totals.actionOperations > 0 ? roundMetric(shapeWeighted / totals.actionOperations) : 0,
-    failureStageEntropyBits: totals.failed > 0 ? roundMetric(failureStageWeighted / totals.failed) : 0,
-    churnRate: churnPairs > 0 ? roundMetric(churnSum / churnPairs) : 0,
+    totals: state.totals,
+    shapeEntropyBits: state.totals.actionOperations > 0
+      ? roundMetric(shapeWeighted / state.totals.actionOperations)
+      : 0,
+    failureStageEntropyBits: state.totals.failed > 0
+      ? roundMetric(failureStageWeighted / state.totals.failed)
+      : 0,
+    churnRate: state.churnPairs > 0 ? roundMetric(state.churnSum / state.churnPairs) : 0,
     navigationRatio,
     flowEntropyBits,
-    lexiconRows,
+    lexiconRows: state.lexiconRows,
     staticFreedom: roundMetric(staticFreedomTotal),
     staticScore,
     behavioralScore,
     score,
     refs: sortedRefs,
   };
+};
+
+const measureOnce = (input: EntropyMeterInput): EntropyReportCore => {
+  const state = createMeasureState(input);
+  for (const trace of input.traces) accumulateTrace(state, trace);
+  return finalizeMeasure(input, state);
 };
 
 export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
@@ -284,5 +306,54 @@ export const measureEntropy = (input: EntropyMeterInput): EntropyReport => {
         behavioralScore: scoped.behavioralScore,
       };
     });
+  return { ...report, byModel };
+};
+
+const yieldToLoop = (): Promise<void> =>
+  new Promise((resolve) => setImmediate(resolve));
+
+const COOPERATIVE_TRACE_CHUNK = 64;
+
+const measureOnceAsync = async (
+  input: EntropyMeterInput,
+): Promise<EntropyReportCore> => {
+  const state = createMeasureState(input);
+  await yieldToLoop();
+  for (let index = 0; index < input.traces.length; index += 1) {
+    accumulateTrace(state, input.traces[index]!);
+    if ((index + 1) % COOPERATIVE_TRACE_CHUNK === 0) await yieldToLoop();
+  }
+  return finalizeMeasure(input, state);
+};
+
+// Cooperative meter for extension hooks. Trace accumulation yields in fixed
+// chunks in both the global and per-model passes, preserving exact synchronous
+// results while letting Pi repaint and process input during a large corpus.
+export const measureEntropyAsync = async (
+  input: EntropyMeterInput,
+): Promise<EntropyReport> => {
+  const report = await measureOnceAsync(input);
+  const groups = new Map<string, EntropyTraceInput[]>();
+  for (const sourceTrace of input.traces) {
+    if (!sourceTrace.model) continue;
+    const group = groups.get(sourceTrace.model) ?? [];
+    group.push(sourceTrace);
+    groups.set(sourceTrace.model, group);
+  }
+  const byModel: EntropyModelReport[] = [];
+  for (const [model, traces] of [...groups.entries()].sort(([left], [right]) =>
+    compareCodeUnits(left, right),
+  )) {
+    const scoped = await measureOnceAsync({ ...input, traces });
+    byModel.push({
+      model,
+      operations: scoped.totals.operations,
+      actionOperations: scoped.totals.actionOperations,
+      succeeded: scoped.totals.succeeded,
+      invocationRejections: scoped.totals.invocationRejections,
+      invocationRejectionsPer1k: scoped.totals.invocationRejectionsPer1k,
+      behavioralScore: scoped.behavioralScore,
+    });
+  }
   return { ...report, byModel };
 };

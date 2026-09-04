@@ -10,8 +10,8 @@
 // already claimed and never invents a domain: open vocabularies arrive as
 // declare-enum review signals instead.
 
-import { stableJsonHash } from "../core/stable-hash.js";
-import { measureEntropy } from "./meter.js";
+import { stableJsonHash, stableJsonHashArrayAsync } from "../core/stable-hash.js";
+import { measureEntropy, measureEntropyAsync } from "./meter.js";
 import {
   applyProposalsToSurface,
   evaluateGate,
@@ -23,6 +23,7 @@ import {
   MAX_COMPILED_SURFACE_PROPOSALS,
   applyCompiledSurface,
   replaySuccessfulCalls,
+  replaySuccessfulCallsAsync,
   schemaDigest,
   type CompiledSurfaceAppliedProposal,
   type CompiledSurfaceFile,
@@ -231,6 +232,110 @@ export const compileEntropySurface = (input: CompileEntropyInput): CompileEntrop
       repairs: input.repairs?.length ?? 0,
       valueObservations: stableJsonHash(input.valueObservations ?? []),
       auditCalls: stableJsonHash(input.auditCalls ?? []),
+    });
+    return {
+      status: "compiled",
+      artifact: artifactFromCandidate(
+        input.surface,
+        candidate,
+        auto,
+        { passed: true, beforeScore: report.score, afterScore: after.score, reasons: [] },
+        evidenceDigest,
+        input.artifact,
+      ),
+      report,
+      after,
+      proposals,
+      gate,
+    };
+  }
+  return {
+    status: "rejected",
+    ...(input.artifact ? { artifact: input.artifact } : {}),
+    report,
+    after,
+    proposals,
+    gate,
+  };
+};
+
+const yieldToLoop = (): Promise<void> =>
+  new Promise((resolve) => setImmediate(resolve));
+
+// Hook-safe compile path: streamed session ingestion and async stores keep I/O
+// off the TUI thread, while these checkpoints split the remaining pure CPU
+// phases. The synchronous compiler remains the deterministic certification API.
+export const compileEntropySurfaceAsync = async (
+  input: CompileEntropyInput,
+): Promise<CompileEntropyOutcome> => {
+  const effective = applyCompiledSurface(input.surface, input.artifact);
+  const report = await measureEntropyAsync({
+    traces: input.traces,
+    surface: effective,
+    ...(input.repairs ? { repairs: input.repairs } : {}),
+    catalogDigest: input.catalogDigest ?? entropySurfaceHash(effective),
+  });
+  await yieldToLoop();
+  const proposals = proposeEntropyReductions({
+    report,
+    traces: input.traces,
+    surface: effective,
+    ...(input.repairs ? { repairs: input.repairs } : {}),
+    ...(input.valueObservations ? { valueObservations: input.valueObservations } : {}),
+  });
+  const auto = proposals.filter((proposal) =>
+    (AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
+  );
+  if (auto.length === 0) {
+    return {
+      status: "converged",
+      ...(input.artifact ? { artifact: input.artifact } : {}),
+      report,
+      proposals,
+    };
+  }
+  await yieldToLoop();
+  const candidate = applyProposalsToSurface(effective, auto);
+  const after = await measureEntropyAsync({
+    traces: input.traces,
+    surface: candidate,
+    ...(input.repairs ? { repairs: input.repairs } : {}),
+    catalogDigest: entropySurfaceHash(candidate),
+  });
+  const scoreGate = evaluateGate(report, after);
+  await yieldToLoop();
+  const violations = await replaySuccessfulCallsAsync(
+    candidate,
+    effective,
+    input.traces,
+    touchedRefs(effective, candidate),
+    input.auditCalls,
+  );
+  const reasons = [
+    ...scoreGate.reasons,
+    ...violations.map((violation) => `${violation.ref}: ${violation.reason}`),
+  ];
+  const gate: EntropyGateResult = {
+    passed: scoreGate.passed && violations.length === 0,
+    beforeScore: report.score,
+    afterScore: after.score,
+    delta: scoreGate.delta,
+    reasons: scoreGate.passed && violations.length === 0 ? [] : reasons,
+  };
+  if (gate.passed) {
+    const [valueObservationsDigest, auditCallsDigest] = await Promise.all([
+      stableJsonHashArrayAsync(input.valueObservations ?? []),
+      stableJsonHashArrayAsync(input.auditCalls ?? []),
+    ]);
+    const evidenceDigest = stableJsonHash({
+      traces: input.traces.length,
+      operations: report.totals.operations,
+      succeeded: report.totals.succeeded,
+      failed: report.totals.failed,
+      surface: entropySurfaceHash(effective),
+      repairs: input.repairs?.length ?? 0,
+      valueObservations: valueObservationsDigest,
+      auditCalls: auditCallsDigest,
     });
     return {
       status: "compiled",

@@ -275,6 +275,7 @@ describe("Fabric runtime provider components", () => {
         from: "sessionId",
         to: "session",
       });
+      await reloaded.flush();
       expect(fs.existsSync(tableFile())).toBe(true);
     } finally {
       await runtime.shutdown();

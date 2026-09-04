@@ -1,13 +1,17 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   entropyTracesFromSessionJsonl,
   machineSessionFiles,
+  machineSessionFilesAsync,
   measureSessionCorpus,
+  measureSessionCorpusAsync,
   projectSessionFiles,
+  projectSessionFilesAsync,
   sessionWindowEvidence,
+  sessionWindowEvidenceAsync,
   trendFromScores,
   type EntropySurfaceSnapshot,
 } from "../src/entropy/index.js";
@@ -114,6 +118,66 @@ describe("machineSessionFiles", () => {
     const b = writeSession(agentDir, "/b", "b.jsonl", same);
     const a = writeSession(agentDir, "/a", "a.jsonl", same);
     expect(machineSessionFiles(agentDir, undefined)).toEqual([a, b]);
+  });
+});
+
+describe("async session pipeline", () => {
+  it("matches synchronous selection, evidence, and measurement without blocking timers", async () => {
+    const agentDir = makeTempDir();
+    const older = writeSession(agentDir, "/repo", "old.jsonl", new Date(2020, 0, 1));
+    const newer = writeSession(agentDir, "/repo", "new.jsonl", new Date(2021, 0, 1));
+    writeSession(agentDir, "/other", "other.jsonl", new Date(2022, 0, 1));
+
+    expect(await projectSessionFilesAsync(agentDir, "/repo")).toEqual([newer, older]);
+    const files = machineSessionFiles(agentDir, "/repo");
+    expect(await machineSessionFilesAsync(agentDir, "/repo")).toEqual(files);
+    const expectedEvidence = sessionWindowEvidence(files);
+    let eventLoopAdvanced = false;
+    const timer = setTimeout(() => {
+      eventLoopAdvanced = true;
+    }, 0);
+    const evidence = await sessionWindowEvidenceAsync(files);
+    clearTimeout(timer);
+    expect(eventLoopAdvanced).toBe(true);
+    expect(evidence).toEqual(expectedEvidence);
+    expect(await measureSessionCorpusAsync({ files })).toEqual(measureSessionCorpus({ files }));
+  });
+
+  it("reads only the appended range when a cached session grows", async () => {
+    const agentDir = makeTempDir();
+    const file = writeSession(agentDir, "/repo", "live.jsonl", new Date(2021, 0, 1));
+    const assistant = JSON.stringify({
+      type: "message",
+      message: { role: "assistant", provider: "provider-a", model: "model-a" },
+    });
+    fs.writeFileSync(file, `${assistant}\n${fs.readFileSync(file, "utf8")}`);
+    const initialSize = fs.statSync(file).size;
+    expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(1);
+    const stream = vi.spyOn(fs, "createReadStream");
+    fs.appendFileSync(file, `${sessionLine()}\n`);
+    const grownSize = fs.statSync(file).size;
+    const evidence = await sessionWindowEvidenceAsync([file]);
+    const options = stream.mock.calls.at(-1)?.[1] as { start?: number; end?: number } | undefined;
+    stream.mockRestore();
+
+    expect(evidence.traces).toHaveLength(2);
+    expect(evidence.traces.map((trace) => trace.model)).toEqual([
+      "provider-a/model-a",
+      "provider-a/model-a",
+    ]);
+    expect(options).toMatchObject({ start: initialSize, end: grownSize - 1 });
+  });
+
+  it("falls back to a full scan after observing a partial appended line", async () => {
+    const agentDir = makeTempDir();
+    const file = writeSession(agentDir, "/repo", "partial.jsonl", new Date(2021, 0, 1));
+    expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(1);
+    const line = sessionLine();
+    const split = Math.floor(line.length / 2);
+    fs.appendFileSync(file, line.slice(0, split));
+    expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(1);
+    fs.appendFileSync(file, `${line.slice(split)}\n`);
+    expect((await sessionWindowEvidenceAsync([file])).traces).toHaveLength(2);
   });
 });
 

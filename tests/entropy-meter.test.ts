@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   entropyReportHash,
   measureEntropy,
+  measureEntropyAsync,
   shannonEntropyBits,
   shapeSignature,
   signatureDistance,
@@ -247,6 +248,24 @@ describe("measureEntropy", () => {
     expect(entropyReportHash(measureEntropy({ traces: shuffled }))).toBe(
       entropyReportHash(first),
     );
+  });
+
+  it("matches the pure meter while yielding throughout a large corpus", async () => {
+    const traces = Array.from({ length: 512 }, (_, index) =>
+      trace([op("pi.read", { path: `file-${index % 3}` })], `task-${index % 5}`),
+    );
+    const expected = measureEntropy({ traces });
+    let turns = 0;
+    let running = true;
+    const pulse = (): void => {
+      turns += 1;
+      if (running) setImmediate(pulse);
+    };
+    setImmediate(pulse);
+    const actual = await measureEntropyAsync({ traces });
+    running = false;
+    expect(turns).toBeGreaterThanOrEqual(4);
+    expect(actual).toEqual(expected);
   });
 
   it("measures an empty corpus as zero", () => {

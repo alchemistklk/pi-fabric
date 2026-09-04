@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { uniqueDeclaredKeyForSpelling } from "../src/providers/arg-normalization.js";
 import { RepairCompiler } from "../src/repairs/compiler.js";
-import { loadRepairTable, saveRepairTable } from "../src/repairs/store.js";
+import { loadRepairTable, saveRepairTable, saveRepairTableAsync } from "../src/repairs/store.js";
 import { emptyRepairTable, type RepairTableFile } from "../src/repairs/types.js";
 
 const tmpRoots: string[] = [];
@@ -25,7 +25,7 @@ describe("uniqueDeclaredKeyForSpelling", () => {
 });
 
 describe("RepairCompiler", () => {
-  it("promotes a unique key alias on first hit and then applies it", () => {
+  it("promotes a unique key alias on first hit and then applies it", async () => {
     const agentDir = makeTempDir();
     const compiler = new RepairCompiler({ agentDir });
     compiler.setCatalogSurface({ providers: ["memory"], capturedTools: [] });
@@ -55,6 +55,7 @@ describe("RepairCompiler", () => {
         properties: { sessionId: { type: "string" }, entryId: { type: "string" } },
       }),
     ).toEqual({ sessionId: "abc" });
+    await compiler.flush();
     const persisted = loadRepairTable(
       path.join(agentDir, "fabric", "repairs"),
       compiler.catalogDigest,
@@ -72,7 +73,7 @@ describe("RepairCompiler", () => {
     expect(compiler.status().effectDropped).toBe(1);
   });
 
-  it("clears in-memory counts when the catalog digest changes on the same instance", () => {
+  it("clears in-memory counts when the catalog digest changes on the same instance", async () => {
     const agentDir = makeTempDir();
     const compiler = new RepairCompiler({ agentDir });
     compiler.setCatalogSurface({ providers: ["memory"], capturedTools: [] });
@@ -83,6 +84,7 @@ describe("RepairCompiler", () => {
       "extra",
     );
     expect(compiler.status().repairCount).toBe(1);
+    await compiler.flush();
     compiler.setCatalogSurface({ providers: ["memory", "mesh"], capturedTools: [] });
     expect(compiler.status().repairCount).toBe(0);
     expect(compiler.status().fingerprints).toEqual([]);
@@ -94,7 +96,7 @@ describe("RepairCompiler", () => {
     expect(compiler.status().repairCount).toBe(1);
   });
 
-  it("starts empty when a new compiler loads a different digest", () => {
+  it("starts empty when a new compiler loads a different digest", async () => {
     const agentDir = makeTempDir();
     const first = new RepairCompiler({ agentDir });
     first.setCatalogSurface({ providers: ["memory"], capturedTools: [] });
@@ -105,6 +107,7 @@ describe("RepairCompiler", () => {
       "extra",
     );
     expect(first.status().repairCount).toBe(1);
+    await first.flush();
     const second = new RepairCompiler({ agentDir });
     second.setCatalogSurface({ providers: ["memory", "mesh"], capturedTools: [] });
     expect(second.status().repairCount).toBe(0);
@@ -113,7 +116,7 @@ describe("RepairCompiler", () => {
     expect(third.status().repairCount).toBe(1);
   });
 
-  it("merges promotions from compiler instances sharing the same catalog", () => {
+  it("merges promotions from compiler instances sharing the same catalog", async () => {
     const agentDir = makeTempDir();
     const first = new RepairCompiler({ agentDir });
     const second = new RepairCompiler({ agentDir });
@@ -127,6 +130,7 @@ describe("RepairCompiler", () => {
       "extra",
     );
     second.observeUnknownAction("memory", "search", ["recall", "expand"]);
+    await Promise.all([first.flush(), second.flush()]);
     const persisted = loadRepairTable(
       path.join(agentDir, "fabric", "repairs"),
       first.catalogDigest,
@@ -138,7 +142,7 @@ describe("RepairCompiler", () => {
     expect(persisted.repairs).toHaveLength(2);
   });
 
-  it("keeps in-memory repair active when persistence fails", () => {
+  it("keeps in-memory repair active when persistence fails", async () => {
     const agentDir = makeTempDir();
     fs.writeFileSync(path.join(agentDir, "fabric"), "not a directory");
     const compiler = new RepairCompiler({ agentDir });
@@ -152,6 +156,7 @@ describe("RepairCompiler", () => {
       )
     ).not.toThrow();
     expect(compiler.repairs).toHaveLength(1);
+    await compiler.flush();
     expect(compiler.status().storeError).toBeTruthy();
   });
 
@@ -178,7 +183,32 @@ describe("RepairCompiler", () => {
     ]);
   });
 
-  it("surfaces a malformed table in status and never overwrites it", () => {
+  it("keeps promotion responsive while the durable table lock is contended", async () => {
+    const agentDir = makeTempDir();
+    const compiler = new RepairCompiler({ agentDir });
+    compiler.setCatalogSurface({ providers: ["memory"], capturedTools: [] });
+    const directory = path.join(agentDir, "fabric", "repairs");
+    const lock = path.join(directory, "current.lock");
+    fs.mkdirSync(lock, { recursive: true });
+    fs.writeFileSync(path.join(lock, "owner"), `token\n${process.pid}\n${Date.now()}\n`);
+    let eventLoopAdvanced = false;
+    const timer = setTimeout(() => {
+      eventLoopAdvanced = true;
+    }, 10);
+
+    expect(
+      compiler.observeInvalidArgs("memory.expand", { sessionId: "s" }, ["session"], "extra"),
+    ).toBeTruthy();
+    expect(compiler.repairs).toHaveLength(1);
+    expect(fs.existsSync(path.join(directory, "current.json"))).toBe(false);
+    await compiler.flush();
+    clearTimeout(timer);
+
+    expect(eventLoopAdvanced).toBe(true);
+    expect(compiler.status().storeError).toContain("lock");
+  });
+
+  it("surfaces a malformed table in status and never overwrites it", async () => {
     const agentDir = makeTempDir();
     const directory = path.join(agentDir, "fabric", "repairs");
     fs.mkdirSync(directory, { recursive: true });
@@ -197,6 +227,7 @@ describe("RepairCompiler", () => {
     });
     // The damaged file is preserved verbatim; the row stays active in memory
     // and the refusal stays visible in status.
+    await compiler.flush();
     expect(compiler.status().storeError).toContain("malformed");
     expect(compiler.repairs).toHaveLength(1);
     expect(fs.readFileSync(path.join(directory, "current.json"), "utf8")).toBe("{ not json");
@@ -222,6 +253,19 @@ describe("repair table lock", () => {
     const stale = new Date(Date.now() - 60_000);
     fs.utimesSync(lock, stale, stale);
     expect(saveRepairTable(directory, table("digest-1")).catalogDigest).toBe("digest-1");
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("reaps an ownerless stale lock asynchronously", async () => {
+    const agentDir = makeTempDir();
+    const directory = path.join(agentDir, "fabric", "repairs");
+    const lock = path.join(directory, "current.lock");
+    fs.mkdirSync(lock, { recursive: true });
+    const stale = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, stale, stale);
+    expect((await saveRepairTableAsync(directory, table("digest-1"))).catalogDigest).toBe(
+      "digest-1",
+    );
     expect(fs.existsSync(lock)).toBe(false);
   });
 

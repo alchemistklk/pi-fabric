@@ -12,7 +12,7 @@
 // and evicted sessions bake into the totals with their digest remembered
 // so the same evidence never merges twice.
 
-import { stableJsonHash } from "../core/stable-hash.js";
+import { createHash } from "node:crypto";
 import { compareCodeUnits } from "./fingerprint.js";
 import type { EntropyValueObservation } from "./types.js";
 
@@ -88,26 +88,96 @@ const parseIdentity = (identity: string): { ref: string; key: string; valueKey: 
   };
 };
 
-// Digest of one window's observation multiset: identical multisets hash
-// identically however the session file grew or was rewritten, so the same
-// evidence never merges twice.
-export const observationWindowDigest = (
-  observations: readonly EntropyValueObservation[],
-): string => {
-  const identities = observations.map((observation) => observationIdentity(observation));
-  identities.sort(compareCodeUnits);
-  return stableJsonHash(identities);
+interface ObservationSummary {
+  digest: string;
+  counts: Record<string, number>;
+}
+
+const digestFromIdentityCounts = (counts: Readonly<Record<string, number>>): string => {
+  const hash = createHash("sha256");
+  hash.update("[");
+  let first = true;
+  for (const [identity, count] of Object.entries(counts).sort(([left], [right]) =>
+    compareCodeUnits(left, right),
+  )) {
+    const encoded = JSON.stringify(identity);
+    const repeated = Array.from({ length: count }, () => encoded).join(",");
+    hash.update(first ? repeated : `,${repeated}`);
+    first = false;
+  }
+  hash.update("]");
+  return hash.digest("hex");
 };
 
-const countsOf = (
+const summarizeObservations = (
   observations: readonly EntropyValueObservation[],
-): Record<string, number> => {
+): ObservationSummary => {
   const counts: Record<string, number> = {};
+  const digestCounts: Record<string, number> = {};
   for (const observation of observations) {
     const identity = observationIdentity(observation);
     counts[identity] = (counts[identity] ?? 0) + (observation.count ?? 1);
+    digestCounts[identity] = (digestCounts[identity] ?? 0) + 1;
   }
-  return counts;
+  return { counts, digest: digestFromIdentityCounts(digestCounts) };
+};
+
+// Digest of one window's observation multiset. The hash input is byte-for-byte
+// compatible with the former sorted identity array, but sorting distinct keys
+// avoids an O(n log n) sweep over every repeated observation.
+export const observationWindowDigest = (
+  observations: readonly EntropyValueObservation[],
+): string => summarizeObservations(observations).digest;
+
+const COOPERATIVE_OBSERVATION_CHUNK = 256;
+const COOPERATIVE_DIGEST_CHUNK = 512;
+
+const yieldToLoop = (): Promise<void> =>
+  new Promise((resolve) => setImmediate(resolve));
+
+const digestFromIdentityCountsAsync = async (
+  counts: Readonly<Record<string, number>>,
+): Promise<string> => {
+  const hash = createHash("sha256");
+  hash.update("[");
+  let first = true;
+  let encodedBatch: string[] = [];
+  const flush = async (): Promise<void> => {
+    if (encodedBatch.length === 0) return;
+    hash.update(`${first ? "" : ","}${encodedBatch.join(",")}`);
+    first = false;
+    encodedBatch = [];
+    await yieldToLoop();
+  };
+  for (const [identity, count] of Object.entries(counts).sort(([left], [right]) =>
+    compareCodeUnits(left, right),
+  )) {
+    const encoded = JSON.stringify(identity);
+    for (let occurrence = 0; occurrence < count; occurrence += 1) {
+      encodedBatch.push(encoded);
+      if (encodedBatch.length >= COOPERATIVE_DIGEST_CHUNK) await flush();
+    }
+  }
+  if (encodedBatch.length > 0) {
+    hash.update(`${first ? "" : ","}${encodedBatch.join(",")}`);
+  }
+  hash.update("]");
+  return hash.digest("hex");
+};
+
+const summarizeObservationsAsync = async (
+  observations: readonly EntropyValueObservation[],
+): Promise<ObservationSummary> => {
+  const counts: Record<string, number> = {};
+  const digestCounts: Record<string, number> = {};
+  for (let index = 0; index < observations.length; index += 1) {
+    const observation = observations[index]!;
+    const identity = observationIdentity(observation);
+    counts[identity] = (counts[identity] ?? 0) + (observation.count ?? 1);
+    digestCounts[identity] = (digestCounts[identity] ?? 0) + 1;
+    if ((index + 1) % COOPERATIVE_OBSERVATION_CHUNK === 0) await yieldToLoop();
+  }
+  return { counts, digest: await digestFromIdentityCountsAsync(digestCounts) };
 };
 
 interface WorkingEntry {
@@ -217,14 +287,14 @@ const serializePool = (
   baked,
 });
 
-// Merge one session-window scan into the pool. A session contributes
-// exactly once per content: unchanged files skip by digest, grown or
-// rewritten files contribute the exact delta from their previous counts,
-// and sessions evicted from tracking bake with their digest remembered, so
-// no evidence can inflate by re-reading.
-export const mergeObservationWindow = (
+interface SummarizedObservationWindow {
+  file: string;
+  summary: ObservationSummary;
+}
+
+const mergeObservationSummaries = (
   pool: EntropyObservationPoolFile | undefined,
-  windows: readonly EntropyObservationWindow[],
+  windows: readonly SummarizedObservationWindow[],
 ): MergedObservationPool => {
   const working = workingFromPool(pool);
   const tracked = [...(pool?.tracked ?? [])];
@@ -234,14 +304,13 @@ export const mergeObservationWindow = (
   let mergedSessions = 0;
   let skippedSessions = 0;
   for (const window of windows) {
-    const digest = observationWindowDigest(window.observations);
+    const { digest, counts: fresh } = window.summary;
     if (bakedSet.has(digest) || trackedDigests.has(digest)) {
       skippedSessions += 1;
       continue;
     }
     const existingIndex = tracked.findIndex((session) => session.file === window.file);
     const existing = existingIndex >= 0 ? tracked[existingIndex] : undefined;
-    const fresh = countsOf(window.observations);
     const delta: Record<string, number> = { ...fresh };
     if (existing) {
       for (const [identity, count] of Object.entries(existing.counts)) {
@@ -281,6 +350,36 @@ export const mergeObservationWindow = (
     mergedSessions,
     skippedSessions,
   };
+};
+
+// Merge one session-window scan into the pool. A session contributes exactly
+// once per content. The async form performs the expensive observation summary
+// in deterministic chunks for extension hooks; the pure form remains the
+// certification API.
+export const mergeObservationWindow = (
+  pool: EntropyObservationPoolFile | undefined,
+  windows: readonly EntropyObservationWindow[],
+): MergedObservationPool => mergeObservationSummaries(
+  pool,
+  windows.map((window) => ({
+    file: window.file,
+    summary: summarizeObservations(window.observations),
+  })),
+);
+
+export const mergeObservationWindowAsync = async (
+  pool: EntropyObservationPoolFile | undefined,
+  windows: readonly EntropyObservationWindow[],
+): Promise<MergedObservationPool> => {
+  const summarized: SummarizedObservationWindow[] = [];
+  for (const window of windows) {
+    summarized.push({
+      file: window.file,
+      summary: await summarizeObservationsAsync(window.observations),
+    });
+  }
+  await yieldToLoop();
+  return mergeObservationSummaries(pool, summarized);
 };
 
 // Expand the pool into the flat value-observation corpus the derivation

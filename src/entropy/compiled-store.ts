@@ -6,8 +6,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
-import { withExclusiveFileLock } from "../core/file-lock.js";
+import { writeJsonAtomic, writeJsonAtomicAsync } from "../core/atomic-write.js";
+import { withExclusiveFileLock, withExclusiveFileLockAsync } from "../core/file-lock.js";
 import {
   COMPILED_SURFACE_VERSION,
   MAX_COMPILED_SURFACE_PROPOSALS,
@@ -163,6 +163,27 @@ export const loadCompiledSurface = (agentDir: string): LoadedCompiledSurface => 
   return { file: parsedFile };
 };
 
+export const loadCompiledSurfaceAsync = async (
+  agentDir: string,
+): Promise<LoadedCompiledSurface> => {
+  const file = compiledPath(compiledSurfaceDirectory(agentDir));
+  let raw: string;
+  try {
+    raw = await fs.promises.readFile(file, "utf8");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return {};
+    return { error: `compiled surface is unreadable: ${errorText(error)}` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: "compiled surface is malformed JSON" };
+  }
+  const parsedFile = parseCompiledSurfaceFile(parsed);
+  return parsedFile ? { file: parsedFile } : { error: "compiled surface is invalid" };
+};
+
 export interface SavedCompiledSurface {
   file: CompiledSurfaceFile;
   written: boolean;
@@ -194,6 +215,41 @@ export const saveCompiledSurface = (
         // Missing file: proceed to write.
       }
       writeJsonAtomic(target, file, { space: 2, newline: true, mode: 0o600, dirMode: 0o700 });
+      return { file, written: true };
+    },
+  );
+
+export const saveCompiledSurfaceAsync = async (
+  agentDir: string,
+  file: CompiledSurfaceFile,
+): Promise<SavedCompiledSurface> =>
+  withExclusiveFileLockAsync(
+    {
+      directory: compiledSurfaceDirectory(agentDir),
+      lockName: "compiled.lock",
+      timeoutMessage: "Timed out waiting for the compiled entropy surface lock",
+      attempts: COMPILED_LOCK_ATTEMPTS,
+      delayMs: COMPILED_LOCK_DELAY_MS,
+      staleMs: COMPILED_STALE_LOCK_MS,
+    },
+    async () => {
+      const loaded = await loadCompiledSurfaceAsync(agentDir);
+      if (loaded.error) throw new Error(loaded.error);
+      const target = compiledPath(compiledSurfaceDirectory(agentDir));
+      const serialized = `${JSON.stringify(file, null, 2)}\n`;
+      try {
+        if (await fs.promises.readFile(target, "utf8") === serialized) {
+          return { file, written: false };
+        }
+      } catch {
+        // Missing file: proceed to write.
+      }
+      await writeJsonAtomicAsync(target, file, {
+        space: 2,
+        newline: true,
+        mode: 0o600,
+        dirMode: 0o700,
+      });
       return { file, written: true };
     },
   );

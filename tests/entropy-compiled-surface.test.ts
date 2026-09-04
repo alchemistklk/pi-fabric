@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   applyCompiledSurface,
+  compiledSurfaceEffectChanged,
   effectiveSchemaFor,
   isQuarantinedRef,
   quarantinedRefNames,
   replaySuccessfulCalls,
+  replaySuccessfulCallsAsync,
   schemaDigest,
   type CompiledSurfaceFile,
   type EntropySurfaceSnapshot,
@@ -86,6 +88,23 @@ const op = (
 ): EntropyTraceInput["operations"][number] => ({ ref, args, outcome });
 
 describe("compiled surface overlay", () => {
+  it("distinguishes enforcement changes from provenance-only updates", () => {
+    const artifact = compiledArtifact(liveSurface());
+    const provenanceOnly = {
+      ...artifact,
+      evidenceDigest: "new evidence",
+      gate: { ...artifact.gate, beforeScore: 0.2 },
+      applied: [...artifact.applied, { kind: "enum-tighten" as const, ref: "other", detail: "new" }],
+    };
+    expect(compiledSurfaceEffectChanged(artifact, provenanceOnly)).toBe(false);
+    expect(
+      compiledSurfaceEffectChanged(artifact, {
+        ...provenanceOnly,
+        quarantined: provenanceOnly.quarantined.slice(1),
+      }),
+    ).toBe(true);
+  });
+
   it("applies digest-matched entries and drops stale ones", () => {
     const live = liveSurface();
     const liveJson = JSON.stringify(live);
@@ -210,4 +229,48 @@ describe("replay preservation", () => {
       ]),
     ).toEqual([{ ref: "mcp.render", reason: "absent from the candidate surface" }]);
   });
+  it("matches pure replay while yielding throughout a large audit corpus", async () => {
+    const live: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [{
+        ref: "mcp.render",
+        inputSchema: {
+          type: "object",
+          properties: { format: { type: "string" } },
+          required: ["format"],
+          additionalProperties: false,
+        },
+      }],
+    };
+    const candidate: EntropySurfaceSnapshot = {
+      version: 1,
+      actions: [{
+        ref: "mcp.render",
+        inputSchema: {
+          type: "object",
+          properties: { format: { type: "string", enum: ["pdf"] } },
+          required: ["format"],
+          additionalProperties: false,
+        },
+      }],
+    };
+    const audits = Array.from({ length: 512 }, (_, index) => ({
+      ref: "mcp.render",
+      args: { format: index % 2 === 0 ? "pdf" : "docx" },
+    }));
+    const touched = new Set(["mcp.render"]);
+    const expected = replaySuccessfulCalls(candidate, live, [], touched, audits);
+    let turns = 0;
+    let running = true;
+    const pulse = (): void => {
+      turns += 1;
+      if (running) setImmediate(pulse);
+    };
+    setImmediate(pulse);
+    const actual = await replaySuccessfulCallsAsync(candidate, live, [], touched, audits);
+    running = false;
+    expect(turns).toBeGreaterThanOrEqual(4);
+    expect(actual).toEqual(expected);
+  });
+
 });

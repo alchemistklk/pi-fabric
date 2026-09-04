@@ -1,7 +1,7 @@
 import { applyActionAliasRepairs, applyCatalogArgRepairs } from "./apply.js";
 import { catalogDigestFromSurface } from "./catalog-digest.js";
 import { actionAliasCandidate, keyAliasCandidate } from "./promote.js";
-import { loadRepairTable, repairsDirectory, saveRepairTable } from "./store.js";
+import { loadRepairTable, repairsDirectory, saveRepairTableAsync } from "./store.js";
 import {
   emptyRepairTable,
   MAX_CATALOG_REPAIRS,
@@ -37,6 +37,7 @@ export class RepairCompiler {
   #invocationErrors = 0;
   #effectDropped = 0;
   #storeError: string | undefined;
+  #persistTail: Promise<void> = Promise.resolve();
 
   constructor(options: RepairCompilerOptions) {
     this.directory = repairsDirectory(options.agentDir);
@@ -190,7 +191,7 @@ export class RepairCompiler {
     if (!this.#digest) return undefined;
     const identity = repairIdentity(candidate);
     if (this.#table.repairs.some((repair) => repairIdentity(repair) === identity)) {
-      if (this.#storeError) this.#persist(this.#table);
+      if (this.#storeError) this.#schedulePersist(this.#table);
       return undefined;
     }
     if (this.#table.repairs.length >= MAX_CATALOG_REPAIRS) return undefined;
@@ -202,22 +203,40 @@ export class RepairCompiler {
       updatedAt: now,
       createdAt: this.#table.createdAt || now,
     };
-    const saved = this.#persist(next);
-    if (!saved) return candidate;
-    return saved.repairs.some((repair) => repairIdentity(repair) === identity)
-      ? candidate
-      : undefined;
+    this.#table = next;
+    this.#schedulePersist(next);
+    return candidate;
   }
 
-  #persist(table: RepairTableFile): RepairTableFile | undefined {
-    try {
-      this.#table = saveRepairTable(this.directory, table);
-      this.#storeError = undefined;
-      return this.#table;
-    } catch (error) {
-      this.#table = table;
-      this.#storeError = errorMessage(error);
-      return undefined;
+  async flush(): Promise<void> {
+    for (;;) {
+      const pending = this.#persistTail;
+      await pending;
+      if (pending === this.#persistTail) return;
     }
+  }
+
+  #schedulePersist(table: RepairTableFile): void {
+    this.#persistTail = this.#persistTail.then(async () => {
+      try {
+        const saved = await saveRepairTableAsync(this.directory, table);
+        if (saved.catalogDigest !== this.#digest) return;
+        const attempted = new Set(table.repairs.map(repairIdentity));
+        const repairs = [...saved.repairs];
+        const seen = new Set(repairs.map(repairIdentity));
+        for (const repair of this.#table.repairs) {
+          const identity = repairIdentity(repair);
+          if (attempted.has(identity) || seen.has(identity) || repairs.length >= MAX_CATALOG_REPAIRS) {
+            continue;
+          }
+          seen.add(identity);
+          repairs.push(repair);
+        }
+        this.#table = { ...saved, repairs };
+        this.#storeError = undefined;
+      } catch (error) {
+        if (table.catalogDigest === this.#digest) this.#storeError = errorMessage(error);
+      }
+    });
   }
 }

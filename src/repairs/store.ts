@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
-import { withExclusiveFileLock } from "../core/file-lock.js";
+import { writeJsonAtomic, writeJsonAtomicAsync } from "../core/atomic-write.js";
+import { withExclusiveFileLock, withExclusiveFileLockAsync } from "../core/file-lock.js";
 import {
   emptyRepairTable,
   MAX_CATALOG_REPAIRS,
@@ -130,6 +130,36 @@ export const loadRepairTable = (
   return { table };
 };
 
+const loadRepairTableAsync = async (
+  directory: string,
+  catalogDigest: string,
+): Promise<LoadedRepairTable> => {
+  const file = currentPath(directory);
+  let raw: string;
+  try {
+    raw = await fs.promises.readFile(file, "utf8");
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return { table: emptyRepairTable(catalogDigest) };
+    return {
+      table: emptyRepairTable(catalogDigest),
+      error: `repair table is unreadable: ${errorText(error)}`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { table: emptyRepairTable(catalogDigest), error: "repair table is malformed JSON" };
+  }
+  const table = parseRepairTable(parsed);
+  if (!table) {
+    return { table: emptyRepairTable(catalogDigest), error: "repair table is invalid" };
+  }
+  return table.catalogDigest === catalogDigest
+    ? { table }
+    : { table: emptyRepairTable(catalogDigest) };
+};
+
 export const saveRepairTable = (
   directory: string,
   table: RepairTableFile,
@@ -161,6 +191,43 @@ export const saveRepairTable = (
         updatedAt: now,
       };
       writeTable(currentPath(directory), merged);
+      return merged;
+    },
+  );
+
+export const saveRepairTableAsync = async (
+  directory: string,
+  table: RepairTableFile,
+): Promise<RepairTableFile> =>
+  withExclusiveFileLockAsync(
+    { directory, lockName: "current.lock", timeoutMessage: LOCK_TIMEOUT_MESSAGE },
+    async () => {
+      const loaded = await loadRepairTableAsync(directory, table.catalogDigest);
+      if (loaded.error) throw new Error(loaded.error);
+      const persisted = loaded.table;
+      const repairs: CatalogRepair[] = [];
+      const identities = new Set<string>();
+      for (const repair of [...persisted.repairs, ...table.repairs]) {
+        const identity = repairIdentity(repair);
+        if (identities.has(identity)) continue;
+        if (repairs.length >= MAX_CATALOG_REPAIRS) break;
+        identities.add(identity);
+        repairs.push(repair);
+      }
+      const now = new Date().toISOString();
+      const merged: RepairTableFile = {
+        version: REPAIR_TABLE_VERSION,
+        catalogDigest: table.catalogDigest,
+        repairs,
+        createdAt: persisted.repairs.length > 0 ? persisted.createdAt : table.createdAt,
+        updatedAt: now,
+      };
+      await writeJsonAtomicAsync(currentPath(directory), merged, {
+        space: 2,
+        newline: true,
+        mode: 0o600,
+        dirMode: 0o700,
+      });
       return merged;
     },
   );

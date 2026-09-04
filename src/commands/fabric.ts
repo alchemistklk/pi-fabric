@@ -26,22 +26,23 @@ import {
   surfaceFreedomReport,
 } from "../entropy/surface.js";
 import {
-  machineSessionFiles,
-  measureSessionCorpus,
-  projectSessionFiles,
-  sessionWindowEvidence,
+  machineSessionFilesAsync,
+  measureSessionCorpusAsync,
+  projectSessionFilesAsync,
+  sessionWindowEvidenceAsync,
 } from "../entropy/sessions.js";
-import { measureEntropy } from "../entropy/meter.js";
+import { measureEntropyAsync } from "../entropy/meter.js";
 import { entropyRepairRows } from "../entropy/corpus.js";
 import { entropyReviewSignals, formatEntropyReviewSignal } from "../entropy/compiler.js";
-import { loadObservationPool } from "../entropy/pool-store.js";
-import { mergeObservationWindow, poolToValueObservations } from "../entropy/pool.js";
+import { loadObservationPoolAsync } from "../entropy/pool-store.js";
+import { mergeObservationWindowAsync, poolToValueObservations } from "../entropy/pool.js";
 import { applyCompiledSurface } from "../entropy/compiled-surface.js";
 import {
-  loadCompiledSurface,
+  loadCompiledSurfaceAsync,
   parseCompiledSurfaceArtifact,
-  saveCompiledSurface,
+  saveCompiledSurfaceAsync,
 } from "../entropy/compiled-store.js";
+import { formatEntropyMetric } from "../entropy/presentation.js";
 import { mergeCompiledSurfaces } from "../entropy/compiled-surface.js";
 import { setActiveCompiledSurface } from "../entropy/active.js";
 import fs from "node:fs";
@@ -875,7 +876,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         if (exportArtifactIndex >= 0) {
           const target = argumentsList[exportArtifactIndex + 1];
           try {
-            const loaded = loadCompiledSurface(resolveAgentDir());
+            const loaded = await loadCompiledSurfaceAsync(resolveAgentDir());
             if (loaded.error) {
               context.ui.notify(loaded.error, "error");
               return;
@@ -890,8 +891,8 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
             const dest = path.resolve(
               target ?? path.join(resolveAgentDir(), "fabric", "entropy", "artifact.json"),
             );
-            fs.mkdirSync(path.dirname(dest), { recursive: true });
-            fs.writeFileSync(dest, `${JSON.stringify(loaded.file, null, 2)}\n`, {
+            await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+            await fs.promises.writeFile(dest, `${JSON.stringify(loaded.file, null, 2)}\n`, {
               encoding: "utf-8",
               mode: 0o600,
             });
@@ -916,7 +917,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           }
           try {
             const raw: unknown = JSON.parse(
-              fs.readFileSync(path.resolve(source), "utf-8"),
+              await fs.promises.readFile(path.resolve(source), "utf-8"),
             );
             const incoming = parseCompiledSurfaceArtifact(raw);
             if (!incoming) {
@@ -924,7 +925,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               return;
             }
             const agentDir = resolveAgentDir();
-            const localLoaded = loadCompiledSurface(agentDir);
+            const localLoaded = await loadCompiledSurfaceAsync(agentDir);
             if (localLoaded.error) {
               context.ui.notify(localLoaded.error, "error");
               return;
@@ -935,7 +936,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               cwd: state.cwd ?? context.cwd,
             });
             const merged = mergeCompiledSurfaces(localLoaded.file, incoming, live);
-            const saved = saveCompiledSurface(agentDir, merged.file);
+            const saved = await saveCompiledSurfaceAsync(agentDir, merged.file);
             if (state.config.entropy.compile) setActiveCompiledSurface(saved.file);
             context.ui.notify(
               `Imported compiled surface: ${merged.file.actions.length} tightened · ${merged.file.quarantined.length} quarantined · ${merged.droppedOverlays + merged.droppedQuarantines} dropped (base digest mismatch)`,
@@ -961,8 +962,8 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
             const dest = path.resolve(
               target ?? path.join(resolveAgentDir(), "fabric", "entropy", "surface.json"),
             );
-            fs.mkdirSync(path.dirname(dest), { recursive: true });
-            fs.writeFileSync(dest, `${JSON.stringify(snapshot, null, 2)}\n`, {
+            await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+            await fs.promises.writeFile(dest, `${JSON.stringify(snapshot, null, 2)}\n`, {
               encoding: "utf8",
               mode: 0o600,
             });
@@ -989,37 +990,40 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         }
         try {
           const status = state.repairs.status();
-          const loadedCompiled = loadCompiledSurface(resolveAgentDir());
-          const live = await liveSurfaceSnapshot({
-            registry: state.registry,
-            extensionContext: context,
-            cwd: state.cwd ?? context.cwd,
-          });
+          const agentDir = resolveAgentDir();
+          const scopeCwd = state.cwd ?? context.cwd;
+          const [loadedCompiled, live, files] = await Promise.all([
+            loadCompiledSurfaceAsync(agentDir),
+            liveSurfaceSnapshot({
+              registry: state.registry,
+              extensionContext: context,
+              cwd: scopeCwd,
+            }),
+            projectScope
+              ? projectSessionFilesAsync(agentDir, scopeCwd)
+              : machineSessionFilesAsync(agentDir, scopeCwd),
+          ]);
           const snapshot = loadedCompiled.file
             ? applyCompiledSurface(live, loadedCompiled.file)
             : live;
           const freedom = surfaceFreedomReport(snapshot);
           const surfaceDigest = entropySurfaceHash(snapshot);
-          const scopeCwd = state.cwd ?? context.cwd;
-          const files = projectScope
-            ? projectSessionFiles(resolveAgentDir(), scopeCwd)
-            : machineSessionFiles(resolveAgentDir(), scopeCwd);
-          const corpus = measureSessionCorpus({
+          const corpus = await measureSessionCorpusAsync({
             files,
             surface: snapshot,
             catalogDigest: surfaceDigest,
           });
-          const format = (value: number): string =>
+          const formatFreedom = (value: number): string =>
             String(Math.round(value * 100) / 100);
           const worst = freedom.actions
             .slice(0, 4)
-            .map((action) => `${action.ref} ${format(action.freedom)}`)
+            .map((action) => `${action.ref} ${formatFreedom(action.freedom)}`)
             .join(" · ");
           const latest = corpus.latest;
           const sessionsLine =
             corpus.sessions.length === 0 || latest === undefined
               ? `session entropy (observed): no fabric_exec traces in the latest ${files.length} ${projectScope ? "project" : "machine"} sessions`
-              : `session entropy (observed): ${corpus.sessions.length} sessions · latest ${latest.totals.operations} ops · behavioral ${format(latest.behavioralScore)} + surface ${format(latest.staticScore)} = ${format(latest.behavioralScore + latest.staticScore)} · slope ${format(corpus.trend.slopePerStep)}/session · ${
+              : `session entropy (observed): ${corpus.sessions.length} sessions · latest ${latest.totals.operations} ops · behavioral ${formatEntropyMetric(latest.behavioralScore)} + surface ${formatEntropyMetric(latest.staticScore)} = ${formatEntropyMetric(latest.behavioralScore + latest.staticScore)} · lower is better · slope ${formatEntropyMetric(corpus.trend.slopePerStep)}/session · ${
                   latest.totals.invocationRejectionsPer1k === 0 && corpus.trend.slopePerStep <= 0
                     ? "ratchet holding"
                     : "ratchet slipping"
@@ -1029,33 +1033,35 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               ? `models: ${corpus.models
                   .map(
                     (model) =>
-                      `${model.model} behavioral ${format(model.latestBehavioralScore)} · slope ${format(model.slopePerSession)}`,
+                      `${model.model} behavioral ${formatEntropyMetric(model.latestBehavioralScore)} · slope ${formatEntropyMetric(model.slopePerSession)}`,
                   )
                   .join(" · ")}`
               : undefined;
           const compiledLine = loadedCompiled.error
             ? `compiled: unavailable — ${loadedCompiled.error}`
             : loadedCompiled.file
-              ? `compiled: v${loadedCompiled.file.metricVersion} · ${loadedCompiled.file.actions.length} tightened · ${loadedCompiled.file.quarantined.length} quarantined · ${loadedCompiled.file.applied.length} applied · gate ${loadedCompiled.file.gate.passed ? "pass" : "REJECTED"} (${format(loadedCompiled.file.gate.beforeScore)} → ${format(loadedCompiled.file.gate.afterScore)})`
+              ? `compiled: v${loadedCompiled.file.metricVersion} · ${loadedCompiled.file.actions.length} tightened · ${loadedCompiled.file.quarantined.length} quarantined · ${loadedCompiled.file.applied.length} applied · gate ${loadedCompiled.file.gate.passed ? "pass" : "REJECTED"} (${formatEntropyMetric(loadedCompiled.file.gate.beforeScore)} → ${formatEntropyMetric(loadedCompiled.file.gate.afterScore)})`
               : "compiled: none";
           // Review listing: the signals the compiler declined to apply,
           // derived read-only from the current window plus the pool (the
           // merge is in memory; the listing never writes the pool).
           let reviewLine: string;
           try {
-            const windowEvidence = sessionWindowEvidence(files);
-            const poolLoaded = loadObservationPool(resolveAgentDir());
+            const [windowEvidence, poolLoaded] = await Promise.all([
+              sessionWindowEvidenceAsync(files),
+              loadObservationPoolAsync(agentDir),
+            ]);
             if (poolLoaded.error) {
               reviewLine = `review: unavailable — ${poolLoaded.error}`;
             } else if (windowEvidence.traces.length === 0) {
               reviewLine = "review: no window evidence";
             } else {
-              const mergedPool = mergeObservationWindow(
+              const mergedPool = await mergeObservationWindowAsync(
                 poolLoaded.file,
                 windowEvidence.observationWindows,
               );
               const signals = entropyReviewSignals({
-                report: measureEntropy({
+                report: await measureEntropyAsync({
                   traces: windowEvidence.traces,
                   surface: snapshot,
                   catalogDigest: surfaceDigest,
@@ -1068,7 +1074,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               reviewLine =
                 signals.length === 0
                   ? "review: none"
-                  : `review: ${signals.length} signal${signals.length === 1 ? "" : "s"} · ${signals
+                  : `review: ${signals.length} suggestion${signals.length === 1 ? "" : "s"} · ${signals
                       .slice(0, 4)
                       .map(formatEntropyReviewSignal)
                       .join(" · ")}${signals.length > 4 ? ` · +${signals.length - 4} more` : ""}`;
@@ -1082,7 +1088,7 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
               `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
               compiledLine,
               reviewLine,
-              `surface freedom (potential): mean ${format(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
+              `surface freedom (potential): mean ${formatFreedom(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
               ...(modelsLine ? [modelsLine] : []),
               "export: /fabric entropy export [path]          # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",

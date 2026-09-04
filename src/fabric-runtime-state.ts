@@ -1239,7 +1239,7 @@ export class FabricRuntimeState {
 
   async shutdown(): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
-    this.#deactivateRepairs();
+    await this.#deactivateRepairs();
     clearActiveCompiledSurface();
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();
@@ -1322,14 +1322,15 @@ export class FabricRuntimeState {
     });
   }
 
-  #deactivateRepairs(): void {
+  async #deactivateRepairs(): Promise<void> {
     const repairs = this.#repairs;
     this.#repairs = undefined;
     clearActiveRepairCompiler(repairs);
+    await repairs?.flush();
   }
 
   async #closeInternal(): Promise<void> {
-    this.#deactivateRepairs();
+    await this.#deactivateRepairs();
     if (!this.#registry) return;
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();

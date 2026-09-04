@@ -7,6 +7,7 @@ export * from "./pool-store.js";
 export * from "./compiled-store.js";
 export * from "./compiled-surface.js";
 export * from "./compiler.js";
+export * from "./presentation.js";
 export * from "./corpus.js";
 export * from "./sessions.js";
 export * from "./trial.js";

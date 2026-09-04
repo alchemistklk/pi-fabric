@@ -18,3 +18,31 @@ const stableJsonValue = (value: unknown): unknown => {
 
 export const stableJsonHash = (value: unknown): string =>
   createHash("sha256").update(JSON.stringify(stableJsonValue(value))).digest("hex");
+const STABLE_HASH_ARRAY_CHUNK = 64;
+
+// Cooperative canonical hashing for large evidence arrays. Each element is
+// normalized by the same pure shaper as stableJsonHash; fixed 64-record chunks
+// keep extension hooks responsive without changing a byte of hash input.
+export const stableJsonHashArrayAsync = async (
+  values: readonly unknown[],
+): Promise<string> => {
+  const hash = createHash("sha256");
+  hash.update("[");
+  let first = true;
+  let batch: string[] = [];
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0) return;
+    hash.update(`${first ? "" : ","}${batch.join(",")}`);
+    first = false;
+    batch = [];
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  for (const value of values) {
+    // JSON.stringify renders undefined array entries as null.
+    batch.push(JSON.stringify(stableJsonValue(value)) ?? "null");
+    if (batch.length >= STABLE_HASH_ARRAY_CHUNK) await flush();
+  }
+  if (batch.length > 0) hash.update(`${first ? "" : ","}${batch.join(",")}`);
+  hash.update("]");
+  return hash.digest("hex");
+};

@@ -31,7 +31,17 @@ Table rows:
 - `keyAlias`: extra argument key → declared key (`sessionId` → `session`)
 - `actionAlias`: spilled action name → declared name (never applied when a committed capability view pins the call)
 
-Cap: 256 rows. Promotion is on the first unique hit; uniqueness against the live schema is the bound. Insert is identity-keyed (idempotent) and locked across Pi processes sharing the agent directory; stale-lock recovery is an exclusive rename claim, so racing reapers can never delete a lock a fresh writer owns. Persistence failures never fail the user's invocation and appear in `/fabric repairs`. Apply is a no-op when the schema accepts extension keys, the live mapping is absent or ambiguous, or the call is already canonical.
+Cap: 256 rows. Promotion is on the first unique hit; uniqueness against the
+live schema is the bound. A promoted row becomes active in memory immediately,
+while persistence queues behind a single asynchronous writer. Insert is
+identity-keyed (idempotent) and locked across Pi processes sharing the agent
+directory; lock retries yield to the event loop, and stale-lock recovery is an
+exclusive rename claim, so racing reapers can never delete a lock a fresh
+writer owns. Queued writes merge with rows another process persisted and flush
+before runtime teardown. Persistence failures never fail or delay the user's
+invocation and appear in `/fabric repairs`. Apply is a no-op when the schema
+accepts extension keys, the live mapping is absent or ambiguous, or the call is
+already canonical.
 
 Two failure modes stay visible, never silent:
 

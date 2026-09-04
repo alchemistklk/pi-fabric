@@ -52,6 +52,19 @@ export interface CompiledSurfaceFile {
   evidenceDigest: string;
 }
 
+// Gate user-facing compile notices on enforcement changes, not provenance-only
+// updates to the evidence digest, gate score, or applied ledger.
+export const compiledSurfaceEffectChanged = (
+  before: CompiledSurfaceFile | undefined,
+  after: CompiledSurfaceFile,
+): boolean => stableJsonHash({
+  actions: before?.actions ?? [],
+  quarantined: before?.quarantined ?? [],
+}) !== stableJsonHash({
+  actions: after.actions,
+  quarantined: after.quarantined,
+});
+
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -273,6 +286,91 @@ export const replaySuccessfulCalls = (
           reason: "recorded arguments no longer validate against the compiled schema",
         });
       }
+    }
+  }
+  return violations;
+};
+
+const COOPERATIVE_REPLAY_CHUNK = 64;
+
+const replayYield = (): Promise<void> =>
+  new Promise((resolve) => setImmediate(resolve));
+
+// Hook-safe replay gate. The ordering and validation rules match the pure
+// certification path exactly, with fixed operation chunks between TUI turns.
+export const replaySuccessfulCallsAsync = async (
+  surface: EntropySurfaceSnapshot,
+  before: EntropySurfaceSnapshot,
+  traces: readonly EntropyTraceInput[],
+  touchedRefs: ReadonlySet<string>,
+  auditCalls?: readonly EntropyAuditCall[],
+): Promise<ReplayViolation[]> => {
+  const schemaByRef = new Map(surface.actions.map((action) => [action.ref, action.inputSchema]));
+  const beforeByRef = new Map(before.actions.map((action) => [action.ref, action.inputSchema]));
+  const accepts = (schema: unknown, args: Record<string, unknown>): boolean => {
+    try {
+      return isPlainRecord(schema) && Value.Check(schema, args);
+    } catch {
+      return false;
+    }
+  };
+  const violations: ReplayViolation[] = [];
+  const auditedRefs = new Set<string>();
+  let processed = 0;
+  await replayYield();
+  if (auditCalls) {
+    const auditArgsByRef = new Map<string, Record<string, unknown>[]>();
+    for (const call of auditCalls) {
+      if (touchedRefs.has(call.ref)) {
+        const bucket = auditArgsByRef.get(call.ref) ?? [];
+        bucket.push(call.args);
+        auditArgsByRef.set(call.ref, bucket);
+      }
+      processed += 1;
+      if (processed % COOPERATIVE_REPLAY_CHUNK === 0) await replayYield();
+    }
+    for (const [ref, argsList] of auditArgsByRef) {
+      auditedRefs.add(ref);
+      const schema = schemaByRef.get(ref);
+      if (schema === undefined) {
+        violations.push({ ref, reason: "absent from the candidate surface" });
+        continue;
+      }
+      const declared = beforeByRef.get(ref);
+      for (const args of argsList) {
+        if (declared === undefined || accepts(declared, args)) {
+          if (!accepts(schema, args)) {
+            violations.push({
+              ref,
+              reason: "recorded arguments no longer validate against the compiled schema",
+            });
+          }
+        }
+        processed += 1;
+        if (processed % COOPERATIVE_REPLAY_CHUNK === 0) await replayYield();
+      }
+    }
+  }
+  for (const sourceTrace of traces) {
+    for (const operation of sourceTrace.operations) {
+      if (
+        operation.outcome === "succeeded" &&
+        !operation.ref.startsWith("fabric.") &&
+        touchedRefs.has(operation.ref) &&
+        !auditedRefs.has(operation.ref)
+      ) {
+        const schema = schemaByRef.get(operation.ref);
+        if (schema === undefined) {
+          violations.push({ ref: operation.ref, reason: "absent from the candidate surface" });
+        } else if (!accepts(schema, operation.args)) {
+          violations.push({
+            ref: operation.ref,
+            reason: "recorded arguments no longer validate against the compiled schema",
+          });
+        }
+      }
+      processed += 1;
+      if (processed % COOPERATIVE_REPLAY_CHUNK === 0) await replayYield();
     }
   }
   return violations;

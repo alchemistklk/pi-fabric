@@ -15,17 +15,21 @@ import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   AUTO_APPLY_PROPOSAL_KINDS,
-  compileEntropySurface,
+  compileEntropySurfaceAsync,
+  compiledSurfaceEffectChanged,
   entropyRepairRows,
+  entropyReviewKey,
+  formatEntropyCompileNotice,
+  formatEntropyReviewNotice,
   liveSurfaceSnapshot,
-  loadCompiledSurface,
-  loadObservationPool,
-  machineSessionFiles,
-  mergeObservationWindow,
+  loadCompiledSurfaceAsync,
+  loadObservationPoolAsync,
+  machineSessionFilesAsync,
+  mergeObservationWindowAsync,
   poolToValueObservations,
-  saveCompiledSurface,
-  saveObservationPool,
-  sessionWindowEvidence,
+  saveCompiledSurfaceAsync,
+  saveObservationPoolAsync,
+  sessionWindowEvidenceAsync,
 } from "./entropy/index.js";
 import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
@@ -382,130 +386,140 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     installHaltOnEscape(context);
   }, cleanupActivationSideEffects);
 
-  // Continual entropy reduction: the compiler runs measure → propose → apply
-  // → gate against the live machine session window at every turn boundary
-  // that produced new action evidence, then persists the compiled surface
-  // beside the repair table. Value observations pool machine-wide with
-  // exact per-session deltas so sparse closed domains still reach the
-  // derivation thresholds, and auto enum-tighten only removes freedom the
-  // declared schema already bounds: open vocabularies surface as
-  // declare-enum review signals for the surface author. Compiles never
-  // fail the session; a gate rejection keeps the old surface silently:
-  // the ratchet is holding the line, and /fabric entropy shows the
-  // compiled state.
+  // Continual entropy reduction runs off the interaction path. Session-tree
+  // discovery and JSONL ingestion use async I/O, scoring yields in fixed trace
+  // chunks, and durable stores acquire locks cooperatively. Turn hooks only
+  // enqueue work; a pending turn coalesces to the newest context.
   let entropyEvidenceThisTurn = false;
-  let entropyCompileInFlight = false;
-  let entropyCompilePending = false;
+  let entropyCompileInFlight: Promise<void> | undefined;
+  let entropyCompilePending: EntropyCompileRequest | undefined;
   let entropyLastReview = "";
+  let entropyLifecycleEpoch = 0;
 
-  const compileEntropyNow = async (context: ExtensionContext): Promise<void> => {
-    if (!state.initialized || !state.config.entropy.compile) return;
+  interface EntropyCompileRequest {
+    context: ExtensionContext;
+    delayMs: number;
+    epoch: number;
+  }
+
+  const compileEntropyNow = async (
+    context: ExtensionContext,
+    epoch: number,
+  ): Promise<void> => {
+    const current = (): boolean =>
+      epoch === entropyLifecycleEpoch && state.initialized && state.config.entropy.compile;
+    if (!current()) return;
+    const startedAt = performance.now();
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
-    const files = machineSessionFiles(agentDir, cwd);
-    if (files.length === 0) return;
-    const loaded = loadCompiledSurface(agentDir);
-    // Damage surfaces in /fabric entropy and blocks compiles; never overwrite.
-    if (loaded.error) return;
-    const evidence = sessionWindowEvidence(files);
-    if (evidence.traces.length === 0) return;
-    // Machine-wide pooling: exact per-session deltas accumulate the value
-    // corpus across every window the compiler reads, so sparse closed
-    // domains reach the derivation thresholds without widening the
-    // gate-local window. Pool damage blocks the merge, never rebuilds.
-    const poolLoaded = loadObservationPool(agentDir);
-    if (poolLoaded.error) return;
-    const mergedPool = mergeObservationWindow(poolLoaded.file, evidence.observationWindows);
-    saveObservationPool(agentDir, mergedPool.file);
-    const pooledObservations = poolToValueObservations(mergedPool.file);
-    const snapshot = await liveSurfaceSnapshot({
-      registry: state.registry,
-      extensionContext: context,
-      cwd,
-    });
-    const outcome = compileEntropySurface({
+    const repairs = entropyRepairRows(state.repairs.repairs);
+    const [files, loaded, poolLoaded, snapshot] = await Promise.all([
+      machineSessionFilesAsync(agentDir, cwd),
+      loadCompiledSurfaceAsync(agentDir),
+      loadObservationPoolAsync(agentDir),
+      liveSurfaceSnapshot({ registry: state.registry, extensionContext: context, cwd }),
+    ]);
+    if (!current() || files.length === 0 || loaded.error || poolLoaded.error) return;
+    const evidence = await sessionWindowEvidenceAsync(files);
+    if (!current() || evidence.traces.length === 0) return;
+    const mergedPool = await mergeObservationWindowAsync(
+      poolLoaded.file,
+      evidence.observationWindows,
+    );
+    await saveObservationPoolAsync(agentDir, mergedPool.file);
+    if (!current()) return;
+    const outcome = await compileEntropySurfaceAsync({
       traces: evidence.traces,
       surface: snapshot,
-      repairs: entropyRepairRows(state.repairs.repairs),
-      valueObservations: pooledObservations,
+      repairs,
+      valueObservations: poolToValueObservations(mergedPool.file),
       auditCalls: evidence.auditCalls,
       ...(loaded.file ? { artifact: loaded.file } : {}),
     });
+    if (!current()) return;
     const review = outcome.proposals.filter(
       (proposal) => !(AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
     );
-    const reviewKey = review
-      .map((proposal) =>
-        proposal.kind === "sequence-fuse"
-          ? `${proposal.kind}:${proposal.sequence.join(">")}`
-          : `${proposal.kind}:${proposal.ref}`,
-      )
-      .join(";");
+    const reviewKey = entropyReviewKey(review);
+    const reviewChanged = reviewKey !== entropyLastReview;
+    let compileNotified = false;
     if (outcome.status === "compiled" && outcome.artifact) {
-      const saved = saveCompiledSurface(agentDir, outcome.artifact);
-      if (saved.written) {
-        // Activate immediately: enforcement follows the compile, never
-        // waiting for the next session start.
+      const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact);
+      if (saved.written && current()) {
+        // Activate immediately: enforcement follows the background compile,
+        // never waiting for the next session start. Provenance-only artifact
+        // updates stay silent because they do not alter the live surface.
         setActiveCompiledSurface(outcome.artifact);
-        entropyLastReview = reviewKey;
-        const applied = outcome.proposals
-          .filter((proposal) =>
-            (AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
-          )
-          .map((proposal) => proposal.kind);
-        const before = outcome.report.score.toFixed(2);
-        const after = (outcome.after?.score ?? outcome.report.score).toFixed(2);
-        const reviewNote = review.length > 0
-          ? ` · ${review.length} review-only proposal${review.length === 1 ? "" : "s"}`
-          : "";
-        context.ui.notify(
-          `entropy: compiled surface · ${applied.join(" · ")} · gate pass (${before} → ${after})${reviewNote}`,
-          "info",
-        );
+        if (compiledSurfaceEffectChanged(loaded.file, outcome.artifact) && context.hasUI) {
+          context.ui.notify(
+            formatEntropyCompileNotice({
+              proposals: outcome.proposals,
+              beforeScore: outcome.report.score,
+              afterScore: outcome.after?.score ?? outcome.report.score,
+              elapsedMs: performance.now() - startedAt,
+              ...(reviewChanged && review.length > 0 ? { reviewCount: review.length } : {}),
+            }),
+            "info",
+          );
+          compileNotified = true;
+        }
       }
-    } else {
-      // Review-only proposals never auto-apply; surface each distinct set
-      // once so the reviewer sees what the compiler declined to apply.
-      if (review.length > 0 && reviewKey !== entropyLastReview) {
-        entropyLastReview = reviewKey;
-        const kinds = [...new Set(review.map((proposal) => proposal.kind))].join(", ");
-        context.ui.notify(
-          `entropy: ${review.length} review-only proposal${review.length === 1 ? "" : "s"} (${kinds})`,
-          "info",
-        );
+    }
+    if (epoch !== entropyLifecycleEpoch) return;
+    if (reviewChanged) {
+      entropyLastReview = reviewKey;
+      if (review.length > 0 && !compileNotified && context.hasUI) {
+        context.ui.notify(formatEntropyReviewNotice(review), "info");
       }
     }
   };
 
-  const scheduleEntropyCompile = (context: ExtensionContext): void => {
-    if (entropyCompileInFlight) {
-      entropyCompilePending = true;
-      return;
-    }
-    entropyCompileInFlight = true;
-    void (async () => {
+  const launchEntropyCompile = (request: EntropyCompileRequest): void => {
+    const task = (async () => {
       try {
-        // Let Pi finish persisting the turn's tool results before the
-        // window scan reads them.
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        await compileEntropyNow(context);
+        if (request.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, request.delayMs));
+        }
+        await compileEntropyNow(request.context, request.epoch);
       } catch (error) {
         console.warn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
-      } finally {
-        entropyCompileInFlight = false;
-        if (entropyCompilePending) {
-          entropyCompilePending = false;
-          scheduleEntropyCompile(context);
-        }
       }
     })();
+    entropyCompileInFlight = task;
+    void task.finally(() => {
+      if (entropyCompileInFlight !== task) return;
+      entropyCompileInFlight = undefined;
+      const pending = entropyCompilePending;
+      entropyCompilePending = undefined;
+      if (pending) launchEntropyCompile(pending);
+    });
+  };
+
+  const scheduleEntropyCompile = (
+    context: ExtensionContext,
+    delayMs = 250,
+  ): void => {
+    const request = { context, delayMs, epoch: entropyLifecycleEpoch };
+    if (entropyCompileInFlight) {
+      entropyCompilePending = request;
+      return;
+    }
+    launchEntropyCompile(request);
+  };
+
+  const settleEntropyCompiles = async (): Promise<void> => {
+    while (entropyCompileInFlight) await entropyCompileInFlight;
   };
 
   pi.on("session_start", async (_event, context) => {
+    entropyLifecycleEpoch += 1;
+    entropyEvidenceThisTurn = false;
+    entropyCompilePending = undefined;
+    entropyLastReview = "";
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -563,9 +577,8 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     // the program never executed (type errors, aborts).
     if (state.initialized) state.resetSpeculation();
     if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
-    // The entropy compiler runs as hot as the evidence allows: a turn that
-    // invoked fabric_exec may have produced new action operations. The
-    // compile is fire-and-forget, so the next prompt never waits on it.
+    // A turn with new action evidence only enqueues the background compiler;
+    // the hook returns without scanning session files or waiting on a lock.
     if (entropyEvidenceThisTurn) {
       entropyEvidenceThisTurn = false;
       scheduleEntropyCompile(context);
@@ -895,16 +908,15 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async (_event, context) => {
-    // Flush the final compile while the runtime is still initialized; it
-    // never blocks shutdown and the window is at its richest right here.
+    // Queue the richest final window and let async I/O/cooperative scoring
+    // finish before teardown; the TUI event loop remains responsive.
     if (entropyEvidenceThisTurn) {
       entropyEvidenceThisTurn = false;
-      try {
-        await compileEntropyNow(context);
-      } catch {
-        // Compiles never fail the session.
-      }
+      scheduleEntropyCompile(context, 0);
     }
+    await settleEntropyCompiles();
+    entropyLifecycleEpoch += 1;
+    entropyCompilePending = undefined;
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
     pendingHandoffs.clear();

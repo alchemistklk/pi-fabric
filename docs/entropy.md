@@ -177,26 +177,49 @@ declared schema already bounds. `overload-split` and `sequence-fuse`
 author new composite definitions, `declare-enum` suggests a domain the
 schema has not claimed, and a pure `modal-rename` drops the declared key
 that every successful call recorded, so all of them stay surfaced for
-review and never auto-apply. The compile notification names
-each distinct review-only set once, so the reviewer sees what the compiler
-found and declined to apply mechanically.
+review and never auto-apply. Review notifications describe the suggestions in
+plain language and emit each distinct suggestion set once per session. Evidence
+counts changing underneath the same suggestion do not repeat it; a changed
+vocabulary, split, sequence, or rename does.
 
 ## The compile loop
 
 The reducer is autonomous, mirroring the repair loop: no command, no
 approval, machine-checked bounds replace review. Every turn that invoked
-`fabric_exec` may have produced new action evidence, so at `turn_end` the
-compiler reads the live session window, snapshots the declared surface
-through the discovery path, and runs measure → propose → apply → gate
-against it. The window is machine-wide, covering the newest sessions
-across every project under the agent dir, so evidence breadth matches
-enforcement breadth: the artifact governs the whole machine, so it learns
-from the whole machine. The current project's newest session is always included so
-the live session that produced this turn's evidence is never crowded out. The snapshot keeps quarantined refs visible because digest
-proofs and artifact carry-forward read the declared schema; the
-model-facing catalog keeps hiding them.
-The compile is fire-and-forget (the next prompt never waits on it), and a
-session shutdown flushes a final compile while the window is richest.
+`fabric_exec` may have produced new action evidence, so at `turn_end` Fabric
+enqueues a background compile and returns the hook immediately. A 250 ms grace
+period lets Pi finish appending the turn; triggers that arrive during a compile
+coalesce into one follow-up using the newest context. The worker reads the live
+session window, snapshots the declared surface through the discovery path, and
+runs measure → propose → apply → gate against it. Directory discovery, stat,
+JSONL scanning, lock waits, and atomic persistence use asynchronous I/O;
+scoring, safety replay, evidence hashing, and observation pooling yield in fixed deterministic chunks. Session
+files stream line by line with bounded concurrency. A bounded metadata-keyed
+cache reuses unchanged evidence; when the active JSONL grows, the scanner reads
+only the appended byte range and carries its model-attribution cursor forward.
+Replacement, truncation, or an incomplete trailing record falls back safely.
+Large logs therefore no longer impose one whole-window synchronous read/parse
+stall on every turn, and a lock held by another Pi
+process no longer blocks TUI timers while compilation proceeds.
+
+The window is machine-wide, covering the newest sessions across every project
+under the agent dir, so evidence breadth matches enforcement breadth: the
+artifact governs the whole machine, so it learns from the whole machine. The
+current project's newest session is always included so the live session that
+produced this turn's evidence is never crowded out. The snapshot keeps
+quarantined refs visible because digest proofs and artifact carry-forward read
+the declared schema; the model-facing catalog keeps hiding them. Session
+shutdown awaits the queued final compile for durability, but all of that work
+remains cooperative with the event loop.
+
+A notification appears only when a newly persisted artifact changes the live
+surface. It starts with `background optimization complete`, includes elapsed
+work time, names up to three concrete targets and values, prints enough decimal
+places to distinguish the before/after scores (with an explicit signed delta),
+states that lower is better, and says that the safety checks passed. An equal
+score is labeled `entropy score unchanged`. Review suggestions point to
+`/fabric entropy`; internal proposal-kind jargon stays out of user-facing
+notices.
 
 Value observations pool machine-wide with exact per-session deltas:
 `<agent dir>/fabric/entropy/observation-pool.json` accumulates per-value
@@ -236,16 +259,17 @@ Fabric config disables the loop and the enforcement entirely.
 ## On-demand measurement
 
 Session JSONL is the source of truth, so nothing is recorded. `/fabric
-entropy` reads the newest machine sessions (window of 8 files total,
-newest first by mtime, spanning every project under the agent dir with the
-current project's newest session guaranteed), measures each against the live
-surface snapshot, and reports the
-latest session's score plus the least-squares slope across the window's
-session scores (`trendFromScores`). Lines without a trace envelope are
-skipped by a cheap substring filter before parsing, so large logs stay
-fast. The repair table, the compiled entropy surface, and the machine-wide
-observation pool remain the only durable derived artifacts; only the first
-two change runtime behavior, the pool only moves thresholds.
+entropy` asynchronously discovers the newest machine sessions (window of 8
+files total, newest first by mtime, spanning every project under the agent dir
+with the current project's newest session guaranteed), streams each file
+against the live surface snapshot, and reports the latest session's score plus
+the least-squares slope across the window's session scores
+(`trendFromScores`). The command shares the bounded evidence cache with the
+background compiler. Lines without a trace envelope are skipped by a cheap
+substring filter before parsing. The repair table, the compiled entropy
+surface, and the machine-wide observation pool remain the only durable derived
+artifacts; only the first two change runtime behavior, the pool only moves
+thresholds.
 
 ## Commands and certification
 

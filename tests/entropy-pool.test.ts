@@ -2,13 +2,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { stableJsonHash } from "../src/core/stable-hash.js";
 import {
   POOL_TRACKED_SESSIONS,
   POOL_TRACKED_VALUES,
   loadObservationPool,
+  loadObservationPoolAsync,
   mergeObservationWindow,
+  mergeObservationWindowAsync,
+  observationIdentity,
+  observationWindowDigest,
   poolToValueObservations,
   saveObservationPool,
+  saveObservationPoolAsync,
   type EntropyObservationWindow,
   type EntropyValueObservation,
 } from "../src/entropy/index.js";
@@ -42,6 +48,36 @@ const levelEntry = (
 ) => pool.file.entries.find((entry) => entry.ref === ref && entry.key === key);
 
 describe("mergeObservationWindow", () => {
+  it("keeps window digests byte-compatible with sorted identity arrays", () => {
+    const observations = [
+      obs("mcp.flags.set", "level", "warn", 3),
+      obs("mcp.flags.set", "level", "info"),
+      obs("mcp.flags.set", "level", "warn"),
+    ];
+    expect(observationWindowDigest(observations)).toBe(
+      stableJsonHash(observations.map(observationIdentity).sort()),
+    );
+  });
+
+  it("matches the pure merge while yielding through a large window", async () => {
+    const observations = Array.from({ length: 1_024 }, (_, index) =>
+      obs("mcp.flags.set", "level", index % 3 === 0 ? "warn" : "info"),
+    );
+    const windows = [window("large.jsonl", observations)];
+    const expected = mergeObservationWindow(undefined, windows);
+    let turns = 0;
+    let running = true;
+    const pulse = (): void => {
+      turns += 1;
+      if (running) setImmediate(pulse);
+    };
+    setImmediate(pulse);
+    const actual = await mergeObservationWindowAsync(undefined, windows);
+    running = false;
+    expect(turns).toBeGreaterThanOrEqual(4);
+    expect(actual).toEqual(expected);
+  });
+
   it("accumulates windows and never double counts an unchanged session", () => {
     const first = mergeObservationWindow(undefined, [
       window("a.jsonl", [obs("mcp.flags.set", "level", "info", 3)]),
@@ -138,7 +174,7 @@ describe("mergeObservationWindow", () => {
 });
 
 describe("observation pool store", () => {
-  it("round-trips the pool, no-ops identical writes, and surfaces damage", () => {
+  it("round-trips the pool, no-ops identical writes, and surfaces damage", async () => {
     const agentDir = makeTempDir();
     expect(loadObservationPool(agentDir)).toEqual({});
     const merged = mergeObservationWindow(undefined, [
@@ -150,12 +186,17 @@ describe("observation pool store", () => {
     expect(loaded.error).toBeUndefined();
     expect(loaded.file).toEqual(merged.file);
     expect(saveObservationPool(agentDir, merged.file).written).toBe(false);
+    expect((await saveObservationPoolAsync(agentDir, merged.file)).written).toBe(false);
+    expect(await loadObservationPoolAsync(agentDir)).toEqual({ file: merged.file });
     const file = path.join(agentDir, "fabric", "entropy", "observation-pool.json");
     fs.writeFileSync(file, "{ nope");
     const damaged = loadObservationPool(agentDir);
     expect(damaged.error).toBe("observation pool is malformed JSON");
     // Damage blocks the overwrite instead of silently rebuilding.
     expect(() => saveObservationPool(agentDir, merged.file)).toThrow(
+      "observation pool is malformed JSON",
+    );
+    await expect(saveObservationPoolAsync(agentDir, merged.file)).rejects.toThrow(
       "observation pool is malformed JSON",
     );
   });

@@ -1,14 +1,18 @@
 import fs from "node:fs";
+import { stableJsonHash, stableJsonHashArrayAsync } from "../src/core/stable-hash.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   compileEntropySurface,
+  compileEntropySurfaceAsync,
   entropyReviewSignals,
   formatEntropyReviewSignal,
   loadCompiledSurface,
+  loadCompiledSurfaceAsync,
   measureEntropy,
   saveCompiledSurface,
+  saveCompiledSurfaceAsync,
   schemaDigest,
   type CompiledSurfaceFile,
   type EntropyOperationInput,
@@ -121,6 +125,24 @@ const compileInput = () => ({
 });
 
 describe("compileEntropySurface", () => {
+  it("hashes large evidence arrays cooperatively without changing canonical bytes", async () => {
+    const values = Array.from({ length: 512 }, (_, index) => ({
+      z: index,
+      nested: { b: index % 3, a: `value-${index}` },
+    }));
+    let turns = 0;
+    let running = true;
+    const pulse = (): void => {
+      turns += 1;
+      if (running) setImmediate(pulse);
+    };
+    setImmediate(pulse);
+    const actual = await stableJsonHashArrayAsync(values);
+    running = false;
+    expect(turns).toBeGreaterThanOrEqual(4);
+    expect(actual).toBe(stableJsonHash(values));
+  });
+
   it("applies the mechanical subset through the gate and builds the artifact", () => {
     const outcome = compileEntropySurface(compileInput());
     expect(outcome.status).toBe("compiled");
@@ -145,6 +167,18 @@ describe("compileEntropySurface", () => {
       "noise-quarantine",
     ]);
     expect(artifact.gate.passed).toBe(true);
+  });
+
+  it("keeps the hook-safe compiler deterministic while yielding to the event loop", async () => {
+    const expected = compileEntropySurface(compileInput());
+    let settled = false;
+    const pending = compileEntropySurfaceAsync(compileInput()).then((outcome) => {
+      settled = true;
+      return outcome;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(await pending).toEqual(expected);
   });
 
   it("converges on the compiled artifact and leaves review-only proposals surfaced", () => {
@@ -274,7 +308,7 @@ describe("compileEntropySurface", () => {
 });
 
 describe("compiled surface store", () => {
-  it("round-trips the artifact, no-ops identical writes, and surfaces damage", () => {
+  it("round-trips the artifact, no-ops identical writes, and surfaces damage", async () => {
     const agentDir = makeTempDir();
     expect(loadCompiledSurface(agentDir)).toEqual({});
     const outcome = compileEntropySurface(compileInput());
@@ -285,12 +319,17 @@ describe("compiled surface store", () => {
     expect(loaded.error).toBeUndefined();
     expect(loaded.file).toEqual(artifact);
     expect(saveCompiledSurface(agentDir, artifact).written).toBe(false);
+    expect((await saveCompiledSurfaceAsync(agentDir, artifact)).written).toBe(false);
+    expect(await loadCompiledSurfaceAsync(agentDir)).toEqual({ file: artifact });
     const file = path.join(agentDir, "fabric", "entropy", "compiled.json");
     fs.writeFileSync(file, "{ nope");
     const damaged = loadCompiledSurface(agentDir);
     expect(damaged.error).toBe("compiled surface is malformed JSON");
     // Damage blocks the overwrite instead of silently rebuilding.
     expect(() => saveCompiledSurface(agentDir, artifact)).toThrow(
+      "compiled surface is malformed JSON",
+    );
+    await expect(saveCompiledSurfaceAsync(agentDir, artifact)).rejects.toThrow(
       "compiled surface is malformed JSON",
     );
   });
