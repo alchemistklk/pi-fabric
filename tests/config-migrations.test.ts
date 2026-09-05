@@ -38,11 +38,11 @@ describe("Fabric configuration migrations", () => {
     expect(result).toMatchObject({
       fromVersion: 0,
       toVersion: CURRENT_FABRIC_CONFIG_VERSION,
-      appliedVersions: [1, 2, 3],
+      appliedVersions: [1, 2, 3, 4],
       changed: true,
     });
     expect(result.document).toEqual({
-      configVersion: 3,
+      configVersion: 4,
       agents: { runner: "claude", defaultTools: ["read"] },
       ui: { enabled: false },
     });
@@ -79,11 +79,11 @@ describe("Fabric configuration migrations", () => {
   it("accepts newer configuration versions as forward-compatible documents", () => {
     // A config written by a newer build (schema only adds semantics) must not
     // brick this extension: accept as-is, apply no migrations, never rewrite.
-    const input = { configVersion: 4, futureSection: { enabled: true } };
+    const input = { configVersion: 5, futureSection: { enabled: true } };
     const result = migrateFabricConfigDocument(input);
     expect(result.document).toEqual(input);
-    expect(result.fromVersion).toBe(4);
-    expect(result.toVersion).toBe(4);
+    expect(result.fromVersion).toBe(5);
+    expect(result.toVersion).toBe(5);
     expect(result.appliedVersions).toEqual([]);
     expect(result.changed).toBe(false);
     expect(result.forwardCompatible).toBe(true);
@@ -96,9 +96,9 @@ describe("Fabric configuration migrations", () => {
 
     const config = loadFabricConfig({ cwd: paths.cwd, agentDir: paths.agentDir, projectTrusted: true });
     expect(config.agents).toMatchObject({ runner: "pi", transport: "tmux", maxConcurrent: 2 });
-    expect(JSON.parse(fs.readFileSync(paths.globalPath, "utf8"))).toMatchObject({ configVersion: 3, agents: { runner: "claude" } });
+    expect(JSON.parse(fs.readFileSync(paths.globalPath, "utf8"))).toMatchObject({ configVersion: 4, agents: { runner: "claude" } });
     expect(JSON.parse(fs.readFileSync(paths.projectPath, "utf8"))).toEqual({
-      configVersion: 3,
+      configVersion: 4,
       agents: { runner: "pi", transport: "tmux" },
     });
   });
@@ -115,7 +115,7 @@ describe("Fabric configuration migrations", () => {
 
   it("does not rewrite an already-current config during load", () => {
     const paths = fixture();
-    const current = JSON.stringify({ configVersion: 3, agents: { maxConcurrent: 3 } }, null, 2) + "\n";
+    const current = JSON.stringify({ configVersion: 4, agents: { maxConcurrent: 3 } }, null, 2) + "\n";
     fs.writeFileSync(paths.globalPath, current);
     const before = fs.statSync(paths.globalPath).mtimeMs;
 
@@ -135,7 +135,7 @@ describe("Fabric configuration migrations", () => {
     );
 
     expect(JSON.parse(fs.readFileSync(paths.projectPath, "utf8"))).toEqual({
-      configVersion: 3,
+      configVersion: 4,
       agents: { transport: "screen", maxConcurrent: 7 },
     });
   });
@@ -157,11 +157,33 @@ describe("Fabric configuration migrations", () => {
       expect(config.agents.maxConcurrent).toBe(5);
       expect(fs.lstatSync(paths.globalPath).isSymbolicLink()).toBe(true);
       expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({
-        configVersion: 3,
+        configVersion: 4,
         agents: { maxConcurrent: 5 },
       });
     },
   );
+
+  it("does not replace a config concurrently created during its first save", () => {
+    const paths = fixture();
+    const fsyncSync = fs.fsyncSync.bind(fs);
+    const concurrent = { ui: { widget: "always" } };
+    let created = false;
+    vi.spyOn(fs, "fsyncSync").mockImplementation((descriptor) => {
+      fsyncSync(descriptor);
+      if (!created && fs.fstatSync(descriptor).isFile()) {
+        created = true;
+        fs.writeFileSync(paths.projectPath, JSON.stringify(concurrent));
+      }
+    });
+
+    expect(() =>
+      saveFabricConfig(
+        { cwd: paths.cwd, agentDir: paths.agentDir, projectTrusted: true },
+        { prewalk: { enabled: false } },
+      )
+    ).toThrow(/changed while updating/);
+    expect(JSON.parse(fs.readFileSync(paths.projectPath, "utf8"))).toEqual(concurrent);
+  });
 
   it("preserves existing file permissions during migration", () => {
     const paths = fixture();
@@ -210,7 +232,7 @@ describe("Fabric configuration migrations", () => {
     expect(result).toMatchObject({
       fromVersion: 1,
       toVersion: CURRENT_FABRIC_CONFIG_VERSION,
-      appliedVersions: [2, 3],
+      appliedVersions: [2, 3, 4],
       changed: true,
     });
     expect(result.document.ui).toEqual({ showAgentToolPreview: false, maxRows: 8 });
@@ -233,7 +255,7 @@ describe("Fabric configuration migrations", () => {
     });
 
     expect(result.changed).toBe(true); // only the version stamp advances
-    expect(result.document).toEqual({ configVersion: 3, ui: { maxRows: 4 } });
+    expect(result.document).toEqual({ configVersion: 4, ui: { maxRows: 4 } });
   });
 
   it("renames ui.nestedToolDebounceMs to ui.updateDebounceMs", () => {
@@ -245,10 +267,52 @@ describe("Fabric configuration migrations", () => {
     expect(result).toMatchObject({
       fromVersion: 2,
       toVersion: CURRENT_FABRIC_CONFIG_VERSION,
-      appliedVersions: [3],
+      appliedVersions: [3, 4],
       changed: true,
     });
     expect(result.document.ui).toEqual({ updateDebounceMs: 250 });
+  });
+
+  it("repairs string booleans emitted for the prewalk master switch", () => {
+    const disabledInput = {
+      configVersion: 3,
+      prewalk: { enabled: "false", mode: "trajectory" },
+    };
+    const disabled = migrateFabricConfigDocument(disabledInput);
+    const enabled = migrateFabricConfigDocument({
+      configVersion: 3,
+      prewalk: { enabled: "true" },
+    });
+
+    expect(disabled.document).toEqual({
+      configVersion: 4,
+      prewalk: { enabled: false, mode: "trajectory" },
+    });
+    expect(enabled.document).toEqual({
+      configVersion: 4,
+      prewalk: { enabled: true },
+    });
+    expect(disabledInput.prewalk.enabled).toBe("false");
+  });
+
+  it("persists a repaired project disable while loading configuration", () => {
+    const paths = fixture();
+    fs.writeFileSync(
+      paths.projectPath,
+      JSON.stringify({ configVersion: 3, prewalk: { enabled: "false" } }),
+    );
+
+    const config = loadFabricConfig({
+      cwd: paths.cwd,
+      agentDir: paths.agentDir,
+      projectTrusted: true,
+    });
+
+    expect(config.prewalk.enabled).toBe(false);
+    expect(JSON.parse(fs.readFileSync(paths.projectPath, "utf8"))).toEqual({
+      configVersion: 4,
+      prewalk: { enabled: false },
+    });
   });
 
   it("persists the rename when loading a legacy ui key", () => {
@@ -266,7 +330,7 @@ describe("Fabric configuration migrations", () => {
 
     expect(config.ui.showAgentToolPreview).toBe(false);
     expect(JSON.parse(fs.readFileSync(paths.globalPath, "utf8"))).toEqual({
-      configVersion: 3,
+      configVersion: 4,
       ui: { showAgentToolPreview: false },
     });
   });

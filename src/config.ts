@@ -1245,7 +1245,7 @@ const planConfigFile = (filePath: string): FabricConfigFilePlan | undefined => {
 const writeJsonAtomic = (
   filePath: string,
   document: Record<string, unknown>,
-  expectedSource?: string,
+  expectedSource: string | null,
 ): void => {
   const resolvedPath = fs.existsSync(filePath) ? fs.realpathSync(filePath) : filePath;
   const directory = path.dirname(resolvedPath);
@@ -1262,7 +1262,11 @@ const writeJsonAtomic = (
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
-    if (expectedSource !== undefined) {
+    if (expectedSource === null) {
+      if (fs.existsSync(resolvedPath)) {
+        throw new Error(`Fabric configuration changed while updating ${filePath}`);
+      }
+    } else {
       let currentSource: string;
       try {
         currentSource = fs.readFileSync(resolvedPath, "utf8");
@@ -1298,6 +1302,7 @@ const resolveFabricConfig = (
     agentDir: string;
   },
   includeProject: boolean,
+  applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
   const plans = [
@@ -1311,7 +1316,10 @@ const resolveFabricConfig = (
     merged = mergeObjects(merged, plan.document);
   }
   const inheritedFullCodeMode = process.env.PI_FABRIC_FULL_CODE_MODE;
-  if (inheritedFullCodeMode === "true" || inheritedFullCodeMode === "false") {
+  if (
+    applyEnvironmentOverrides &&
+    (inheritedFullCodeMode === "true" || inheritedFullCodeMode === "false")
+  ) {
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
   return normalizeFabricConfig(merged);
@@ -1328,7 +1336,7 @@ export const loadFabricConfigForScope = (
   if (scope === "project" && !options.projectTrusted) {
     throw new Error("Cannot load project Fabric configuration for an untrusted project");
   }
-  return resolveFabricConfig(options, scope === "project");
+  return resolveFabricConfig(options, scope === "project", false);
 };
 
 export const loadFabricConfig = (options: {
@@ -1336,7 +1344,7 @@ export const loadFabricConfig = (options: {
   agentDir: string;
   projectTrusted: boolean;
 }): FabricConfig => {
-  const config = resolveFabricConfig(options, options.projectTrusted);
+  const config = resolveFabricConfig(options, options.projectTrusted, true);
   if (config.compaction.engine === "fabric") {
     process.env.PI_FABRIC_COMPACTION_ENGINE = "fabric";
   } else {
@@ -1372,6 +1380,6 @@ export const saveFabricConfig = (
     typeof merged.configVersion === "number" ? merged.configVersion : 0,
     CURRENT_FABRIC_CONFIG_VERSION,
   );
-  writeJsonAtomic(targetPath, merged, input?.source);
+  writeJsonAtomic(targetPath, merged, input?.source ?? null);
   return { scope, path: targetPath };
 };

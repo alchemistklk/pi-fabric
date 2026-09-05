@@ -38,7 +38,6 @@ import {
   saveFabricConfig,
   type FabricConfig,
   type FabricConfigScope,
-  type FabricSchemaMode,
 } from "../config.js";
 import { THINKING_LEVELS, thinkingLabel } from "../thinking.js";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
@@ -293,7 +292,9 @@ const coerceValue = (id: string, value: string, config: FabricConfig): unknown =
     return typeof current === "number" ? current : 160;
   }
   const current = getPath(config, id);
-  if (typeof current === "boolean") return value === "true";
+  // prewalk.enabled is enabled by default and omitted from normalized
+  // configs unless false, so its control still needs an explicit boolean type.
+  if (typeof current === "boolean" || id === "prewalk.enabled") return value === "true";
   if (typeof current === "number") return parseFormattedNumericValue(value);
   // The model picker stores the canonical "provider/id" string, or "Inherit"
   // for no override; persist an empty string so normalizeFabricConfig drops it.
@@ -2169,21 +2170,12 @@ export async function openFabricSettings(
       return;
     }
     deps.state.reloadConfig(context);
-    // The project-scope view is exactly the merged config reloadConfig just
-    // produced; reuse it instead of reading both fabric.json files a third
-    // time. Global scope differs (it excludes project overrides) and still
-    // needs its own load.
+    // Render the persisted layers, not the live config: runtime-only
+    // environment and session overrides must not change what this editor saves.
     Object.assign(
       settingsConfig,
-      saveScope === "project"
-        ? deps.state.config
-        : loadFabricConfigForScope(configLocation, saveScope),
+      loadFabricConfigForScope(configLocation, saveScope),
     );
-    if (id === "schema.mode" && typeof value === "string") {
-      // reloadConfig pins the live session's startup mode; render the saved
-      // value so the picker does not appear to ignore the selection.
-      settingsConfig.schema.mode = value as FabricSchemaMode;
-    }
     deps.onConfigApplied?.(id);
     dirty = true;
     changedSections.add(id.split(".")[0] ?? id);

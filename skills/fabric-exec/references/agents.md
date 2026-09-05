@@ -98,7 +98,7 @@ The guest result is `{ scheduled: true, status: "deferred", boundary: "fabric_ex
 
 ## Automatic prewalk
 
-`/fabric prewalk [task]` arms one automatic continuation when a Fabric invocation contains a successful `pi.edit`, `pi.write`, or `schema.commit`. With a task it submits immediately; without one it captures the next user input. The executor comes from `prewalk.model` or an interactive choice, and its reasoning effort from `prewalk.thinking` (inheriting `agents.thinking` when unset). `prewalk.alwaysRearm` keeps the controller armed until `/fabric prewalk --off`.
+`/fabric prewalk [task]` arms one automatic continuation when a Fabric invocation contains a successful `pi.edit`, `pi.write`, or `schema.commit`. With a task it submits immediately; without one it captures the next user input. The executor comes from `prewalk.model` or an interactive choice, and its reasoning effort from `prewalk.thinking` (inheriting `agents.thinking` when unset). `prewalk.alwaysRearm` keeps the controller armed until `/fabric prewalk --off`. That command cancels only the session arm; `/fabric prewalk --disable` persists the master switch and survives restarts, while `--enable` restores it.
 
 The default `prewalk.mode: "in-place"` switches Main to the executor model at the finalized outer boundary and queues one hidden follow-up to continue the existing task. It does not spawn or wait for a child. The outer tool terminates the old-model automatic turn, then Pi drains the queued continuation on the newly selected model. This mode requires full code mode but not enabled agents; Pi's public model switch also updates its persisted default model.
 

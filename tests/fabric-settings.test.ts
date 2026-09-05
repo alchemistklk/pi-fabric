@@ -889,6 +889,65 @@ describe("FabricSettingsComponent", () => {
     }
   });
 
+  it("edits the persisted full-code value instead of its environment override", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-env-"));
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    const inheritedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const inheritedFullCodeMode = process.env.PI_FABRIC_FULL_CODE_MODE;
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ fullCodeMode: true }));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.PI_FABRIC_FULL_CODE_MODE = "false";
+    try {
+      const location = { cwd, agentDir, projectTrusted: true };
+      const config = loadFabricConfig(location);
+      const state = {
+        config,
+        ensure: vi.fn().mockResolvedValue(undefined),
+        reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
+        agents: { claudeModels: vi.fn().mockResolvedValue([]) },
+      } as unknown as FabricState;
+      const context = {
+        mode: "tui",
+        cwd,
+        isProjectTrusted: () => true,
+        modelRegistry: { getAvailable: () => fakeModelSource.models },
+        ui: {
+          notify: vi.fn(),
+          custom: vi.fn(async (factory) => {
+            const component = factory({ requestRender: vi.fn() }, theme, {}, () => {}) as FabricSettingsComponent;
+            component.handleInput("\x07");
+            const list = component.settingsList as any;
+            const item = list.items.find(
+              (candidate: { id: string }) => candidate.id === "fullCodeMode",
+            );
+            expect(item.currentValue).toBe("true");
+            list.selectedIndex = list.items.indexOf(item);
+            list.activateItem();
+          }),
+        },
+      } as unknown as ExtensionContext;
+
+      await openFabricSettings(context, {
+        state,
+        applyFabricMode: vi.fn(),
+        capturedTools: { list: () => [] } as unknown as CapturedToolCatalog,
+      });
+
+      expect(JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8")))
+        .toMatchObject({ fullCodeMode: false });
+      expect(config.fullCodeMode).toBe(false);
+    } finally {
+      if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
+      if (inheritedFullCodeMode === undefined) delete process.env.PI_FABRIC_FULL_CODE_MODE;
+      else process.env.PI_FABRIC_FULL_CODE_MODE = inheritedFullCodeMode;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps global edits visible when a project override remains effective", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-shadowed-global-"));
     const cwd = path.join(root, "project");
@@ -957,6 +1016,67 @@ describe("FabricSettingsComponent", () => {
       else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
       if (inheritedFullCodeMode === undefined) delete process.env.PI_FABRIC_FULL_CODE_MODE;
       else process.env.PI_FABRIC_FULL_CODE_MODE = inheritedFullCodeMode;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists disabling default-on Prewalk as a boolean across reloads", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-prewalk-disable-"));
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    const inheritedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    fs.mkdirSync(cwd, { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      const location = { cwd, agentDir, projectTrusted: true };
+      const config = loadFabricConfig(location);
+      const applyFabricMode = vi.fn();
+      const state = {
+        config,
+        ensure: vi.fn().mockResolvedValue(undefined),
+        reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig(location))),
+        agents: { claudeModels: vi.fn().mockResolvedValue([]) },
+      } as unknown as FabricState;
+      const context = {
+        mode: "tui",
+        cwd,
+        isProjectTrusted: () => true,
+        modelRegistry: { getAvailable: () => fakeModelSource.models },
+        ui: {
+          notify: vi.fn(),
+          custom: vi.fn(async (factory) => {
+            const component = factory({}, theme, {}, () => {}) as FabricSettingsComponent;
+            const rootList = component.settingsList as any;
+            rootList.selectedIndex = rootList.items.findIndex(
+              (item: { id: string }) => item.id === "prewalk",
+            );
+            rootList.activateItem();
+            const prewalkList = rootList.submenuComponent.settingsList;
+            prewalkList.selectedIndex = prewalkList.items.findIndex(
+              (item: { id: string }) => item.id === "prewalk.enabled",
+            );
+            prewalkList.activateItem();
+          }),
+        },
+      } as unknown as ExtensionContext;
+
+      await openFabricSettings(context, {
+        state,
+        applyFabricMode,
+        capturedTools: { list: () => [] } as unknown as CapturedToolCatalog,
+      });
+
+      const saved = JSON.parse(
+        fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"),
+      ) as { prewalk?: { enabled?: unknown } };
+      expect(saved.prewalk?.enabled).toBe(false);
+      expect(typeof saved.prewalk?.enabled).toBe("boolean");
+      expect(loadFabricConfig(location).prewalk.enabled).toBe(false);
+      expect(config.prewalk.enabled).toBe(false);
+      expect(applyFabricMode).toHaveBeenCalledOnce();
+    } finally {
+      if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1199,6 +1319,7 @@ describe("Fabric RPC settings", () => {
       let editedDepth = false;
       let editedModel = false;
       let editedVeda = false;
+      let editedVedaModel = false;
       const state = {
         config,
         ensure: vi.fn().mockResolvedValue(undefined),
@@ -1214,6 +1335,7 @@ describe("Fabric RPC settings", () => {
           if (!editedDepth) return options.find((option) => option.startsWith("Max depth"));
           if (!editedModel) return options.find((option) => option.startsWith("Default model"));
           if (!editedVeda) return options.find((option) => option.startsWith("Veda backend"));
+          if (!editedVedaModel) return options.find((option) => option.startsWith("Veda model"));
           return "← Back";
         }
         if (title.startsWith("Fabric settings")) {
@@ -1234,6 +1356,10 @@ describe("Fabric RPC settings", () => {
           editedVeda = true;
           return "codex";
         }
+        if (title.startsWith("Fabric settings › Agents › Veda model")) {
+          editedVedaModel = true;
+          return "false";
+        }
         return undefined;
       });
       const context = {
@@ -1251,11 +1377,17 @@ describe("Fabric RPC settings", () => {
       });
 
       expect(JSON.parse(fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8")))
-        .toMatchObject({ agents: { maxDepth: 64, model: "openai/gpt-5.5", veda: { backend: "codex" } } });
+        .toMatchObject({
+          agents: {
+            maxDepth: 64,
+            model: "openai/gpt-5.5",
+            veda: { backend: "codex", model: "false" },
+          },
+        });
       expect(config.agents.maxDepth).toBe(64);
       expect(config.agents.model).toBe("openai/gpt-5.5");
-      expect(config.agents.veda.backend).toBe("codex");
-      expect(input).toHaveBeenCalledTimes(2);
+      expect(config.agents.veda).toMatchObject({ backend: "codex", model: "false" });
+      expect(input).toHaveBeenCalledTimes(3);
       expect(applyFabricMode).toHaveBeenCalledOnce();
     } finally {
       if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
