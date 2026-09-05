@@ -181,6 +181,7 @@ const snapshot = (): FabricDashboardSnapshot => {
     actors: [
       {
         id: "actor-1",
+        scope: "project",
         name: "advisor",
         status: "idle",
         runner: "pi",
@@ -2974,6 +2975,7 @@ describe("Fabric dashboard global actors and instructions editor", () => {
       actors: [
         {
           id: "actor-1",
+          scope: "project",
           name: "advisor",
           status: "idle",
           runner: "pi",

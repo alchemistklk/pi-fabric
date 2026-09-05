@@ -236,14 +236,12 @@ Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-
 
 Fabric uses one participant directory for each project. Every live entity has a fixed `kind` of `root`, `agent`, or `actor`. It also has a `rootId`, an optional `parentId`, an `ownerHostId`, and an authenticated owner identity for the process that controls its lifecycle. **Main** is the local user-facing view of one root. **Peers** provide compatibility views of the other roots. These views do not use separate registries or control planes. **Fabric reserves Peer for another root Pi session. The term never means a child agent.** When asked about a peer, call `agents.peers()` first. `agents.list()` reports only child agents, so it cannot determine whether a peer root has settled.
 
-`agents.self()` returns the participant record for the caller. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` provide convenient root projections. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
+`agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
 
 ```ts
 const main = await agents.main();
-const project = await agents.members({ scope: "project" });
-const peerRoot = project.find(
-  (participant) => participant.kind === "root" && participant.id !== main.id,
-);
+const sessions = await agents.sessions();
+const peerRoot = sessions.find((participant) => participant.id !== main.id);
 if (peerRoot) {
   await agents.steer({ id: peerRoot.id, message: "Coordinate on the shared migration." });
 }
@@ -331,7 +329,7 @@ Claude actors can keep context and use mapped Claude Code tools to inspect or ed
 
 ### Shared actors and session bindings
 
-`mesh.actorScope: "project"` stores one actor definition for the project. Fabric keeps three pieces of state:
+A project-scoped actor stores one definition for the project. Select storage per actor with `agents.create({ scope: "project" | "session", ... })`; omitted scope uses `mesh.actorScope` as a compatibility default. Fabric keeps three pieces of state:
 
 - **Project definition.** The shared registry stores the actor ID, instructions, runner, subscriptions, tools, and project model and thinking defaults.
 - **Session binding.** A mode-`0600` file stores only `model` and `thinking` for one Pi session ID. It survives a resume of that session and does not rewrite `actors.json`.
@@ -372,7 +370,7 @@ Fabric stores the resolved binding on each mailbox item before it queues. Later 
 
 The mailbox, history, and runner session remain shared. Host events and mesh subscriptions run once on the owner and use the owner's session binding. Opening another Pi session does not start another copy of the actor.
 
-Use `mesh.actorScope: "session"` when each Pi session needs its own definitions, mailbox, history, and runtime. Under project scope, every trusted session can read shared actor definitions, mailbox history, and logs. Do not store secrets in them.
+Use `scope: "session"` when one root Pi session needs its own definition, mailbox, history, and runtime; use `scope: "project"` for repository-wide guardians. Both run concurrently. Session identity propagates to recursive participant agents in the same lineage. Under project scope, every trusted session can read shared actor definitions, mailbox history, and logs. Do not store secrets in them.
 
 Use `requires` to declare exact `provider.action` capabilities for every activation. An entry can use `{ ref, optional: true }`. Before launch, the host resolves and keeps one view identified by its descriptor hash. Pi children separately resolve the portable semantic digest. They run with a closed-world Fabric surface, so a live provider addition cannot expand the actor during a run. When required refs are missing, mailbox work stays queued. `missingCapabilities` reports which capabilities are available, separately from `idle | queued | running | stopped`. Changes to providers or catalogs retry dispatch. Actor status and run metadata include the normalized requirements and last committed digest. Claude actors receive the host availability commitment. They have no child Fabric surface to limit. If the private Claude session was removed, the next activation reports a clear failure and preserves actor context. Recreate the actor when you need a new Claude session.
 

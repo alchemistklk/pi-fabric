@@ -268,6 +268,7 @@ export class ActorRegistryOwnershipError extends Error {
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
+  readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registryPath: string;
   readonly #persistent: boolean;
   readonly #bindings: ActorBindingStore;
@@ -277,6 +278,7 @@ export class ActorManager {
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
   readonly #meshCursorPath: string | undefined;
+  readonly #relayParticipantSteering: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #acquireCapabilityView:
     | ((
@@ -322,6 +324,7 @@ export class ActorManager {
     readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
     options: {
       actorRoot?: string;
+      actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
@@ -330,6 +333,7 @@ export class ActorManager {
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
       meshCursorPath?: string;
+      relayParticipantSteering?: boolean;
       retention?: FabricRetentionConfig;
       acquireCapabilityView?(
         requirements: readonly FabricCapabilityRequirement[],
@@ -339,6 +343,7 @@ export class ActorManager {
   ) {
     this.#actorRoot =
       options.actorRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actors-"));
+    this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
@@ -347,6 +352,7 @@ export class ActorManager {
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
     this.#meshCursorPath = options.meshCursorPath;
+    this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#registryPath = path.join(this.#actorRoot, "actors.json");
     this.#bindings = new ActorBindingStore(
       sessionId,
@@ -1762,27 +1768,29 @@ export class ActorManager {
     const kind = event.kind === "followUp" ? "followUp" : "steer";
     const message = typeof event.text === "string" ? event.text : "";
     if (!message) return;
-    if (this.#mainAgent?.local && target === this.#mainAgent.id) {
-      try {
-        this.#mainAgent.deliverAgent({
-          from: event.from,
-          message,
-          delivery: kind,
-          ...(event.data === undefined ? {} : { data: event.data }),
-        });
-      } catch {
-        // The owning main session may be shutting down; mesh delivery is best-effort.
-      }
-      return;
-    }
-    try {
-      this.agents.status(target);
-      if (kind === "steer") this.agents.steer(target, message);
-      else this.agents.followUp(target, message);
-      return;
-    } catch (error) {
-      if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
+    if (this.#relayParticipantSteering) {
+      if (this.#mainAgent?.local && target === this.#mainAgent.id) {
+        try {
+          this.#mainAgent.deliverAgent({
+            from: event.from,
+            message,
+            delivery: kind,
+            ...(event.data === undefined ? {} : { data: event.data }),
+          });
+        } catch {
+          // The owning main session may be shutting down; mesh delivery is best-effort.
+        }
         return;
+      }
+      try {
+        this.agents.status(target);
+        if (kind === "steer") this.agents.steer(target, message);
+        else this.agents.followUp(target, message);
+        return;
+      } catch (error) {
+        if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
+          return;
+        }
       }
     }
     try {
@@ -2282,6 +2290,7 @@ export class ActorManager {
     const effective = this.#runBinding(actor);
     return {
       id: actor.id,
+      scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
       status: actor.status,

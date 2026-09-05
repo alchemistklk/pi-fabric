@@ -198,25 +198,29 @@ export class FabricState {
       (this.config.mesh.root
         ? path.resolve(projectRoot, this.config.mesh.root)
         : path.join(projectRoot, ".pi", "fabric", "mesh"));
-    const actorRoot = this.config.mesh.actorScope === "session"
-      ? path.join(meshRoot, "actors", sessionId)
-      : path.join(meshRoot, "actors");
-    try {
-      const registry = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as unknown;
-      if (typeof registry !== "object" || registry === null || Array.isArray(registry)) return false;
-      const actors = (registry as { actors?: unknown }).actors;
-      return Array.isArray(actors) && actors.some((value) => {
-        if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-        const actor = value as Record<string, unknown>;
-        return typeof actor.id === "string" && /^[a-f0-9]{32}$/.test(actor.id) &&
-          typeof actor.name === "string" && /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/.test(actor.name) &&
-          typeof actor.instructions === "string" &&
-          Buffer.byteLength(actor.instructions, "utf8") <= this.config.mesh.maxEventBytes &&
-          typeof actor.createdAt === "number" && Number.isFinite(actor.createdAt);
-      });
-    } catch {
-      return false;
-    }
+    const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
+    const actorRoots = [
+      path.join(meshRoot, "actors"),
+      path.join(meshRoot, "actors", fabricSessionId),
+    ];
+    return actorRoots.some((actorRoot) => {
+      try {
+        const registry = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as unknown;
+        if (typeof registry !== "object" || registry === null || Array.isArray(registry)) return false;
+        const actors = (registry as { actors?: unknown }).actors;
+        return Array.isArray(actors) && actors.some((value) => {
+          if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+          const actor = value as Record<string, unknown>;
+          return typeof actor.id === "string" && /^[a-f0-9]{32}$/.test(actor.id) &&
+            typeof actor.name === "string" && /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/.test(actor.name) &&
+            typeof actor.instructions === "string" &&
+            Buffer.byteLength(actor.instructions, "utf8") <= this.config.mesh.maxEventBytes &&
+            typeof actor.createdAt === "number" && Number.isFinite(actor.createdAt);
+        });
+      } catch {
+        return false;
+      }
+    });
   }
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }

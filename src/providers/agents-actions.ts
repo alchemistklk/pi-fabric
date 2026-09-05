@@ -219,6 +219,12 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
   {
+    name: "sessions",
+    description: "List all live root Pi session agents in the project, including the current lineage root and peers, with symmetric participant identities.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    risk: "read",
+  },
+  {
     name: "peers",
     description: "List other live root Pi sessions sharing this project mesh. The dashboard-owning session remains Main; these targets are named peers.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -314,7 +320,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "create",
     description:
-      'Create a persistent actor with a mailbox and optional subscriptions to any session-bound Pi event or mesh topic. Image-bearing events attach images to the actor model automatically while persistent event data stays redacted. Use scope "global" to save a reusable project-independent template to the global registry instead of a live project actor; global templates are not live and carry no history.',
+      'Create a persistent actor with independently selected session or project storage. Use scope "global" to save a reusable project-independent template instead of a live actor.',
     inputSchema: {
       type: "object",
       properties: {
@@ -368,7 +374,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           required: ["version", "source"],
           additionalProperties: false,
         },
-        scope: { type: "string", enum: ["project", "global"] },
+        scope: {
+          type: "string",
+          enum: ["session", "project", "global"],
+          description: "session isolates the actor to the root Pi session; project shares it across sessions; global creates a non-live template.",
+        },
       },
       required: ["name", "instructions"],
       oneOf: [

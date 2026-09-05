@@ -150,6 +150,7 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
       projectRoot: repo,
       meshRoot,
       actorRoot: path.join(meshRoot, "actors"),
+      sessionActorRoot: path.join(meshRoot, "actors", name),
       residencyRoot,
       fullCodeMode: true,
       agents: { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000 },
@@ -539,6 +540,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         state.identity.id,
       );
       const second = await recruitment.createActor({
+        scope: "session",
         name: "recruited advisor",
         instructions: "Challenge the design.",
         residency: "durable",
@@ -551,6 +553,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         "recruited architect",
       ]);
       expect(residentActors.every((actor) => actor.residency === "durable")).toBe(true);
+      expect(first.scope).toBe("project");
+      expect(second.scope).toBe("session");
+      expect(second.sessionFile).toContain(path.join(state.config.sessionActorRoot!, second.id));
       expect(new Set(residentActors.map((actor) => actor.sessionFile)).size).toBe(2);
 
       for (const actor of residentActors) await client.removeActor(actor.id);

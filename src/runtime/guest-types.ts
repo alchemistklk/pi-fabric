@@ -560,6 +560,7 @@ type FabricActorBindingScope = "session" | "project";
 interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
 interface FabricActorRequestBase {
+  scope?: "session" | "project" | "global";
   name: string;
   instructions: string;
   events?: FabricActorHostEvent[];
@@ -585,6 +586,7 @@ type FabricActorRequest = FabricActorRequestBase & (
 );
 interface FabricActorInfo {
   id: string;
+  scope: "session" | "project";
   name: string;
   status: "idle" | "queued" | "running" | "stopped";
   runner: FabricAgentRunner;
@@ -661,6 +663,7 @@ interface FabricAgentsApi {
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   self(): Promise<FabricParticipantInfo>;
   main(): Promise<FabricMainAgentInfo>;
+  sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
   subscribe(args: {
     from: string;

@@ -1725,7 +1725,7 @@ export const buildFabricSettingsItems = (
           }),
           setting("mesh.actorScope", "Actor scope", config.mesh.actorScope, {
             description:
-              'Where persistent actor definitions, mailboxes, and sessions are stored. "project" shares actors across all Pi sessions in this project (survives /new); "session" isolates them per Pi session (the previous default).',
+              'Default storage for newly created actors. Each agents.create call may choose project or session independently; project actors are shared, while session actors follow the root Pi session and its participant agents.',
             values: ACTOR_SCOPES,
           }),
           setting("mesh.maxReadEvents", "Max read events", String(config.mesh.maxReadEvents), {

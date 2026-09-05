@@ -136,6 +136,10 @@ describe("ParticipantDirectory", () => {
       "agent:alpha-child",
       "agent:grandchild",
     ]);
+    expect(alpha.sessions()).toMatchObject([
+      { id: "session:alpha", kind: "root", local: true },
+      { id: "session:beta", kind: "root", local: false },
+    ]);
     expect(alpha.peers()).toMatchObject([
       { id: "session:beta", name: "PRO-2", label: "PRO-2", kind: "peer", local: false },
     ]);

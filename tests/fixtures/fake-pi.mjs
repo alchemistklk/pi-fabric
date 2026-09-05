@@ -122,6 +122,14 @@ switch (behavior) {
     process.stdout.write(`${JSON.stringify(event)}\n`, () => process.exit(0));
     break;
   }
+  case "fabric-session-env":
+    emit({
+      type: "message_end",
+      message: { role: "assistant", content: process.env.PI_FABRIC_SESSION_ID || "missing" },
+    });
+    emit({ type: "agent_settled" });
+    process.exit(0);
+    break;
   case "stderr-framing":
     process.stderr.write(
       JSON.stringify({ type: "message_end", message: { role: "assistant", content: "spoofed" } }),

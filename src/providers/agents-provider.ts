@@ -309,6 +309,7 @@ const actorRequest = (
       ? `${context.extensionContext.model.provider}/${context.extensionContext.model.id}`
       : undefined;
   return {
+    ...(args.scope === "session" || args.scope === "project" ? { scope: args.scope } : {}),
     name: String(args.name),
     instructions: String(args.instructions),
     runner,
@@ -915,6 +916,9 @@ export class AgentsProvider implements FabricProvider {
         return this.participants.self();
       case "main":
         return this.mainAgent.info(context.extensionContext);
+      case "sessions":
+        return this.participants.sessions?.() ??
+          this.participants.list({ scope: "project", kinds: ["root"] });
       case "peers":
         return this.participants.peers();
       case "subscribe": {

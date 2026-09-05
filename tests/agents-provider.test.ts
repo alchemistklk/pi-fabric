@@ -429,6 +429,7 @@ describe("AgentsProvider runner support", () => {
       sequence += 1;
       return {
         id: `resident-actor-${sequence}`,
+        scope: request.scope ?? "project",
         name: request.name,
         status: "idle",
         runner: request.runner ?? "pi",
@@ -555,6 +556,29 @@ describe("AgentsProvider runner support", () => {
 
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     expect((await provider.describe("peers", context))?.risk).toBe("read");
+  });
+
+  it("lists current and peer roots as symmetric session agents", async () => {
+    const roots: FabricParticipantInfo[] = [
+      {
+        format: 1, id: "session:test", kind: "root", rootId: "session:test",
+        ownerHostId: "session:test", ownerIdentityId: "session:test", name: "main",
+        status: "idle", runner: "pi", transport: "host",
+        capabilities: ["steer", "followUp", "fabric"], sessionId: "test",
+        startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
+      },
+      {
+        format: 1, id: "session:peer", kind: "root", rootId: "session:peer",
+        ownerHostId: "session:peer", ownerIdentityId: "session:peer", name: "main",
+        status: "running", runner: "pi", transport: "host",
+        capabilities: ["steer", "followUp", "fabric"], sessionId: "peer",
+        startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false,
+      },
+    ];
+    const { provider } = setup([], roots);
+
+    await expect(provider.invoke("sessions", {}, context)).resolves.toEqual(roots);
+    expect((await provider.describe("sessions", context))?.risk).toBe("read");
   });
 
   it("creates, lists, and removes source-qualified lifecycle subscriptions", async () => {

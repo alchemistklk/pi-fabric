@@ -9,7 +9,7 @@ import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
-import { ActorManager } from "../actors/manager.js";
+import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -87,6 +87,7 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
     typeof config.projectRoot !== "string" ||
     typeof config.meshRoot !== "string" ||
     typeof config.actorRoot !== "string" ||
+    (config.sessionActorRoot !== undefined && typeof config.sessionActorRoot !== "string") ||
     typeof config.residencyRoot !== "string" ||
     typeof config.fullCodeMode !== "boolean" ||
     typeof config.agents !== "object" ||
@@ -117,7 +118,7 @@ class ResidentHost {
   readonly participants: ParticipantDirectory;
   readonly control: FabricControlPlane;
   readonly agents: AgentManager;
-  readonly actors: ActorManager;
+  readonly actors: ActorDirectory;
   readonly lifecycle: LifecycleBroker;
   readonly #ownerPath: string;
   readonly #lockPath: string;
@@ -184,6 +185,7 @@ class ResidentHost {
       runRoot: path.join(config.residencyRoot, "runs"),
       fullCodeMode: config.fullCodeMode,
       mainAgentId: config.rootId,
+      fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,
       hostId: this.hostId,
@@ -217,7 +219,12 @@ class ResidentHost {
     };
     const lineageAlive = (rootId: string): boolean =>
       this.participants.get(rootId) !== undefined;
-    this.actors = new ActorManager(
+    const actorRoots = config.sessionActorRoot
+      ? { project: config.actorRoot, session: config.sessionActorRoot }
+      : config.mesh.actorScope === "session"
+        ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+        : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
+    this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
       this.mesh,
@@ -236,7 +243,6 @@ class ResidentHost {
         ).catch(() => undefined);
       },
       {
-        actorRoot: config.actorRoot,
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -245,7 +251,7 @@ class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: config.retention,
       },
-    );
+    ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(
       this.mesh,
       this.identity,

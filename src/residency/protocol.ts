@@ -29,6 +29,7 @@ export interface ResidentHostConfig {
   projectRoot: string;
   meshRoot: string;
   actorRoot: string;
+  sessionActorRoot?: string;
   residencyRoot: string;
   fullCodeMode: boolean;
   agents: FabricAgentConfig;

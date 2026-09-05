@@ -182,6 +182,20 @@ describe("FabricState lazy bootstrap", () => {
       }],
     }));
     expect(actorState.shouldEagerlyActivate(actorContext)).toBe(true);
+
+    fs.writeFileSync(registryPath, JSON.stringify({ actors: [] }));
+    vi.stubEnv("PI_FABRIC_SESSION_ID", "root-session");
+    const sessionActorDirectory = path.join(actorDirectory, "root-session");
+    fs.mkdirSync(sessionActorDirectory, { recursive: true });
+    fs.writeFileSync(path.join(sessionActorDirectory, "actors.json"), JSON.stringify({
+      actors: [{
+        id: "b".repeat(32),
+        name: "session reviewer",
+        instructions: "Review this root session",
+        createdAt: Date.now(),
+      }],
+    }));
+    expect(actorState.shouldEagerlyActivate(actorContext)).toBe(true);
     vi.unstubAllEnvs();
   });
 

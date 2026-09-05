@@ -360,6 +360,7 @@ const main = async (): Promise<void> => {
       PI_FABRIC_PARENT_RUN: options.id,
       PI_FABRIC_AGENT_NAME: options.name,
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
+      ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),
       PI_FABRIC_FULL_CODE_MODE: String(options.fullCodeMode),
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),

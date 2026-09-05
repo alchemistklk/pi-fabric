@@ -380,6 +380,7 @@ export class AgentManager {
   readonly #currentDepth: number;
   readonly #fullCodeMode: boolean;
   readonly #mainAgentId: string | undefined;
+  readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
   readonly #projectRoot: string;
   readonly #hostId: string | undefined;
@@ -415,6 +416,7 @@ export class AgentManager {
       runRoot?: string;
       fullCodeMode?: boolean;
       mainAgentId?: string;
+      fabricSessionId?: string;
       meshRoot?: string;
       projectRoot?: string;
       hostId?: string;
@@ -448,6 +450,7 @@ export class AgentManager {
     this.#fullCodeMode = options.fullCodeMode ?? true;
     this.#mainAgentId =
       options.mainAgentId ?? process.env.PI_FABRIC_MAIN_AGENT_ID;
+    this.#fabricSessionId = options.fabricSessionId ?? process.env.PI_FABRIC_SESSION_ID;
     this.#meshRoot = options.meshRoot ?? process.env.PI_FABRIC_MESH_ROOT;
     this.#projectRoot =
       options.projectRoot ?? process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
@@ -675,6 +678,7 @@ export class AgentManager {
         "--full-code-mode",
         String(recursive && this.#fullCodeMode),
         ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
+        ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
         "--extensions",
         String(extensions),
         "--tools",

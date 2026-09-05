@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
-import { ActorManager } from "./actors/manager.js";
+import { ActorDirectory } from "./actors/directory.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
 import { GlobalActorRegistry } from "./actors/global-registry.js";
@@ -160,7 +160,7 @@ export class FabricRuntimeState {
   #speculationStore: FabricSpeculationStore | undefined;
   #speculationTap: FabricSpeculationStreamTap | undefined;
   #agents: AgentManager | undefined;
-  #actors: ActorManager | undefined;
+  #actors: ActorDirectory | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #mesh: MeshStore | undefined;
   #identity: MeshIdentity | undefined;
@@ -340,7 +340,7 @@ export class FabricRuntimeState {
     return this.#agents;
   }
 
-  get actors(): ActorManager {
+  get actors(): ActorDirectory {
     if (!this.#actors) throw new Error("Pi Fabric has not initialized");
     return this.#actors;
   }
@@ -538,6 +538,7 @@ export class FabricRuntimeState {
     }
     const sessionId = context.sessionManager.getSessionId();
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
+    const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const ownsPersistentActorRegistry =
       identity.kind === "main" &&
       !enforceSchema &&
@@ -627,6 +628,7 @@ export class FabricRuntimeState {
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
       mainAgentId,
+      fabricSessionId,
       meshRoot,
       projectRoot,
       hostId,
@@ -692,10 +694,10 @@ export class FabricRuntimeState {
     };
     const lineageAlive = (rootId: string): boolean =>
       this.#participants?.get(rootId) !== undefined;
-    const persistentActorRoot =
-      this.#config.mesh.actorScope === "session"
-        ? path.join(meshRoot, "actors", sessionId)
-        : path.join(meshRoot, "actors");
+    const actorRoots = {
+      project: path.join(meshRoot, "actors"),
+      session: path.join(meshRoot, "actors", fabricSessionId),
+    };
     const acquireActorCapabilityView = (
       requirements: Parameters<ActionRegistry["acquireCapabilityView"]>[0],
       signal: AbortSignal,
@@ -707,8 +709,8 @@ export class FabricRuntimeState {
       extensionContext: context,
       update() {},
     });
-    this.#actors = new ActorManager(
-      sessionId,
+    this.#actors = new ActorDirectory([
+      fabricSessionId,
       identity,
       this.#mesh,
       enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
@@ -738,7 +740,6 @@ export class FabricRuntimeState {
       },
       ownsPersistentActorRegistry
         ? {
-            actorRoot: persistentActorRoot,
             persistent: true,
             mainAgent,
             canManageActor,
@@ -758,7 +759,7 @@ export class FabricRuntimeState {
             retention: this.#config.retention,
             acquireCapabilityView: acquireActorCapabilityView,
           },
-    );
+    ], actorRoots, this.#config.mesh.actorScope);
     this.#registry.subscribeProviderChanges(() => {
       this.#actors?.retryCapabilityWaiters();
       this.#refreshRepairCatalog();
@@ -787,7 +788,8 @@ export class FabricRuntimeState {
             cwd: context.cwd,
             projectRoot,
             meshRoot,
-            actorRoot: persistentActorRoot,
+            actorRoot: actorRoots.project,
+            sessionActorRoot: actorRoots.session,
             residencyRoot: residentRoot(meshRoot, mainAgentId),
             fullCodeMode: this.#config.fullCodeMode,
             agents: structuredClone(this.#config.agents),
