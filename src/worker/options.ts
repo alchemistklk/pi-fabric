@@ -60,6 +60,7 @@ export const parseWorkerOptions = (
   const maxTokens = optional(args, "max-tokens");
   const runnerSessionId = optional(args, "runner-session-id");
   const mainAgentId = optional(args, "main-agent-id");
+  const fabricSessionId = optional(args, "fabric-session-id");
   const runner = required(args, "runner");
   if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
     throw new Error(`Unsupported Fabric agent runner: ${runner}`);
@@ -84,6 +85,7 @@ export const parseWorkerOptions = (
     depth: Number(required(args, "depth")),
     fullCodeMode: required(args, "full-code-mode") === "true",
     ...(mainAgentId ? { mainAgentId } : {}),
+    ...(fabricSessionId ? { fabricSessionId } : {}),
     extensions: required(args, "extensions") === "true",
     tools: JSON.parse(required(args, "tools")) as string[],
     grantedRisks: JSON.parse(required(args, "granted-risks")) as string[],

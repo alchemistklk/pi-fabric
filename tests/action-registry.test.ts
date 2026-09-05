@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ActionRegistry,
   type FabricCallAudit,
@@ -8,6 +11,10 @@ import type {
   FabricInvocationContext,
   FabricProvider,
 } from "../src/protocol.js";
+import { setActiveRepairCompiler } from "../src/repairs/active.js";
+import { RepairCompiler } from "../src/repairs/compiler.js";
+import { setActiveCompiledSurface } from "../src/entropy/active.js";
+import { schemaDigest, type CompiledSurfaceFile } from "../src/entropy/index.js";
 
 const provider = (): FabricProvider => ({
   name: "demo",
@@ -79,6 +86,21 @@ const invokeContext = (audits: FabricCallAudit[] = []) => ({
   audits,
   maxResultChars: 10_000,
 });
+
+const repairTmp: string[] = [];
+afterEach(() => {
+  setActiveRepairCompiler(undefined);
+  for (const dir of repairTmp.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const attachCompiler = (): RepairCompiler => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-registry-repairs-"));
+  repairTmp.push(agentDir);
+  const compiler = new RepairCompiler({ agentDir });
+  compiler.setCatalogSurface({ providers: ["demo"], capturedTools: [] });
+  setActiveRepairCompiler(compiler);
+  return compiler;
+};
 
 describe("ActionRegistry", () => {
   it("lists, searches, describes, and invokes providers", async () => {
@@ -523,5 +545,436 @@ describe("ActionRegistry", () => {
     await expect(registry.describe("demo.echo", context)).resolves.toMatchObject({
       ref: "demo.echo",
     });
+  });
+
+  it("persists a unique live action alias and applies it on the next miss", async () => {
+    const compiler = attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register(actionProvider("recall", "expand"));
+    expect(await registry.invoke("demo.search", {}, invokeContext())).toBe("recall");
+    expect(compiler.repairs).toContainEqual({
+      kind: "actionAlias",
+      provider: "demo",
+      from: "search",
+      to: "recall",
+    });
+  });
+
+  it("does not apply action aliases when a committed capability view is pinned", async () => {
+    attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register(actionProvider("recall", "expand"));
+    expect(await registry.invoke("demo.search", {}, invokeContext())).toBe("recall");
+    const pinned = await registry.acquireCapabilityView(["demo.recall"], context);
+    expect(pinned.satisfied).toBe(true);
+    await expect(
+      registry.invoke("demo.search", {}, {
+        ...invokeContext(),
+        capabilityView: pinned.view!,
+      }),
+    ).rejects.toThrow(/Unknown Fabric action|outside the committed view/);
+    await pinned.release();
+  });
+
+  it("does not learn accepted extension keys", async () => {
+    const compiler = attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register({
+      name: "demo",
+      description: "extensible action",
+      async list() {
+        return [await this.describe("echo", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "echo"
+          ? {
+              name: "echo",
+              description: "echo",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                additionalProperties: true,
+              },
+              risk: "read" as const,
+            }
+          : undefined;
+      },
+      async invoke(_name, args) {
+        return args.val;
+      },
+    });
+    expect(await registry.invoke("demo.echo", { val: "ok" }, invokeContext())).toBe("ok");
+    expect(compiler.repairs).toEqual([]);
+  });
+
+  it("repairs before provider preparation and scopes the row to the resolved action", async () => {
+    const compiler = attachCompiler();
+    const proxy = {
+      proxy: vi.fn(async (request: {
+        value: unknown;
+        args: Record<string, unknown>;
+      }) => request.value),
+    };
+    const registry = new ActionRegistry(proxy);
+    registry.register({
+      name: "demo",
+      description: "session action",
+      async list() {
+        return [await this.describe("recall", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "recall"
+          ? {
+              name: "recall",
+              description: "recall",
+              inputSchema: {
+                type: "object",
+                properties: { session: { type: "string" } },
+                required: ["session"],
+                additionalProperties: false,
+              },
+              risk: "read" as const,
+            }
+          : undefined;
+      },
+      async prepareArguments(_name, args) {
+        if ("sessionId" in args) throw new Error("preparer received spilled arguments");
+        return { ...args, session: String(args.session).trim() };
+      },
+      async invoke(_name, args) {
+        return args.session;
+      },
+    });
+    expect(
+      await registry.invoke("demo.search", { sessionId: " s1 " }, invokeContext()),
+    ).toBe("s1");
+    expect(compiler.repairs).toContainEqual({
+      kind: "keyAlias",
+      ref: "demo.recall",
+      from: "sessionId",
+      to: "session",
+    });
+    expect(proxy.proxy).toHaveBeenCalledWith(
+      expect.objectContaining({ args: { session: "s1" }, value: "s1" }),
+    );
+    expect(compiler.status()).toMatchObject({ invocationErrors: 0 });
+
+    registry.setSpeculation({
+      async tryServe() { return { hit: false, reason: "absent" }; },
+      bumpEpoch() {},
+    }, () => true);
+    const speculation = await registry.speculate(
+      "demo.recall",
+      { sessionId: " s2 " },
+      context,
+      {},
+    );
+    expect(speculation?.preparedArgs).toEqual({ session: "s2" });
+    await expect(speculation?.execute(undefined)).resolves.toBe("s2");
+  });
+
+  it("counts an unrepaired invalid-argument occurrence once", async () => {
+    const compiler = attachCompiler();
+    const registry = new ActionRegistry();
+    registry.register({
+      name: "demo",
+      description: "ambiguous session action",
+      async list() {
+        return [await this.describe("expand", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "expand"
+          ? {
+              name: "expand",
+              description: "expand",
+              inputSchema: {
+                type: "object",
+                properties: { session: { type: "string" }, path: { type: "string" } },
+                required: ["session"],
+                additionalProperties: false,
+              },
+              risk: "read" as const,
+            }
+          : undefined;
+      },
+      async invoke() { return undefined; },
+    });
+    await expect(
+      registry.invoke("demo.expand", { id: "ambiguous" }, invokeContext()),
+    ).rejects.toThrow("Invalid arguments");
+    expect(compiler.repairs).toEqual([]);
+    expect(compiler.status()).toMatchObject({
+      invocationErrors: 1,
+      fingerprints: [expect.objectContaining({ count: 1, fingerprint: "args:demo.expand:id" })],
+    });
+  });
+
+  it("repairs scoped acquisition arguments before provider preparation", async () => {
+    const compiler = attachCompiler();
+    const dispose = vi.fn(async () => {});
+    const registry = new ActionRegistry();
+    registry.register({
+      name: "demo",
+      description: "scoped session action",
+      async list() {
+        return [await this.describe("open", context)].filter((entry) => entry !== undefined);
+      },
+      async describe(name) {
+        return name === "open"
+          ? {
+              name: "open",
+              description: "open",
+              inputSchema: {
+                type: "object",
+                properties: { session: { type: "string" } },
+                required: ["session"],
+                additionalProperties: false,
+              },
+              risk: "execute" as const,
+              effect: { kind: "scoped" as const, resources: ["session"], ordering: "ordered" as const },
+            }
+          : undefined;
+      },
+      async prepareArguments(_name, args) {
+        if ("sessionId" in args) throw new Error("preparer received spilled arguments");
+        return args;
+      },
+      async invoke() {
+        throw new Error("use acquire");
+      },
+      async acquire(_name, args) {
+        return { value: args.session, dispose };
+      },
+    });
+    const acquired = await registry.acquireScoped("demo.open", { sessionId: "s1" }, context);
+    expect(acquired.value).toBe("s1");
+    expect(compiler.repairs).toContainEqual({
+      kind: "keyAlias",
+      ref: "demo.open",
+      from: "sessionId",
+      to: "session",
+    });
+    await acquired.dispose();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+});
+
+const liveEchoSchema = () => ({
+  type: "object",
+  properties: { value: { type: "string" } },
+  required: ["value"],
+  additionalProperties: false,
+});
+
+const overlayArtifact = (baseSchema: unknown): CompiledSurfaceFile => ({
+  version: 1,
+  metricVersion: 2,
+  actions: [
+    {
+      ref: "demo.echo",
+      inputSchema: {
+        type: "object",
+        properties: { value: { type: "string", enum: ["alpha", "beta"] } },
+        required: ["value"],
+        additionalProperties: false,
+      },
+      baseSchemaDigest: schemaDigest(baseSchema),
+    },
+  ],
+  quarantined: [],
+  applied: [
+    { kind: "enum-tighten", ref: "demo.echo", detail: "value: 2 observed values" },
+  ],
+  gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+  evidenceDigest: "test",
+});
+
+describe("compiled entropy surface enforcement", () => {
+  afterEach(() => {
+    setActiveCompiledSurface(undefined);
+  });
+
+  it("enforces the compiled enum at the validate stage", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    await registry.invoke("demo.echo", { value: "free-form" }, invokeContext());
+    setActiveCompiledSurface(overlayArtifact(liveEchoSchema()));
+    await registry.invoke("demo.echo", { value: "alpha" }, invokeContext());
+    await expect(
+      registry.invoke("demo.echo", { value: "off-modal" }, invokeContext()),
+    ).rejects.toThrow(/Invalid arguments for demo\.echo/);
+  });
+
+  it("records a validate-rejected attempt as a failed-call audit for declared enum members", async () => {
+    const enumProvider = (): FabricProvider => ({
+      name: "demo",
+      description: "Demo provider",
+      async list() {
+        return [
+          {
+            name: "echo",
+            description: "Echo a string",
+            inputSchema: {
+              type: "object",
+              properties: { value: { type: "string", enum: ["alpha", "beta"] } },
+              required: ["value"],
+              additionalProperties: false,
+            },
+            risk: "read" as const,
+          },
+        ];
+      },
+      async describe(name) {
+        return name === "echo" ? (await this.list({}, context))[0] : undefined;
+      },
+      async invoke(_name, args) {
+        return (args as { value: string }).value;
+      },
+    });
+    const liveEnumSchema = () => ({
+      type: "object",
+      properties: { value: { type: "string", enum: ["alpha", "beta"] } },
+      required: ["value"],
+      additionalProperties: false,
+    });
+    const tightOverlay = (): CompiledSurfaceFile => ({
+      version: 1,
+      metricVersion: 2,
+      actions: [
+        {
+          ref: "demo.echo",
+          inputSchema: {
+            type: "object",
+            properties: { value: { type: "string", enum: ["alpha"] } },
+            required: ["value"],
+            additionalProperties: false,
+          },
+          baseSchemaDigest: schemaDigest(liveEnumSchema()),
+        },
+      ],
+      quarantined: [],
+      applied: [{ kind: "enum-tighten", ref: "demo.echo", detail: "value: 1 observed values" }],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    const registry = new ActionRegistry();
+    registry.register(enumProvider());
+    setActiveCompiledSurface(tightOverlay());
+    const audits: FabricCallAudit[] = [];
+    await registry.invoke("demo.echo", { value: "alpha" }, invokeContext(audits));
+    await expect(
+      registry.invoke("demo.echo", { value: "beta" }, invokeContext(audits)),
+    ).rejects.toThrow(/Invalid arguments for demo\.echo/);
+    await expect(
+      registry.invoke("demo.echo", { value: "untrusted-secret" }, invokeContext(audits)),
+    ).rejects.toThrow(/Invalid arguments for demo\.echo/);
+    expect(audits).toHaveLength(2);
+    expect(audits[0]).toMatchObject({ ref: "demo.echo", success: true });
+    expect(audits[1]).toMatchObject({
+      ref: "demo.echo",
+      tool: "echo",
+      provider: "demo",
+      success: false,
+      error: expect.stringContaining("Invalid arguments for demo.echo"),
+      args: { value: "beta" },
+    });
+    expect(audits[1]?.startedAt).toBeGreaterThan(0);
+    expect(audits[1]?.endedAt).toBeGreaterThanOrEqual(audits[1]?.startedAt ?? 0);
+    expect(JSON.stringify(audits)).not.toContain("untrusted-secret");
+  });
+
+  it("drops the overlay when the live schema changed underneath the compile", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    setActiveCompiledSurface(
+      overlayArtifact({ type: "object", properties: { other: { type: "string" } } }),
+    );
+    await registry.invoke("demo.echo", { value: "still free" }, invokeContext());
+  });
+
+  it("hides quarantined refs from the catalog and denies resolution", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    expect((await registry.list({ limit: 10 }, context)).map((a) => a.ref)).toEqual([
+      "demo.echo",
+    ]);
+    setActiveCompiledSurface({
+      version: 1,
+      metricVersion: 2,
+      actions: [],
+      quarantined: [{ ref: "demo.echo", baseSchemaDigest: schemaDigest(liveEchoSchema()) }],
+      applied: [
+        { kind: "noise-quarantine", ref: "demo.echo", detail: "2 failed vs 1 succeeded" },
+      ],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    expect(await registry.list({ limit: 10 }, context)).toEqual([]);
+    await expect(
+      registry.invoke("demo.echo", { value: "x" }, invokeContext()),
+    ).rejects.toThrow(/demo\.echo/);
+  });
+  it("teaches the compiled schema in the model-facing listing", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    const artifact = overlayArtifact(liveEchoSchema());
+    setActiveCompiledSurface(artifact);
+    const listed = await registry.list({ limit: 10 }, context);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]!.inputSchema).toEqual(artifact.actions[0]!.inputSchema);
+    const declared = await registry.list({ limit: 10, declared: true }, context);
+    expect(declared[0]!.inputSchema).toEqual(liveEchoSchema());
+  });
+
+  it("keeps quarantined refs in the declared view for compile snapshots", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    setActiveCompiledSurface({
+      version: 1,
+      metricVersion: 2,
+      actions: [],
+      quarantined: [{ ref: "demo.echo", baseSchemaDigest: schemaDigest(liveEchoSchema()) }],
+      applied: [
+        { kind: "noise-quarantine", ref: "demo.echo", detail: "2 failed vs 1 succeeded" },
+      ],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    expect(await registry.list({ limit: 10 }, context)).toEqual([]);
+    const declared = await registry.list({ limit: 10, declared: true }, context);
+    expect(declared.map((action) => action.ref)).toEqual(["demo.echo"]);
+  });
+
+  it("never launches speculation the compiled surface rejects", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    registry.setSpeculation(undefined, () => true);
+    const replay = {} as Parameters<typeof registry.speculate>[3];
+    setActiveCompiledSurface(overlayArtifact(liveEchoSchema()));
+    expect(
+      await registry.speculate("demo.echo", { value: "off-modal" }, invokeContext(), replay),
+    ).toBeUndefined();
+    const launched = await registry.speculate(
+      "demo.echo",
+      { value: "alpha" },
+      invokeContext(),
+      replay,
+    );
+    expect(launched?.preparedArgs).toEqual({ value: "alpha" });
+    setActiveCompiledSurface({
+      version: 1,
+      metricVersion: 2,
+      actions: [],
+      quarantined: [{ ref: "demo.echo", baseSchemaDigest: schemaDigest(liveEchoSchema()) }],
+      applied: [
+        { kind: "noise-quarantine", ref: "demo.echo", detail: "2 failed vs 1 succeeded" },
+      ],
+      gate: { passed: true, beforeScore: 0.25, afterScore: 0.18, reasons: [] },
+      evidenceDigest: "test",
+    });
+    expect(
+      await registry.speculate("demo.echo", { value: "alpha" }, invokeContext(), replay),
+    ).toBeUndefined();
+    registry.setSpeculation(undefined);
   });
 });

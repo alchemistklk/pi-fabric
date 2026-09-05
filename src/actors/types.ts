@@ -67,6 +67,7 @@ export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 export type FabricActorStatus = "idle" | "queued" | "running" | "stopped";
 export type FabricActorBindingScope = "session" | "project";
+export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
   model?: string;
@@ -133,6 +134,8 @@ export interface FabricActorValidityFacts {
 }
 
 export interface FabricActorRequest {
+  /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
+  scope?: FabricActorStorageScope;
   name: string;
   instructions: string;
   /** Asynchronous observations of session-bound Pi events plus synthetic tool_error. */
@@ -170,6 +173,7 @@ export interface FabricActorRequest {
 
 export interface FabricActorInfo {
   id: string;
+  scope: FabricActorStorageScope;
   name: string;
   rootId?: string;
   status: FabricActorStatus;

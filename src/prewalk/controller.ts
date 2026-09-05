@@ -9,7 +9,7 @@ const PREWALK_TRIGGER_REFS = new Set([
 ]);
 
 // Synthesized audit ref for filesystem-drift claims: writes made through
-// pi.bash (or any call whose file effects audits cannot see) detected by the
+// Pi shell calls (or any call whose file effects audits cannot see) detected by the
 // stat-manifest fallback while armed. Never a real call; trigger ref only.
 const PREWALK_FS_DRIFT_REF = "fs.drift";
 

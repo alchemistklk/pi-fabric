@@ -38,7 +38,6 @@ import {
   saveFabricConfig,
   type FabricConfig,
   type FabricConfigScope,
-  type FabricSchemaMode,
 } from "../config.js";
 import { THINKING_LEVELS, thinkingLabel } from "../thinking.js";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
@@ -94,8 +93,8 @@ const SHIKI_THEME_PRESETS = [
   "one-dark-pro",
 ] as const;
 const RISKS = ["read", "write", "execute", "network", "agent"] as const;
-const CORE_RISK_TOOLS = ["read", "grep", "find", "edit", "write", "bash"] as const;
-const CORE_DEFAULT_TOOL_CANDIDATES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const CORE_RISK_TOOLS = ["read", "grep", "find", "edit", "write", "bash", "powershell"] as const;
+const CORE_DEFAULT_TOOL_CANDIDATES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 const BUDGET_VALUES = [0, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10];
 const TOKEN_VALUES = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000];
 const PREWALK_MODEL_UNSET_LABEL = "Ask each time";
@@ -293,7 +292,9 @@ const coerceValue = (id: string, value: string, config: FabricConfig): unknown =
     return typeof current === "number" ? current : 160;
   }
   const current = getPath(config, id);
-  if (typeof current === "boolean") return value === "true";
+  // prewalk.enabled is enabled by default and omitted from normalized
+  // configs unless false, so its control still needs an explicit boolean type.
+  if (typeof current === "boolean" || id === "prewalk.enabled") return value === "true";
   if (typeof current === "number") return parseFormattedNumericValue(value);
   // The model picker stores the canonical "provider/id" string, or "Inherit"
   // for no override; persist an empty string so normalizeFabricConfig drops it.
@@ -1275,7 +1276,7 @@ export const buildFabricSettingsItems = (
             config.prewalk.detectShellWrites ? "true" : "false",
             {
               description:
-                "Filesystem fallback trigger: when an armed task ran a successful pi.bash in fabric_exec without an audited pi.edit / pi.write / schema.commit, claim the handoff if file stats drifted from baseline, so shell heredocs, sed -i, or formatter-binary writes also reach the executor.",
+                "Filesystem fallback trigger: when an armed task ran a successful pi.bash or pi.powershell in fabric_exec without an audited pi.edit / pi.write / schema.commit, claim the handoff if file stats drifted from baseline, so shell heredocs, sed -i, or formatter-binary writes also reach the executor.",
               values: BOOLEANS,
             },
           ),
@@ -1725,7 +1726,7 @@ export const buildFabricSettingsItems = (
           }),
           setting("mesh.actorScope", "Actor scope", config.mesh.actorScope, {
             description:
-              'Where persistent actor definitions, mailboxes, and sessions are stored. "project" shares actors across all Pi sessions in this project (survives /new); "session" isolates them per Pi session (the previous default).',
+              'Default storage for newly created actors. Each agents.create call may choose project or session independently; project actors are shared, while session actors follow the root Pi session and its participant agents.',
             values: ACTOR_SCOPES,
           }),
           setting("mesh.maxReadEvents", "Max read events", String(config.mesh.maxReadEvents), {
@@ -2169,21 +2170,12 @@ export async function openFabricSettings(
       return;
     }
     deps.state.reloadConfig(context);
-    // The project-scope view is exactly the merged config reloadConfig just
-    // produced; reuse it instead of reading both fabric.json files a third
-    // time. Global scope differs (it excludes project overrides) and still
-    // needs its own load.
+    // Render the persisted layers, not the live config: runtime-only
+    // environment and session overrides must not change what this editor saves.
     Object.assign(
       settingsConfig,
-      saveScope === "project"
-        ? deps.state.config
-        : loadFabricConfigForScope(configLocation, saveScope),
+      loadFabricConfigForScope(configLocation, saveScope),
     );
-    if (id === "schema.mode" && typeof value === "string") {
-      // reloadConfig pins the live session's startup mode; render the saved
-      // value so the picker does not appear to ignore the selection.
-      settingsConfig.schema.mode = value as FabricSchemaMode;
-    }
     deps.onConfigApplied?.(id);
     dirty = true;
     changedSections.add(id.split(".")[0] ?? id);

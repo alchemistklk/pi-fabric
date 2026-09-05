@@ -25,6 +25,8 @@ ActionRegistry ◀── staged commit ── ComponentSupervisor
 ActivityStore → compact widget + footer status + interactive dashboard
 ```
 
+Unique provider extra keys and unknown actions feed a [catalog repair table](repairs.md). Session JSONL is the log; `current.json` holds unique schema maps. Effect failures (bash, edit miss) and guest typecheck are classified for status but never promoted.
+
 In the default QuickJS runtime, guest code runs without `process`, `require`, filesystem, network, or subprocess globals. Every effect crosses the host bridge, and schemas, approvals, audit records, timeouts, and cancellation apply there. Each execution gets a fresh QuickJS context. Strings the caller names in the `payloads` tool parameter appear as `π.key`. Reading a missing key throws a clear, actionable error that lists the provided keys.
 
 For the model-facing distinction between TypeScript `code + payloads` and a
@@ -76,9 +78,9 @@ For provider-level corruption, or for sessions that expose Pi tools directly, in
 
 The provider owns the Anthropic strict tool use setting. When enabled, strict mode stops the server from sampling keys that are absent from the schema. Anthropic limits the complexity of strict tool definitions.
 
-## Bash exit status and result middleware
+## Shell exit status and result middleware
 
-`pi.bash(..., { settle: true })` converts an ordinary native nonzero exit into
+`pi.bash(..., { settle: true })` and Windows-only `pi.powershell(..., { settle: true })` convert an ordinary native nonzero exit into
 `{ ok: false, exitCode, output, details, error }`. Fabric classifies that exit
 before `tool_result` middleware runs and transports the status separately from
 display text in both runtimes. Trimming, redaction, newline changes, or replacing
@@ -93,7 +95,7 @@ middleware recovery through `isError: false` remains effective. Pi's
 a handler introduced a new failure. After a native nonzero exit, Fabric cannot
 distinguish an annotation/redaction from an additional middleware veto expressed
 only through text and `isError: true`. Such a veto needs a separate explicit
-provenance contract; this limitation is not solved by bash settlement. For now,
+provenance contract; this limitation is not solved by shell settlement. For now,
 checks that must prevent command execution belong in approval or `tool_call`
 preflight, and callers requiring all final errors to throw should omit `settle`.
 
@@ -132,7 +134,7 @@ Control topics and topology and legacy state prefixes are reserved from guest me
 - Fabric stops session-resident background children when the parent Pi session shuts down. A hidden per-root resident host launches `agents.spawn({ residency: "durable" })`, and that child continues after the TUI exits. A detached spawn sends a follow-up completion message unless the caller later waits for it or `notifyOnComplete` is disabled. Resident completion messages queue in mesh state until Main resumes. Durable participant lifecycle subscriptions deliver source-qualified Pi and run notifications across roots, agents, and actors with no transcript disclosure. Completed worktrees are retained on purpose.
 - Fabric suspends session-resident actors on shutdown and restores them after project trust. `agents.create({ residency: "durable" })` transfers execution to the hidden resident host before it returns. The mailbox, mesh subscriptions, relayed Main events, and runner session continue after Main exits.
 - Claude actor session IDs point to Claude Code's private session store. Removing that session makes resume fail. Removing the Fabric actor does not delete Claude Code's transcript.
-- With `mesh.actorScope: "project"`, definitions, mailbox history, and child sessions live under `.pi/fabric/mesh/actors/` and survive `/new`. Mode-`0600` files under `actors/bindings/` store each Pi session's model and thinking values without changing the project defaults. Use `mesh.actorScope: "session"` to isolate definitions, mailboxes, histories, and runtimes. Mesh topics and shared state remain project-scoped. Do not put secrets in actor prompts, messages, or mesh state.
+- Project actors live under `.pi/fabric/mesh/actors/` and survive `/new`; session actors live under `.pi/fabric/mesh/actors/<sessionId>/`. `agents.create({ scope })` selects either boundary per actor, while `mesh.actorScope` supplies the omitted default, so both kinds coexist. Mode-`0600` binding files store each caller session's model and thinking values without changing project defaults. Root session identity propagates through participant agents. Mesh topics and shared state remain project-scoped. Do not put secrets in actor prompts, messages, or mesh state.
 - Approving `agents.create()` delegates future subscribed events until someone stops the actor. Durable residency lets that delegation outlive the approving TUI. Each mailbox item stores one model and thinking view before it queues: call override → session binding → project default → Fabric default. The runner and tool allowlist remain fixed for that activation. Review them before approval. Tool changes affect later activations only.
 - Only an approved durable `agents.spawn` or `agents.create` action in a trusted mesh-enabled project starts the hidden resident host. Its mode-`0600` config, command spool, run metadata, and PID lock live below the root's mesh residency directory. This IPC is crash-conservative: an interrupted claimed request reports an indeterminate outcome, and the request is not replayed. The IPC is not a boundary against arbitrary host filesystem access. Trusted code with direct access to `.pi/fabric` can corrupt residency state in the same way it can corrupt the mesh. Empty resident hosts exit after a short grace period.
 - Actor responses enter the main context only through the delivery policy fixed at creation. Directive output passes schema validation. It is still untrusted model output, and the main agent should weigh it.

@@ -126,12 +126,15 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 ## Reference
 
 - [Configuration](docs/configuration.md): `fabric.json`, code modes, tool capture, approvals, and budgets.
+- [Memory & recall](docs/memory-recall.md): compact ranked hits, uniform follow calls, lossless expansion, and guest-local `memory.walk` computation.
 - [Interface & commands](docs/interface.md): dashboard, settings, keybindings, slash commands, and headless runs.
 - [Agents, actors & mesh](docs/agents.md): model handoff, `/fabric prewalk`, runners, transports, actors, councils, recursive queries, and durable coordination.
 - [Durable residency through Pi](docs/residency-runtime.md): background host lifecycle and the Pi-runtime launcher boundary.
 - [Components & committed capabilities](docs/components.md): supervised effects, exact requirements, external per-model guidance and execution-profile replacement, rolling provider generations, actor commitments, and both formal calculi.
 - [External providers](docs/providers.md): the versioned provider protocol for extensions.
 - [Architecture & security](docs/architecture.md): the host bridge, sandboxing, tool-call robustness, and limits.
+- [Catalog repairs](docs/repairs.md): unique extra keys and unknown actions promoted into silent schema maps.
+- [Tool entropy](docs/entropy.md): the deterministic entropy meter, on-demand session measurement, reduction proposals, the autonomous compile loop with its ratchet gate, and `certify:entropy`.
 - [Speculative PTC](docs/speculation.md): pre-launching literal read calls while the program streams, with epoch + freshness guarantees.
 - [Skills](docs/skills.md): the core-first invocation policy and user-invoked advanced patterns.
 

@@ -12,7 +12,7 @@ import {
   loadTieredIndex,
   shardPathForSession,
 } from "../src/memory/index.js";
-import { formatSearchResult, searchMemoryIndex } from "../src/memory/search.js";
+import { searchMemoryIndex } from "../src/memory/search.js";
 import { tokenizeLexical } from "../src/memory/tokenize.js";
 import { MemoryProvider } from "../src/providers/memory-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
@@ -104,9 +104,8 @@ describe("memory cache V6", () => {
         { scope, query: "common rarelexeme_000", pageSize: 10 },
         invocationContext(cwd),
       ) as {
-        items: { kind: string; digest?: { sessionId: string } }[];
-        digestHits: { sessionId: string }[];
-        coverage: { complete: boolean; indexedSessions: number; eligibleSessions: number; staleSessions: number };
+        hits: Array<{ kind: string; sessionId: string; follow: { ref: string } }>;
+        coverage: { complete: boolean; indexedSessions: number; eligibleSessions: number; staleSessions: number; reasons: string[] };
       };
       expect(result.coverage).toEqual({
         complete: true,
@@ -116,27 +115,27 @@ describe("memory cache V6", () => {
         incompleteSessions: 0,
         reasons: [],
       });
-      expect(result.items[0]).toEqual(expect.objectContaining({
-        kind: "digest",
-        digest: expect.objectContaining({ sessionId: "session-0" }),
+      expect(result.hits[0]).toEqual(expect.objectContaining({
+        kind: "session",
+        sessionId: "session-0",
+        follow: expect.objectContaining({ ref: "memory.recall" }),
       }));
-      expect(result.digestHits[0]!.sessionId).toBe("session-0");
     }
 
     const regexResult = await provider().invoke(
       "recall",
       { scope: "project", query: "^rarelexeme_[0-9]{3}$", queryMode: "regex" },
       invocationContext(cwd),
-    ) as { digestHits: { sessionId: string }[]; coverage: { complete: boolean } };
-    expect(regexResult.digestHits.map((hit) => hit.sessionId)).toEqual(["session-0"]);
+    ) as { hits: Array<{ sessionId: string }>; coverage: { complete: boolean } };
+    expect(regexResult.hits.map((hit) => hit.sessionId)).toEqual(["session-0"]);
     expect(regexResult.coverage.complete).toBe(true);
 
     const unicodeResult = await provider().invoke(
       "recall",
       { scope: "project", query: "ΩMEGA雪" },
       invocationContext(cwd),
-    ) as { digestHits: { sessionId: string }[] };
-    expect(unicodeResult.digestHits[0]!.sessionId).toBe("session-0");
+    ) as { hits: Array<{ sessionId: string }> };
+    expect(unicodeResult.hits[0]!.sessionId).toBe("session-0");
 
     const digest = JSON.parse(
       fs.readFileSync(digestPathForSession(oldest, indexDir), "utf8"),
@@ -164,19 +163,19 @@ describe("memory cache V6", () => {
       fs.utimesSync(file, base + index, base + index);
     }
     const browse = await provider().invoke("recall", { scope: "project" }, invocationContext(cwd)) as {
-      matchedCount: number;
+      total: number;
       coverage: { eligibleSessions: number };
     };
     expect(browse.coverage.eligibleSessions).toBe(20);
-    expect(browse.matchedCount).toBe(20);
+    expect(browse.total).toBe(20);
 
     const search = await provider({ hotSessions: 1 }).invoke(
       "recall",
       { scope: "project", query: "token_0" },
       invocationContext(cwd),
-    ) as { coverage: { complete: boolean; eligibleSessions: number }; digestHits: { sessionId: string }[] };
+    ) as { coverage: { complete: boolean; eligibleSessions: number }; hits: Array<{ sessionId: string }> };
     expect(search.coverage).toEqual(expect.objectContaining({ complete: true, eligibleSessions: 20 }));
-    expect(search.digestHits[0]!.sessionId).toBe("browse-0");
+    expect(search.hits[0]!.sessionId).toBe("browse-0");
   });
 
   it("rebuilds rewritten and V5 caches and removes caches for deleted sources", async () => {
@@ -229,9 +228,8 @@ describe("memory cache V6", () => {
       reasons: ["source_unavailable"],
     });
     const empty = await searchMemoryIndex(stale.shards, stale.digests, { query: "rewrittenxyz" });
-    expect(formatSearchResult(empty, "rewrittenxyz", stale.coverage)).toContain(
-      "No indexed matches",
-    );
+    expect(empty.items).toEqual([]);
+    expect(empty.queryCoverage.complete).toBe(true);
     expect(fs.existsSync(digestPathForSession(file, indexDir))).toBe(false);
   });
 
@@ -255,37 +253,34 @@ describe("memory cache V6", () => {
       "recall",
       { scope: "project", branches: "all", query: "bounded" },
       invocationContext(cwd),
-    ) as { digestHits: { sessionFile: string; sourceHash: string }[] };
-    expect(pointer.digestHits[0]).toEqual(expect.objectContaining({
-      sessionFile: old,
-      sourceHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    ) as { hits: Array<{ follow: { ref: string; args: Record<string, unknown> } }> };
+    expect(pointer.hits[0]!.follow).toEqual(expect.objectContaining({
+      ref: "memory.recall",
+      args: expect.objectContaining({
+        scope: `session:${old}`,
+        expectedSourceHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
     }));
 
     const hydrated = await provider({ hotSessions: 1 }).invoke(
       "recall",
-      {
-        scope: `session:${pointer.digestHits[0]!.sessionFile}`,
-        expectedSourceHash: pointer.digestHits[0]!.sourceHash,
-        branches: "all",
-        query: "bounded",
-        entryRange: { first: 1, last: 1 },
-      },
+      { ...pointer.hits[0]!.follow.args, entryRange: { first: 1, last: 1 } },
       invocationContext(cwd),
-    ) as { segments: { entries: { entry: { index: number } }[] }[] };
-    expect(hydrated.segments.flatMap((segment) => segment.entries).map((entry) => entry.entry.index))
-      .toEqual([1]);
+    ) as { hits: Array<{ index: number }> };
+    expect(hydrated.hits.map((hit) => hit.index)).toEqual([1]);
     expect(fs.existsSync(shardPathForSession(old, indexDir))).toBe(false);
 
     const expanded = await provider({ hotSessions: 1 }).invoke(
       "expand",
       { session: "old", branches: "all", entryIds: ["entry-b"] },
       invocationContext(cwd),
-    ) as { expanded: { index: number; entryId: string; text: string }[] };
-    expect(expanded.expanded).toEqual([{
+    ) as { entries: { index: number; entryId: string; text: string }[] };
+    expect(expanded.entries).toEqual([expect.objectContaining({
       index: 1,
       entryId: "entry-b",
       text: "rare bounded fact",
-    }]);
+      textRange: { start: 0, end: 17, total: 17, complete: true },
+    })]);
   });
 
   it("uses one Unicode-aware tokenizer for exact lexical terms", () => {

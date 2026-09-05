@@ -1,4 +1,4 @@
-export const CURRENT_FABRIC_CONFIG_VERSION = 3;
+export const CURRENT_FABRIC_CONFIG_VERSION = 4;
 
 export interface FabricConfigMigrationResult {
   document: Record<string, unknown>;
@@ -85,6 +85,24 @@ const migrations: readonly FabricConfigMigration[] = [
         }
         delete renamed.nestedToolDebounceMs;
         migrated.ui = renamed;
+      }
+      return migrated;
+    },
+  },
+  {
+    from: 3,
+    to: 4,
+    migrate(document) {
+      const migrated = { ...document };
+      const prewalk = migrated.prewalk;
+      if (
+        isObject(prewalk) &&
+        (prewalk.enabled === "true" || prewalk.enabled === "false")
+      ) {
+        migrated.prewalk = {
+          ...prewalk,
+          enabled: prewalk.enabled === "true",
+        };
       }
       return migrated;
     },

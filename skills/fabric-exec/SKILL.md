@@ -12,29 +12,30 @@ description: >-
 One type-checked TS program in a fresh executor (isolated QuickJS by default). Only the `return` value reaches the model; `print()`/`console.log` go to the activity panel. `π` is not a tool.
 
 ## `pi` core tools (full code mode only)
-`pi.<tool>(arg)` — single arg: bare string (primary field) or options object, or a two-arg `(primary, options)` merge for the string-primary tools (`read`/`bash`/`ls`/`grep`/`find`): `pi.read('index.ts', { limit: 120 })` becomes `{ path: 'index.ts', limit: 120 }`, the positional string winning the primary field on conflict; a non-object second arg on those is still a type error. Positional tuple calls are accepted for `grep`/`find` (`pattern, path, limit`), `write` (`path, content`), and `edit` (`path, oldText, newText`).
+`pi.<tool>(arg)` — single arg: bare string (primary field) or options object, or a two-arg `(primary, options)` merge for the string-primary tools (`read`/`bash`/`powershell`/`ls`/`grep`/`find`): `pi.read('index.ts', { limit: 120 })` becomes `{ path: 'index.ts', limit: 120 }`, the positional string winning the primary field on conflict; a non-object second arg on those is still a type error. Positional tuple calls are accepted for `grep`/`find` (`pattern, path, limit`), `write` (`path, content`), and `edit` (`path, oldText, newText`).
 
 | Tool | Form | Returns |
 |------|------|---------|
 | `read` | `path` \| `{path,offset?,limit?}` \| `(path, options?)` | `string` |
-| `bash` | `command` \| `{command,timeout?}` \| `(command, options?)` | `{ok:true,output,details}`; rejects on a nonzero exit (`settle:true` returns `{ok:false,output,details:null,exitCode,error}` instead) |
+| `bash` | `command` \| `{command,timeout?,cwd?}` \| `(command, options?)` | `{ok:true,output,details}`; rejects on a nonzero exit (`settle:true` returns `{ok:false,output,details:null,exitCode,error}` instead) |
+| `powershell` | Windows only; same forms and result contract as `bash` | `{ok:true,output,details}`; supports `settle:true` |
 | `grep` | `pattern` \| `{pattern,path?,glob?,ignoreCase?,literal?,context?,limit?}` \| `(pattern, path?, limit?)` | `string` |
 | `find` | `pattern` \| `{pattern,path?,limit?}` \| `(pattern, path?, limit?)` | `string` |
 | `ls` | `path?` \| `{path?,limit?}` \| `(path, options?)` | `string` |
 | `edit` | `{path,edits:[{oldText,newText,all?}],all?}` \| `{path,oldText,newText,all?}` \| `(path, oldText, newText)` | `{ok,output,details}` |
 | `write` | `{path,content}` \| `(path, content)` | `{ok,output,details}` |
 
-`pi.bash` has no `stdin` option. When a command needs content input, write it to a file with `pi.write(path, content)`, then pass that path to the command or redirect the file into it; do not interpolate untrusted content into shell code.
+`pi.bash` and `pi.powershell` have no `stdin` option. When a command needs content input, write it to a file with `pi.write(path, content)`, then pass that path to the command or redirect the file into it; do not interpolate untrusted content into shell code.
 
 For `pi.edit`, entry-level `all:true` applies that replacement to every non-overlapping occurrence; top-level `all:true` applies every entry that way. Omit it for unique anchors.
 
-`bash` rejects on an ordinary nonzero exit; pass `settle:true` to get `{ok:false,output,details:null,exitCode,error}` instead of a rejection. Timeout, cancellation, approval, security, and spawn failures still reject. Other Pi core tool errors reject normally.
+Shell tools reject on an ordinary nonzero exit; pass `settle:true` to get `{ok:false,output,details:null,exitCode,error}` instead of a rejection. Timeout, cancellation, approval, security, and spawn failures still reject. Other Pi core tool errors reject normally.
 
 Aliases are normalized to canonical fields before host validation. Command aliases include `cmd`/`shell`/`cmdline`/`script`/`commandLine`; pattern aliases include `query`/`regex`/`search` plus `q`/`expression`/`text` for grep and `name`/`filename`/`glob`/`include` for find. Path aliases include `file`, `file_path`, camel-case path variants, `dir`/`folder`/`directory`, and target-file variants. Edit text accepts `old`/`from`/`old_string`-style and `new`/`to`/`replacement`/`new_string`-style spellings, including inside `edits`; write content accepts `contents`/`body`/`text`/`data`/`fileContent`. `ic`/`caseInsensitive`→`ignoreCase`, `globPattern`→`glob`, `ctx`→`context`, `max`→`limit`, and `start`→`offset`.
 
-Bash `timeout` is in seconds; `timeoutMs` is converted from milliseconds. Numeric strings in `limit`, `timeout`, `offset`, and `context` coerce to numbers. `null`/`undefined` is omitted only for known optional fields; required fields remain invalid so authoritative host validation still reports them. Canonical fields win when both canonical and alias spellings are present. Unknown keys still fail the excess-property type check.
+Shell `timeout` is in seconds; `timeoutMs` is converted from milliseconds. Numeric strings in `limit`, `timeout`, `offset`, and `context` coerce to numbers. `null`/`undefined` is omitted only for known optional fields; required fields remain invalid so authoritative host validation still reports them. Canonical fields win when both canonical and alias spellings are present. Unknown keys still fail the excess-property type check.
 
-`bash`/`edit`/`write` always resolve an envelope `{ ok, output, details }`, never a bare string, and the executor guards those envelopes: a string method or iteration applied to the envelope itself (`r.trim()`, `for (const line of r)`) throws a TypeError naming the fix (`.output`) instead of a context-free "not a function".
+`bash`/`powershell`/`edit`/`write` always resolve an envelope `{ ok, output, details }`, never a bare string, and the executor guards those envelopes: a string method or iteration applied to the envelope itself (`r.trim()`, `for (const line of r)`) throws a TypeError naming the fix (`.output`) instead of a context-free "not a function".
 
 A captured extension that registers an exact core name may provide a compatible additive override. Fabric derives a bounded object overload from the current override schema and adds it to the familiar `pi.<name>` surface wherever execution is effectively full-code, including Schema enforce mode; built-in positional calls, bare strings, shorthand, aliases, and normalized result contracts remain Fabric-owned. Override-specific prompt metadata is appended under that same `pi.<name>` identity. Schema enforce still applies its host restrictions to protected mutations and external effects. Unsupported or over-budget schemas use a loose object overload and still pass through authoritative registry validation, so use the effective schema and retry from the validation error when needed.
 
@@ -50,7 +51,7 @@ const window = await pi.read({ path: "src/engine.ts", offset: 120, limit: 80 });
 
 An unbounded `pi.read('/x')` returns at most 2000 lines or 50KB (whichever is hit first); truncated output ends with a `[Showing lines a-b of N. Use offset=n to continue.]` notice — continue with `offset` only when you truly need the full file. Reserve whole-file reads for small files you will use in full (configs, tests or files you are about to edit, sources under a few hundred lines). Batching several large whole-file reads into one program inflates the single tool result, and that enlarged result stays in every later turn's context.
 
-Keep multiline or syntax-heavy payloads out of `code`: pass them through `payloads` and read `π.key` (for example, `await pi.write("path", π.content)`). TypeScript still parses template-literal contents, including shell heredocs. The legacy `strings` argument is accepted as an alias.
+Keep multiline or syntax-heavy payloads out of `code`: pass them through `payloads` and read the exact matching key from `π`. For example, `payloads: { content: text }` is read as `π.content`; do not invent a different reference such as `π.task`. Every `π.key` must exist in the same call's top-level `payloads` map. TypeScript still parses template-literal contents, including shell heredocs. The legacy `strings` argument is accepted as an alias.
 
 ## Shell payloads: `script`
 When the *whole* payload is one shell program, pass it as the outer `script` argument instead of `code`, and skip TypeScript string escaping entirely — heredocs, backticks, quotes, `$`-expansions, and sed backreferences travel literally:
@@ -76,8 +77,9 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 
 | Call | Resolves to |
 |------|-------------|
-| `memory.recall(args?)` | `{scope?,branches?,query?,queryMode?,matchMode?,structuralFilters?,matchedCount?,totalMatches?,totalItems?,segmentCount?,segments?,digestHits?,items?,page?,pageSize?,hasNext?,coverage?,text?,error?}` |
-| `memory.expand(args)` | `{session?,sourceHash?,branches?,lineageFingerprint?,expanded?:unknown[],error?}` |
+| `memory.recall(args?)` | `{total,hits:MemoryRecallHit[],next:{ref:"memory.recall",args}|null,coverage:MemoryCoverage,error?}` |
+| `memory.expand(args)` | `{session?,sourceHash?,branches?,lineageFingerprint?,entryCount?,entries:ExpandedSessionEntry[],next?:{ref:"memory.expand",args}|null,error?}` |
+| `memory.walk(args, visitor)` | `{visited,stopped,error?}`; guest-local paging and full-entry reassembly over `memory.expand` |
 | `memory.sessions(args?)` | `{scope?,branches?,sessions?:SessionInfo[],error?}`; slice `result.sessions ?? []`, not the wrapper |
 | `state.transition(args)` | `{event:FabricMeshEvent,head:unknown}` |
 | `state.get()` | `{head,goal,complexity,certification,recentLabels:string[]}` |
@@ -99,11 +101,13 @@ All calls return promises. Fields ending in `?` are optional; `unknown` marks pr
 | `compact.status()` | `{pending?:CompactIntent,last?:{at,requestedBy,status,summary?,tokensBefore?,estimatedTokensAfter?,error?}}` |
 | `compact.cancel()` | `{cancelled:true}` |
 
-`memory.recall` structural filters (`ref`, `provider`, `action`, `outcome`) use exact persisted trace fields. With no `query`, `matchMode` is `"structural"`; with a lexical/regex query it is `"combined"`. Use `tools.catalog()`/`tools.search()` only to choose a current action head—catalog descriptions are navigation metadata and never become session evidence.
+`memory.recall` multi-term literal queries default to ranked `queryMatch: "any"` so wording differences do not hide evidence; use `"all"` to require every canonical term in one indexed entry, and `queryMode: "phrase"` when adjacency matters. Results are hard-bounded either way. Structural filters (`ref`, `provider`, `action`, `outcome`) use exact persisted trace fields. Use `tools.catalog()`/`tools.search()` only to choose a current action head—catalog descriptions are navigation metadata and never become session evidence.
 
-`memory.expand(args)` requires `session` (a `SessionInfo.id` or `.file` round-trips) plus a selector: `indices`, `entryIds`, `operationAddresses`, or `entryRange:{first,last}` — get them from `memory.recall` hits; expansion has no before/after window argument. `memory.sessions` accepts an optional `limit`.
+Recall returns one bounded flat hit stream. Every hit has the same copy-ready `{ref,args}` field: `await tools.call(hit.follow)` expands an entry or resolves a cold session. Continue any result with `await tools.call(result.next)` when `next !== null`; `total` is the retained pre-page hit count. Do not locate or parse Pi session JSONL yourself: follow calls, integrity bindings, and continuations are the supported retrieval API.
 
-Stable-provider arguments normalize near-miss spellings the way `pi.*` does: known aliases and casing/singular variants repair to the canonical key, numeric strings coerce for numeric fields, and scope spellings such as `cwd` repair to `project`. Unknown keys are never silently ignored—they fail validation with the offending property path named (e.g. `/before: must NOT have additional properties`).
+`memory.expand(args)` requires `session` plus a selector: `indices`, `entryIds`, `operationAddresses`, or `entryRange:{first,last}`. Optional `before`/`after` add adjacent entries. It returns normalized records in `entries`, with one uniform `tool` field and Pi `parentId` links. Long entries use lossless `textRange` chunks. For arbitrary filter/map/reduce/join/traversal work, use guest-local `memory.walk(args, async (entry, index) => { ... })`: it follows every expansion page, reassembles complete entries, awaits nested tool calls, and stops early when the visitor returns `false`. `memory.sessions` accepts an optional `limit`.
+
+Stable-provider arguments normalize near-miss spellings the way `pi.*` does: known aliases and casing/singular variants repair to the canonical key, numeric strings coerce for numeric fields, and scope spellings such as `cwd` repair to `project`. Unknown keys are never silently ignored—they fail validation with the offending property path named (e.g. `/befroe: must NOT have additional properties`).
 
 `SessionInfo` is `{id,file,cwd,mtime,entryCount,tier:"hot"|"cold",branches,lineageFingerprint}`. Memory failures are returned in `error: {code,message,...}`; ambiguous-session failures may return only `{error}`. Check `error` before relying on optional success fields.
 
@@ -119,7 +123,7 @@ The guest TypeScript declarations contain the complete argument and return contr
 Refs are namespaced (`pi.grep`, `extensions.<tool>`, `mcp.<server>.<tool>`, `schema.<action>`, `components.<action>`); bare names are rejected. `tools.providers()`→`[{name,description}]` · `tools.catalog({provider?,limit?})`→current provider/action head tree (navigation metadata, not session evidence) · `tools.search({query,limit?})`→`FabricAction[]`(`ref,name,description,inputSchema,risk`) · `tools.describe({ref})`→full `FabricAction` (read `inputSchema` first) · `tools.call({ref,args?})` · `tools.list({provider?,namespace?,query?,limit?})` · `tools.models()`→Pi `[{provider,id,name,key}]`; `agents.models({runner:"claude"})`→Claude Code runtime models with canonical `claude/<value>` keys. Use `tools.call()` for refs discovered or computed at runtime, or names that cannot use property access—not as the default for known actions. Calling a core-tool name on `tools` (e.g. `tools.read(...)`) throws with a hint to use `pi.read(...)`.
 
 ## Error recovery: read, describe, retry
-Read the line-numbered error → `await tools.describe({ref})` for the schema → match `inputSchema`, rerun (don't guess). Common mistakes: bare ref (`grep`→`pi.grep`); a non-object second arg on `read`/`bash`/`ls` (`(primary, optionsObject)` already merges on the string-primary tools; positional tuples exist only for `grep`/`find`/`write`/`edit`).
+Read the line-numbered error → `await tools.describe({ref})` for the schema → match `inputSchema`, rerun (don't guess). Common mistakes: bare ref (`grep`→`pi.grep`); a non-object second arg on `read`/`bash`/`powershell`/`ls` (`(primary, optionsObject)` already merges on the string-primary tools; positional tuples exist only for `grep`/`find`/`write`/`edit`).
 
 ## Orchestration surfaces (opt-in)
 Advanced workflow skills are user-invoked; never load them autonomously. When the user has explicitly invoked an agent or mesh workflow, `<skill-dir>/references/agents.md` and `<skill-dir>/references/mesh.md` are branch pointers for low-level API detail.

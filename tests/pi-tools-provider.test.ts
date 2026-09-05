@@ -201,6 +201,68 @@ describe("PiToolsProvider lifecycle", () => {
     expect((result as string).length).toBeGreaterThan(0);
   });
 
+  it("preserves shell cwd through pi 0.85 argument preparation", async () => {
+    const root = fs.realpathSync.native(
+      fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-cwd-")),
+    );
+    const nested = path.join(root, "nested");
+    fs.mkdirSync(nested);
+    try {
+      const registry = new ActionRegistry();
+      registry.register(new PiToolsProvider(root, undefined, undefined));
+      const result = await registry.invoke(
+        "pi.bash",
+        {
+          command: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "process.stdout.write(process.cwd())"`,
+          cwd: "nested",
+        },
+        {
+          ...baseContext,
+          cwd: root,
+          extensionContext: { ...baseContext.extensionContext, cwd: root } as ExtensionContext,
+          audits: [],
+        },
+      ) as { output: string };
+      expect(fs.realpathSync.native(result.output.trim())).toBe(
+        fs.realpathSync.native(nested),
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("omits PowerShell when the host factory is unavailable", async () => {
+    const provider = new PiToolsProvider(
+      process.cwd(),
+      undefined,
+      undefined,
+      { powerShellToolDefinitionFactory: undefined },
+    );
+
+    expect(await provider.describe("powershell", baseContext)).toBeUndefined();
+    expect((await provider.list({}, baseContext)).map((item) => item.name))
+      .not.toContain("powershell");
+    expect(await provider.describe("bash", baseContext)).toBeDefined();
+    await expect(provider.invoke("powershell", { command: "Write-Output ok" }, baseContext))
+      .rejects.toThrow("Unknown Pi tool: powershell");
+  });
+
+  it("registers PowerShell with shell schema and execution risk", async () => {
+    const provider = new PiToolsProvider(process.cwd(), undefined, undefined);
+    const descriptor = await provider.describe("powershell", baseContext);
+
+    expect(descriptor).toMatchObject({
+      name: "powershell",
+      namespace: "builtin",
+      risk: "execute",
+    });
+    expect(descriptor?.inputSchema.properties).toMatchObject({
+      command: expect.any(Object),
+      timeout: expect.any(Object),
+      cwd: expect.any(Object),
+    });
+  });
+
   it("expands explicit skill-dir markers only for SKILL.md reads", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-skill-dir-"));
     const skillDir = path.join(cwd, "installed", "duplicate-name");

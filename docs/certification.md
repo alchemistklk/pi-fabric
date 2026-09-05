@@ -1,8 +1,9 @@
 # Context and memory certification
 
-The repository provides two evaluation commands:
+The repository provides three evaluation commands:
 
 - `pnpm certify:context` is deterministic, runs offline, and costs nothing.
+- `bun run certify:entropy` is deterministic and offline: fixed corpora through the versioned [tool-entropy meter](entropy.md), with a ratchet proof, the compile loop (applied, gate-rejected, and converged rounds), ingestion checks, and, against a real corpus with `--trial`, the held-out divergence trial that fails if the compiled artifact would reject any recorded successful call.
 - `pnpm benchmark:real-resume` is an opt-in, billable Pi RPC benchmark with a safe skip as its default behavior.
 
 `pnpm test` excludes these commands, which keeps the normal test suite offline and fast.

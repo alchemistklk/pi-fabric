@@ -58,7 +58,7 @@ type DiffSummary = {
   hunks: number;
 };
 
-const CORE_TOOLS = new Set(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+const CORE_TOOLS = new Set(["bash", "powershell", "read", "write", "edit", "grep", "find", "ls"]);
 
 export const isCoreToolAudit = (audit: FabricRenderAudit): boolean =>
   audit.tool !== undefined &&
@@ -201,6 +201,7 @@ const toolLimit = (audit: FabricRenderAudit, options: CoreToolRenderOptions): nu
       case "ls":
         return options.settings.pathListCollapsedLines;
       case "bash":
+      case "powershell":
         return 8;
       default:
         return options.maxLines;
@@ -1412,7 +1413,9 @@ const renderBash = (
   theme: Theme,
   options: CoreToolRenderOptions,
 ): RenderedCoreToolBody | null => {
-  const commandName = firstShellCommandName(bashCommand(audit));
+  const commandName = audit.tool === "bash"
+    ? firstShellCommandName(bashCommand(audit))
+    : "";
   const resultEnabled =
     options.settings.bashResultPreview &&
     (commandName === "grep" || commandName === "egrep" || commandName === "fgrep"
@@ -1431,7 +1434,11 @@ const renderBash = (
   const displayCommand = escapeControlChars(command.replace(/\r\n/g, "\n"));
   const commandLines = displayCommand.split("\n");
   const highlightedCommand = command
-    ? highlightCode(displayCommand, "bash", options.invalidate)
+    ? highlightCode(
+        displayCommand,
+        audit.tool === "powershell" ? "powershell" : "bash",
+        options.invalidate,
+      )
     : null;
   const lines = commandLines.slice(1).map((line, index) =>
     `${theme.fg("dim", "  ")}${highlightedCommand?.[index + 1] ?? theme.fg("accent", line)}`,
@@ -1460,7 +1467,9 @@ const renderBash = (
     const text = theme.fg(audit.success === false ? "error" : "muted", escapeControlChars(entry.line) || " ");
     lines.push(text);
   }
-  if (nativeTruncated(audit)) pushArcItem(lines, arcItem(theme, "Output truncated by bash"));
+  if (nativeTruncated(audit)) {
+    pushArcItem(lines, arcItem(theme, `Output truncated by ${audit.tool ?? "shell"}`));
+  }
   const fullOutputPath = stringOf(resultDetails(audit)?.fullOutputPath);
   if (fullOutputPath) pushArcItem(lines, arcItem(theme, `Full output: ${escapeControlChars(fullOutputPath)}`));
   return { lines, hidden: selected.hidden };
@@ -1492,9 +1501,12 @@ export const coreToolPreviewEnabled = (
       return settings.findResultPreview;
     case "ls":
       return settings.lsResultPreview;
-    case "bash": {
+    case "bash":
+    case "powershell": {
       if (!settings.bashResultPreview) return false;
-      const command = firstShellCommandName(bashCommand(audit));
+      const command = audit.tool === "bash"
+        ? firstShellCommandName(bashCommand(audit))
+        : "";
       if (command === "grep" || command === "egrep" || command === "fgrep") {
         return settings.grepResultPreview;
       }
@@ -1527,6 +1539,7 @@ export const renderCoreToolBody = (
     case "ls":
       return renderPathList(audit, theme, options);
     case "bash":
+    case "powershell":
       return renderBash(audit, theme, options);
     default:
       return null;
@@ -1545,13 +1558,17 @@ export const coreToolTitle = (
     ? formatToolCallDuration(audit.startedAt, audit.endedAt)
     : undefined;
   const filePath = argString(audit, "path") ?? "";
-  if (audit.tool === "bash") {
+  if (audit.tool === "bash" || audit.tool === "powershell") {
     const command = bashCommand(audit);
     const firstLine = command.split("\n")[0] ?? "";
-    const highlighted = firstLine ? highlightCode(firstLine, "bash", options.invalidate)?.[0] : undefined;
+    const language = audit.tool === "powershell" ? "powershell" : "bash";
+    const highlighted = firstLine ? highlightCode(firstLine, language, options.invalidate)?.[0] : undefined;
     const timeout = numberOf(audit.args?.timeout);
-    const warnings = options.settings.bashWarnings ? bashWarnings(command) : [];
-    return `${title} ${theme.fg("dim", "$")} ${highlighted ?? theme.fg("accent", escapeControlChars(firstLine))}${metadata(theme, [
+    const warnings = audit.tool === "bash" && options.settings.bashWarnings
+      ? bashWarnings(command)
+      : [];
+    const prompt = audit.tool === "powershell" ? "PS>" : "$";
+    return `${title} ${theme.fg("dim", prompt)} ${highlighted ?? theme.fg("accent", escapeControlChars(firstLine))}${metadata(theme, [
       timeout !== undefined ? `timeout ${timeout}s` : undefined,
       warnings.length > 0 ? `⚠ ${warnings.join(", ")}` : undefined,
       timing,

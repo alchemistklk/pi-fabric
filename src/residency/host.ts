@@ -6,10 +6,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import {
+  normalizeModelAliases,
+  resolveAvailablePiModel,
+  type FabricModelCandidate,
+} from "../core/model-resolution.js";
+import { loadModelUsage } from "../core/model-usage.js";
+import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
-import { ActorManager } from "../actors/manager.js";
+import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
@@ -87,6 +93,7 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
     typeof config.projectRoot !== "string" ||
     typeof config.meshRoot !== "string" ||
     typeof config.actorRoot !== "string" ||
+    (config.sessionActorRoot !== undefined && typeof config.sessionActorRoot !== "string") ||
     typeof config.residencyRoot !== "string" ||
     typeof config.fullCodeMode !== "boolean" ||
     typeof config.agents !== "object" ||
@@ -117,7 +124,7 @@ class ResidentHost {
   readonly participants: ParticipantDirectory;
   readonly control: FabricControlPlane;
   readonly agents: AgentManager;
-  readonly actors: ActorManager;
+  readonly actors: ActorDirectory;
   readonly lifecycle: LifecycleBroker;
   readonly #ownerPath: string;
   readonly #lockPath: string;
@@ -171,9 +178,30 @@ class ResidentHost {
       });
     }
     const guidanceConfigPath = path.join(config.residencyRoot, "config.json");
-    const currentModelGuidance = () => {
-      const current = readJson<Partial<ResidentHostConfig>>(guidanceConfigPath);
-      return parseFabricOwnedModelGuidance(current?.modelGuidance ?? config.modelGuidance);
+    const currentConfig = (): Partial<ResidentHostConfig> =>
+      readJson<Partial<ResidentHostConfig>>(guidanceConfigPath) ?? config;
+    const currentModelGuidance = () =>
+      parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
+    const resolveResidentPiModel = (selector?: string): string => {
+      const state = currentConfig().piModels ?? config.piModels;
+      const available: FabricModelCandidate[] = Array.isArray(state?.available)
+        ? state.available.flatMap((candidate) =>
+            typeof candidate?.provider === "string" && typeof candidate.id === "string"
+              ? [{
+                  provider: candidate.provider,
+                  id: candidate.id,
+                  ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
+                }]
+              : [],
+          )
+        : [];
+      const query = selector?.trim() || state?.defaultModel?.trim() || "";
+      const resolved = resolveAvailablePiModel(query, {
+        aliases: normalizeModelAliases(state?.aliases),
+        available,
+        lastUsed: loadModelUsage(),
+      });
+      return `${resolved.provider}/${resolved.id}`;
     };
     this.agents = new AgentManager(config.cwd, config.agents, {
       workerPath: config.workerPath,
@@ -184,11 +212,13 @@ class ResidentHost {
       runRoot: path.join(config.residencyRoot, "runs"),
       fullCodeMode: config.fullCodeMode,
       mainAgentId: config.rootId,
+      fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
+      preparePiModel: async (model) => resolveResidentPiModel(model),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -217,7 +247,12 @@ class ResidentHost {
     };
     const lineageAlive = (rootId: string): boolean =>
       this.participants.get(rootId) !== undefined;
-    this.actors = new ActorManager(
+    const actorRoots = config.sessionActorRoot
+      ? { project: config.actorRoot, session: config.sessionActorRoot }
+      : config.mesh.actorScope === "session"
+        ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+        : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
+    this.actors = new ActorDirectory([
       config.sessionId,
       this.identity,
       this.mesh,
@@ -236,7 +271,6 @@ class ResidentHost {
         ).catch(() => undefined);
       },
       {
-        actorRoot: config.actorRoot,
         persistent: true,
         canManageActor,
         lineageAlive,
@@ -244,8 +278,9 @@ class ResidentHost {
         rootId: config.rootId,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: config.retention,
+        resolvePiModel: resolveResidentPiModel,
       },
-    );
+    ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(
       this.mesh,
       this.identity,
@@ -608,7 +643,7 @@ class ResidentHost {
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.
-        const actor = await this.actors.create(command.request);
+        const actor = await this.actors.create(command.request, { asRegistryOwner: true });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

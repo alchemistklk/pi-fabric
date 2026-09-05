@@ -186,6 +186,7 @@ export interface AgentWorkerOptions {
   depth: number;
   fullCodeMode: boolean;
   mainAgentId?: string;
+  fabricSessionId?: string;
   extensions: boolean;
   tools: string[];
   grantedRisks: string[];

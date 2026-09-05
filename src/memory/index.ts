@@ -792,6 +792,7 @@ export interface IndexedEntry {
 
 export interface ScoredEntry extends IndexedEntry {
   score: number;
+  matchedTerms: number;
 }
 
 export interface ShardBundle {
@@ -838,16 +839,20 @@ export const bm25Score = (
   for (let index = 0; index < matching.length; index += 1) {
     const item = matching[index]!;
     let score = 0;
+    let matchedTerms = 0;
     for (const term of queryTerms) {
       const tf = item.counts.get(term) ?? 0;
       if (tf === 0) continue;
+      matchedTerms += 1;
       const df = documentFrequency.get(term) ?? 0;
       const idf = Math.log((matching.length - df + 0.5) / (df + 0.5) + 1);
       const normalized = (tf * (K + 1)) /
         (tf + K * (1 - B + B * (lengths[index]! / averageLength)));
       score += idf * normalized;
     }
-    if (score > 0) results.push({ entry: item.entry, sessionMtime: item.mtime, score });
+    if (score > 0) {
+      results.push({ entry: item.entry, sessionMtime: item.mtime, score, matchedTerms });
+    }
   }
 
   results.sort((left, right) => {

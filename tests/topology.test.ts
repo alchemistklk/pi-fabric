@@ -71,6 +71,7 @@ const agent = (
 
 const actor = (overrides: Partial<FabricUiActor> = {}): FabricUiActor => ({
   id: "actor-1",
+  scope: "project",
   name: "advisor",
   status: "idle",
   runner: "pi",

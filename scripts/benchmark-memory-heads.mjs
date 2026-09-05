@@ -200,7 +200,10 @@ for (const [query, expected] of headQueries) {
   headResults.push({ query, expected, selected: candidates[0]?.ref ?? null });
 }
 const catalog = await registry.catalog(context);
-const lexical = await searchMemoryIndex(shards, digests, { query: "search source files" });
+const lexical = await searchMemoryIndex(shards, digests, {
+  query: "search source files",
+  queryMatch: "any",
+});
 const structural = await searchMemoryIndex(shards, digests, { filters: { ref: "pi.grep" } });
 const combined = await searchMemoryIndex(shards, digests, {
   query: "rarelexeme_target",

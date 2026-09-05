@@ -725,6 +725,11 @@ export interface ExpandSessionSelection {
 export interface ExpandedSessionEntry {
   index: number;
   entryId: string | null;
+  parentId: string | null;
+  type: string;
+  role: string | null;
+  timestamp: number | null;
+  isError: boolean;
   text: string;
   parentEntryId?: string | null;
   operationAddress?: string;
@@ -742,13 +747,36 @@ export interface ExpandedSessionEntry {
   carrierFromId?: string | null;
 }
 
-/** Re-read source once and resolve index, stable entry-id, or inclusive range addresses. */
-export const expandSessionEntries = (
-  sessionFile: string,
+const toExpandedSessionEntry = (entry: NormalizedEntry): ExpandedSessionEntry => ({
+  index: entry.index,
+  entryId: entry.entryId,
+  parentId: entry.parentId,
+  type: entry.type,
+  role: entry.role,
+  timestamp: entry.timestamp,
+  isError: entry.isError,
+  text: entry.text,
+  ...(entry.parentEntryId !== undefined ? { parentEntryId: entry.parentEntryId } : {}),
+  ...(entry.operationAddress ? { operationAddress: entry.operationAddress } : {}),
+  ...(entry.toolName ? { toolName: entry.toolName } : {}),
+  ...(entry.ref ? { ref: entry.ref } : {}),
+  ...(entry.provider ? { provider: entry.provider } : {}),
+  ...(entry.action ? { action: entry.action } : {}),
+  ...(entry.outcome ? { outcome: entry.outcome } : {}),
+  ...(entry.filesTouched ? { filesTouched: entry.filesTouched } : {}),
+  ...(entry.operation ? { operation: entry.operation } : {}),
+  ...(entry.branchFact ? { branchFact: entry.branchFact } : {}),
+  ...(entry.factAddress ? { factAddress: entry.factAddress } : {}),
+  ...(entry.carrierEntryId ? { carrierEntryId: entry.carrierEntryId } : {}),
+  ...(entry.carrierParentId !== undefined ? { carrierParentId: entry.carrierParentId } : {}),
+  ...(entry.carrierFromId !== undefined ? { carrierFromId: entry.carrierFromId } : {}),
+});
+
+/** Resolve index, stable entry-id, or inclusive range addresses from one normalized snapshot. */
+const expandNormalizedEntries = (
+  entries: readonly NormalizedEntry[],
   selection: ExpandSessionSelection,
-  options: NormalizeSessionOptions = {},
 ): ExpandedSessionEntry[] => {
-  const { entries } = normalizeSession(sessionFile, Number.MAX_SAFE_INTEGER, options);
   const indices = new Set(selection.indices ?? []);
   const entryIds = new Set(selection.entryIds ?? []);
   const operationAddresses = new Set(selection.operationAddresses ?? []);
@@ -760,25 +788,17 @@ export const expandSessionEntries = (
       (entry.operationAddress !== undefined && operationAddresses.has(entry.operationAddress)) ||
       (range !== undefined && entry.index >= range.first && entry.index <= range.last),
     )
-    .map((entry) => ({
-      index: entry.index,
-      entryId: entry.entryId,
-      text: entry.text,
-      ...(entry.parentEntryId !== undefined ? { parentEntryId: entry.parentEntryId } : {}),
-      ...(entry.operationAddress ? { operationAddress: entry.operationAddress } : {}),
-      ...(entry.toolName ? { toolName: entry.toolName } : {}),
-      ...(entry.ref ? { ref: entry.ref } : {}),
-      ...(entry.provider ? { provider: entry.provider } : {}),
-      ...(entry.action ? { action: entry.action } : {}),
-      ...(entry.outcome ? { outcome: entry.outcome } : {}),
-      ...(entry.filesTouched ? { filesTouched: entry.filesTouched } : {}),
-      ...(entry.operation ? { operation: entry.operation } : {}),
-      ...(entry.branchFact ? { branchFact: entry.branchFact } : {}),
-      ...(entry.factAddress ? { factAddress: entry.factAddress } : {}),
-      ...(entry.carrierEntryId ? { carrierEntryId: entry.carrierEntryId } : {}),
-      ...(entry.carrierParentId !== undefined ? { carrierParentId: entry.carrierParentId } : {}),
-      ...(entry.carrierFromId !== undefined ? { carrierFromId: entry.carrierFromId } : {}),
-    }));
+    .map(toExpandedSessionEntry);
+};
+
+/** Re-read source once and resolve index, stable entry-id, or inclusive range addresses. */
+export const expandSessionEntries = (
+  sessionFile: string,
+  selection: ExpandSessionSelection,
+  options: NormalizeSessionOptions = {},
+): ExpandedSessionEntry[] => {
+  const { entries } = normalizeSession(sessionFile, Number.MAX_SAFE_INTEGER, options);
+  return expandNormalizedEntries(entries, selection);
 };
 
 interface ExpansionAddressError {
@@ -793,15 +813,37 @@ export type ExpandSessionResult =
   | { expanded: ExpandedSessionEntry[] }
   | { expanded: []; error: ExpansionAddressError };
 
-/** Resolve every requested stable address exactly once, refusing missing or ambiguous identities. */
+/** Resolve every requested stable address from a source or snapshot, refusing missing or ambiguous identities. */
 export const expandSessionEntriesChecked = (
-  sessionFile: string,
+  sessionFileOrEntries: string | readonly NormalizedEntry[],
   selection: ExpandSessionSelection,
   options: NormalizeSessionOptions = {},
 ): ExpandSessionResult => {
-  const { entries } = normalizeSession(sessionFile, Number.MAX_SAFE_INTEGER, options);
-  for (const address of new Set(selection.entryIds ?? [])) {
-    const matches = entries.filter((entry) => entry.entryId === address).length;
+  const entries = typeof sessionFileOrEntries === "string"
+    ? normalizeSession(sessionFileOrEntries, Number.MAX_SAFE_INTEGER, options).entries
+    : sessionFileOrEntries;
+  const requestedEntryIds = new Set(selection.entryIds ?? []);
+  const requestedOperationAddresses = new Set(selection.operationAddresses ?? []);
+  const entryIdCounts = new Map([...requestedEntryIds].map((address) => [address, 0]));
+  const operationAddressCounts = new Map(
+    [...requestedOperationAddresses].map((address) => [address, 0]),
+  );
+  for (const entry of entries) {
+    if (entry.entryId !== null && requestedEntryIds.has(entry.entryId)) {
+      entryIdCounts.set(entry.entryId, (entryIdCounts.get(entry.entryId) ?? 0) + 1);
+    }
+    if (
+      entry.operationAddress !== undefined &&
+      requestedOperationAddresses.has(entry.operationAddress)
+    ) {
+      operationAddressCounts.set(
+        entry.operationAddress,
+        (operationAddressCounts.get(entry.operationAddress) ?? 0) + 1,
+      );
+    }
+  }
+  for (const address of requestedEntryIds) {
+    const matches = entryIdCounts.get(address) ?? 0;
     if (matches !== 1) {
       return {
         expanded: [],
@@ -817,8 +859,8 @@ export const expandSessionEntriesChecked = (
       };
     }
   }
-  for (const address of new Set(selection.operationAddresses ?? [])) {
-    const matches = entries.filter((entry) => entry.operationAddress === address).length;
+  for (const address of requestedOperationAddresses) {
+    const matches = operationAddressCounts.get(address) ?? 0;
     if (matches !== 1) {
       return {
         expanded: [],
@@ -834,5 +876,5 @@ export const expandSessionEntriesChecked = (
       };
     }
   }
-  return { expanded: expandSessionEntries(sessionFile, selection, options) };
+  return { expanded: expandNormalizedEntries(entries, selection) };
 };

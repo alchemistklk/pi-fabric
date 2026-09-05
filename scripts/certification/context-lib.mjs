@@ -141,7 +141,7 @@ export const runDeterministicHandoff = async ({ root, compactedContext, memory }
   }
   const expansion = await memory.expand({ pointer, entryIds: [taskAddress] });
   if (expansion?.error) throw new Error(`Memory expansion failed: ${String(expansion.error.code)}`);
-  const taskEntry = expansion?.expanded?.find((entry) => entry.entryId === taskAddress);
+  const taskEntry = expansion?.entries?.find((entry) => entry.entryId === taskAddress);
   const addressResolved = Boolean(taskEntry);
   if (!taskEntry || !taskEntry.text.startsWith("CERT_TASK_V1\n")) {
     throw new Error("Address did not expand to an exact CERT_TASK_V1 task");

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { resolveAgentCwd, validateAgentCwdRequest } from "../agents/manager.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
@@ -22,6 +23,7 @@ import {
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
   type ResidentHostOwner,
+  type ResidentPiModelState,
 } from "./protocol.js";
 
 // One-time cost per resident root: cold-starting the bundled pi binary plus
@@ -88,6 +90,7 @@ export interface ResidencyClientOptions {
   mesh: MeshStore;
   participants: FabricParticipantSource;
   mainAgent: FabricMainAgentTarget;
+  piModelState?: () => ResidentPiModelState;
   hostPath?: string;
 }
 
@@ -120,6 +123,7 @@ export class ResidencyClient {
 
   start(): void {
     if (this.#deliveryTimer || this.#closed || !this.options.mainAgent.local) return;
+    this.syncPiModels();
     this.#deliveryTimer = setInterval(
       () => void this.#drainDeliveries().catch(() => undefined),
       Math.max(20, this.options.config.mesh.actorPollMs),
@@ -135,12 +139,20 @@ export class ResidencyClient {
     while (this.#drainingDeliveries) await delay(10);
   }
 
+  syncPiModels(): void {
+    this.#refreshPiModels();
+    if (fs.existsSync(this.options.config.residencyRoot)) {
+      atomicWrite(this.#configPath, this.options.config);
+    }
+  }
+
   updateModelGuidance(guidance: readonly FabricOwnedModelGuidance[]): void {
     const snapshot: FabricOwnedModelGuidance[] = structuredClone([...guidance]);
     const serialized = JSON.stringify(snapshot);
     if (serialized === this.#modelGuidanceJson) return;
     this.#modelGuidanceJson = serialized;
     this.options.config.modelGuidance = snapshot;
+    this.#refreshPiModels();
     if (fs.existsSync(this.options.config.residencyRoot)) {
       atomicWrite(this.#configPath, this.options.config);
     }
@@ -148,6 +160,7 @@ export class ResidencyClient {
 
   async ensureHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
+    this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
     if (existing) return existing;
@@ -183,9 +196,29 @@ export class ResidencyClient {
     throw new Error(`Timed out starting Fabric resident host ${this.hostId}. ${diagnostics}`);
   }
 
+  #refreshPiModels(): void {
+    const state = this.options.piModelState?.();
+    if (state) this.options.config.piModels = structuredClone(state);
+  }
+
   async ensureActor(id: string): Promise<void> {
     await this.ensureHost();
     await this.#waitForParticipant(id, "actor");
+  }
+
+  async createActor(request: FabricActorRequest): Promise<FabricActorInfo> {
+    await this.ensureHost();
+    const response = await this.#command({
+      format: RESIDENT_HOST_FORMAT,
+      operation: "createActor",
+      requestId: randomUUID(),
+      rootId: this.options.config.rootId,
+      request,
+      createdAt: Date.now(),
+    });
+    if (!response.actor) throw new Error("Fabric resident host returned no actor");
+    await this.#waitForParticipant(response.actor.id, "actor");
+    return response.actor;
   }
 
   async spawnAgent(request: AgentRunRequest, signal?: AbortSignal): Promise<AgentHandleInfo> {

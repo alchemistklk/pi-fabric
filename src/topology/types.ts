@@ -94,6 +94,8 @@ export interface FabricParticipantSource {
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
   get(id: string, now?: number): FabricParticipantInfo | undefined;
   self(now?: number): FabricParticipantInfo;
+  /** All live root Pi session agents, including the current lineage root. */
+  sessions?(now?: number): FabricParticipantInfo[];
   peers(now?: number): FabricPeerInfo[];
   refresh(): Promise<void>;
   scheduleRefresh(): void;

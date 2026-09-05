@@ -258,18 +258,28 @@ const asDirective = (result: AgentRunResult): FabricActorDirective => {
   return directive as FabricActorDirective;
 };
 
+export class ActorRegistryOwnershipError extends Error {
+  constructor() {
+    super("Fabric actor registry is owned by another host");
+    this.name = "ActorRegistryOwnershipError";
+  }
+}
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   readonly #actorRoot: string;
+  readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registryPath: string;
   readonly #persistent: boolean;
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #resolvePiModel: ((model: string) => string) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
   readonly #meshCursorPath: string | undefined;
+  readonly #relayParticipantSteering: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #acquireCapabilityView:
     | ((
@@ -315,14 +325,17 @@ export class ActorManager {
     readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
     options: {
       actorRoot?: string;
+      actorScope?: import("./types.js").FabricActorStorageScope;
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
+      resolvePiModel?: (model: string) => string;
       lineageAlive?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
       meshCursorPath?: string;
+      relayParticipantSteering?: boolean;
       retention?: FabricRetentionConfig;
       acquireCapabilityView?(
         requirements: readonly FabricCapabilityRequirement[],
@@ -332,14 +345,17 @@ export class ActorManager {
   ) {
     this.#actorRoot =
       options.actorRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actors-"));
+    this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
+    this.#resolvePiModel = options.resolvePiModel;
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
     this.#meshCursorPath = options.meshCursorPath;
+    this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#registryPath = path.join(this.#actorRoot, "actors.json");
     this.#bindings = new ActorBindingStore(
       sessionId,
@@ -372,14 +388,26 @@ export class ActorManager {
     });
   }
 
-  async create(request: FabricActorRequest): Promise<FabricActorInfo> {
+  /**
+   * Create an actor. The asRegistryOwner option is reserved for explicitly
+   * durable requests arriving through the resident host control channel. That
+   * host already is the authoritative registry owner, so the foreign-live-actor
+   * guard—which protects against concurrent local starters—must not veto the
+   * request while a transferred actor still advertises its creating host.
+   */
+  async create(
+    request: FabricActorRequest,
+    { asRegistryOwner = false }: { asRegistryOwner?: boolean } = {},
+  ): Promise<FabricActorInfo> {
     this.#refreshOwnership();
+    const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
     if (
+      !registryOwnerCreate &&
       [...this.#actors.values()].some(
         (actor) => actor.status !== "stopped" && !this.#canManage(actor.id),
       )
     ) {
-      throw new Error("Fabric actor registry is owned by another host");
+      throw new ActorRegistryOwnershipError();
     }
     if (!this.meshConfig.enabled) throw new Error("Fabric mesh and actors are disabled");
     const name = request.name.trim();
@@ -411,6 +439,8 @@ export class ActorManager {
     if (runner !== "pi" && runner !== "claude") {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
+    const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
+    const model = requestedModel ? this.#resolvedModel(runner, requestedModel) : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
@@ -432,7 +462,7 @@ export class ActorManager {
       coalesce: request.coalesce ?? true,
       residency,
       runner,
-      ...(request.model ? { model: request.model } : {}),
+      ...(model ? { model } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.tools ? { tools: [...new Set(request.tools)] } : {}),
       ...(request.transport ? { transport: request.transport } : {}),
@@ -537,15 +567,19 @@ export class ActorManager {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
     }
     const next = typeof model === "string" ? model.trim() : "";
+    if (scope === "session") this.#syncActorsFromRegistry();
+    const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
+    const resolved = next
+      ? scope === "project" || this.#canManage(actor.id)
+        ? this.#resolvedModel(actor.runner, next)
+        : next
+      : undefined;
     if (scope === "session") {
-      this.#syncActorsFromRegistry();
-      const actor = this.#requireActor(id);
-      await this.#bindings.setModel(actor.id, next || undefined);
+      await this.#bindings.setModel(actor.id, resolved);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
-    const actor = this.#requireOwnedActor(id);
-    if (next) actor.model = next;
+    if (resolved) actor.model = resolved;
     else delete actor.model;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -1218,9 +1252,12 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const binding = options.binding !== undefined
-      ? this.#validatedRunBinding(options.binding)
-      : this.#runBinding(actor, options.overrides);
+    const binding = this.#resolvedRunBinding(
+      actor,
+      options.binding !== undefined
+        ? this.#validatedRunBinding(options.binding)
+        : this.#runBinding(actor, options.overrides),
+    );
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
@@ -1743,27 +1780,29 @@ export class ActorManager {
     const kind = event.kind === "followUp" ? "followUp" : "steer";
     const message = typeof event.text === "string" ? event.text : "";
     if (!message) return;
-    if (this.#mainAgent?.local && target === this.#mainAgent.id) {
-      try {
-        this.#mainAgent.deliverAgent({
-          from: event.from,
-          message,
-          delivery: kind,
-          ...(event.data === undefined ? {} : { data: event.data }),
-        });
-      } catch {
-        // The owning main session may be shutting down; mesh delivery is best-effort.
-      }
-      return;
-    }
-    try {
-      this.agents.status(target);
-      if (kind === "steer") this.agents.steer(target, message);
-      else this.agents.followUp(target, message);
-      return;
-    } catch (error) {
-      if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
+    if (this.#relayParticipantSteering) {
+      if (this.#mainAgent?.local && target === this.#mainAgent.id) {
+        try {
+          this.#mainAgent.deliverAgent({
+            from: event.from,
+            message,
+            delivery: kind,
+            ...(event.data === undefined ? {} : { data: event.data }),
+          });
+        } catch {
+          // The owning main session may be shutting down; mesh delivery is best-effort.
+        }
         return;
+      }
+      try {
+        this.agents.status(target);
+        if (kind === "steer") this.agents.steer(target, message);
+        else this.agents.followUp(target, message);
+        return;
+      } catch (error) {
+        if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
+          return;
+        }
       }
     }
     try {
@@ -2233,6 +2272,21 @@ export class ActorManager {
     if (added > 0) this.#emitChange();
   }
 
+  #resolvedModel(runner: FabricAgentRunner, model: string): string {
+    return runner === "pi" && this.#resolvePiModel
+      ? this.#resolvePiModel(model)
+      : model;
+  }
+
+  #resolvedRunBinding(
+    actor: ManagedActor,
+    binding: FabricActorRunBinding,
+  ): FabricActorRunBinding {
+    return binding.model
+      ? { ...binding, model: this.#resolvedModel(actor.runner, binding.model) }
+      : binding;
+  }
+
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {
     const model = typeof binding.model === "string" ? binding.model.trim() : "";
     if (binding.thinking !== undefined && !isFabricThinking(binding.thinking)) {
@@ -2263,6 +2317,7 @@ export class ActorManager {
     const effective = this.#runBinding(actor);
     return {
       id: actor.id,
+      scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
       status: actor.status,

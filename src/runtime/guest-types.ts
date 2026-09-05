@@ -9,6 +9,7 @@ import type { FabricDynamicGuestDeclarations } from "../protocol.js";
 export const PI_CORE_COMPATIBILITY_ARGUMENT_TYPE_NAMES = {
   read: "PiReadCompatibilityArgument",
   bash: "PiBashCompatibilityArgument",
+  powershell: "PiPowerShellCompatibilityArgument",
   edit: "PiEditCompatibilityArgument",
   write: "PiWriteCompatibilityArgument",
   grep: "PiGrepCompatibilityArgument",
@@ -19,6 +20,7 @@ export const PI_CORE_COMPATIBILITY_ARGUMENT_TYPE_NAMES = {
 export const PI_CORE_NUMERIC_FIELDS = {
   read: ["offset", "limit"],
   bash: ["timeout"],
+  powershell: ["timeout"],
   edit: [],
   write: [],
   grep: ["context", "limit"],
@@ -365,11 +367,11 @@ interface FabricCapturedTool {
   (args?: Record<string, unknown>): Promise<FabricCapturedToolResult>;
 }
 type FabricExtensionsApi = Record<string, FabricCapturedTool>;
-// String-primary tools (read/bash/grep/find/ls) accept a bare string; the
+// String-primary tools (read/bash/powershell/grep/find/ls) accept a bare string; the
 // runtime proxy coerces it to { <primaryField>: string }. Lets the model write
 // the natural form (pi.bash("ls")) instead of pi.bash({ command: "ls" }).
 // Return shapes differ by tool: read/grep/find/ls return their text as a bare
-// string (e.g. const src: string = await pi.read({ path })); bash/edit/write
+// string (e.g. const src: string = await pi.read({ path })); shell/edit/write
 // return { ok, output, details } (e.g. const { output } = await pi.bash(...)).
 // Common alias keys (cmd→command, query→pattern, file→path, dir→path) and a
 // flat edit shape ({ path, oldText, newText }) are also accepted; the runtime
@@ -382,7 +384,7 @@ type FabricExtensionsApi = Record<string, FabricCapturedTool>;
 // String-primary tools also take a two-arg (primary, options) form —
 // pi.read("index.ts", { limit: 120 }) merges to { path, ...options } at
 // runtime, the positional string winning the primary field on conflict.
-// bash/edit/write envelopes are proxy-guarded so string-method access
+// shell/edit/write envelopes are proxy-guarded so string-method access
 // (.trim(), .split(), iteration) fails with an actionable TypeError pointing
 // at .output instead of QuickJS's context-free "not a function" — property-
 // miss (2339) checks are suppressed by design, so the runtime gives the hint.
@@ -453,19 +455,22 @@ type PiFindPatternArgument = { pattern?: string; query?: string; regex?: string;
 // the primary field comes from the positional string.
 type PiReadOptions = { offset?: number; limit?: number; start?: number; max?: number };
 // cwd is honored per call by the pi provider, which binds the command to a
-// bash definition rooted there; relative paths resolve from the session cwd.
-// The alias spellings mirror __piArgAliases.bash in quickjs-runtime.ts: the
+// shell definition rooted there; relative paths resolve from the session cwd.
+// The alias spellings mirror the shell entries in __piArgAliases: the
 // runtime repairs them, so the checker has to accept the same spellings or a
 // repairable call is rejected before it ever reaches the sandbox.
-type PiBashOptions = {
+type PiShellOptions = {
   timeout?: number; timeoutMs?: number; settle?: boolean;
   cwd?: string; workdir?: string; directory?: string; workingDirectory?: string;
 };
+type PiBashOptions = PiShellOptions;
+type PiPowerShellOptions = PiShellOptions;
 type PiGrepOptions = { path?: string; glob?: string; globPattern?: string; ignoreCase?: boolean; ic?: boolean; caseInsensitive?: boolean; literal?: boolean; context?: number; ctx?: number; limit?: number; max?: number };
 type PiFindOptions = { path?: string; limit?: number; max?: number };
 type PiLsOptions = { limit?: number; max?: number };
 type PiReadArgument = string | (PiPathArgument & PiReadOptions);
 type PiBashArgument = string | (PiCommandArgument & PiBashOptions);
+type PiPowerShellArgument = string | (PiCommandArgument & PiPowerShellOptions);
 type PiEditFlatArgument = PiPathArgument & PiOldTextArgument & PiNewTextArgument & { all?: boolean };
 type PiEditArgument = PiPathArgument & ({ edits: PiEditOperation[]; all?: boolean } | PiEditFlatArgument);
 type PiWriteArgument = string | (PiPathArgument & PiContentArgument);
@@ -476,6 +481,7 @@ type PiNumericString<T> = T extends number ? T | string : T;
 type PiNumericStringOptions<T> = { [K in keyof T]: PiNumericString<T[K]> };
 type PiReadCompatibilityArgument = string | (PiPathArgument & PiNumericStringOptions<PiReadOptions>);
 type PiBashCompatibilityArgument = string | (PiCommandArgument & PiNumericStringOptions<PiBashOptions>);
+type PiPowerShellCompatibilityArgument = string | (PiCommandArgument & PiNumericStringOptions<PiPowerShellOptions>);
 type PiEditCompatibilityArgument = PiEditFlatArgument;
 type PiWriteCompatibilityArgument = PiWriteArgument;
 type PiGrepCompatibilityArgument = string | (PiGrepPatternArgument & PiNumericStringOptions<PiGrepOptions>);
@@ -484,6 +490,7 @@ type PiLsCompatibilityArgument = string | (PiOptionalPathArgument & PiNumericStr
 interface PiToolsApi {
   read(args: PiReadArgument, options?: PiReadOptions): Promise<string>;
   bash(args: PiBashArgument, options?: PiBashOptions): Promise<{ ok: true; output: string; details: unknown } | { ok: false; output: string; details: null; exitCode: number; error: string }>;
+  powershell(args: PiPowerShellArgument, options?: PiPowerShellOptions): Promise<{ ok: true; output: string; details: unknown } | { ok: false; output: string; details: null; exitCode: number; error: string }>;
   edit(args: PiEditArgument): Promise<{ ok: true; output: string; details: unknown }>;
   edit(path: string, oldText: string, newText: string): Promise<{ ok: true; output: string; details: unknown }>;
   write(args: PiWriteArgument): Promise<{ ok: true; output: string; details: unknown }>;
@@ -553,6 +560,7 @@ type FabricActorBindingScope = "session" | "project";
 interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
 interface FabricActorRequestBase {
+  scope?: "session" | "project" | "global";
   name: string;
   instructions: string;
   events?: FabricActorHostEvent[];
@@ -578,6 +586,7 @@ type FabricActorRequest = FabricActorRequestBase & (
 );
 interface FabricActorInfo {
   id: string;
+  scope: "session" | "project";
   name: string;
   status: "idle" | "queued" | "running" | "stopped";
   runner: FabricAgentRunner;
@@ -654,6 +663,7 @@ interface FabricAgentsApi {
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   self(): Promise<FabricParticipantInfo>;
   main(): Promise<FabricMainAgentInfo>;
+  sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
   subscribe(args: {
     from: string;
@@ -800,19 +810,23 @@ interface FabricMeshApi {
 // property path named. Keep these spillover fields in sync with the provider
 // normalization tables.
 type FabricMemoryBranches = "active" | "all";
+type FabricMemoryQueryMode = "literal" | "phrase" | "regex";
+type FabricMemoryQueryMatch = "all" | "any";
 interface FabricMemoryEntryRange {
   first: number;
   last: number;
 }
 interface FabricMemoryRecallArgs {
   query?: string;
-  queryMode?: "literal" | "regex";
+  queryMode?: FabricMemoryQueryMode;
+  queryMatch?: FabricMemoryQueryMatch;
   expectedSourceHash?: string;
   expectedLineageFingerprint?: string;
   branches?: FabricMemoryBranches;
   scope?: string;
-  page?: number;
+  offset?: number;
   pageSize?: number;
+  snippetChars?: number;
   role?: string;
   tool?: string;
   ref?: string;
@@ -826,38 +840,10 @@ interface FabricMemoryRecallArgs {
   limit?: number;
   max?: number;
   page_size?: number;
-  query_mode?: "literal" | "regex";
+  snippet_chars?: number;
+  query_mode?: FabricMemoryQueryMode;
+  query_match?: FabricMemoryQueryMatch;
   entry_range?: FabricMemoryEntryRange;
-}
-interface FabricMemoryRecallResult {
-  scope?: string;
-  branches?: FabricMemoryBranches;
-  query?: string | null;
-  queryMode?: "literal" | "regex";
-  matchMode?: "browse" | "lexical" | "regex" | "structural" | "combined";
-  structuralFilters?: {
-    role?: string;
-    tool?: string;
-    ref?: string;
-    provider?: string;
-    action?: string;
-    outcome?: "succeeded" | "failed" | "aborted" | "timed_out";
-    since?: number;
-    until?: number;
-  };
-  matchedCount?: number;
-  totalMatches?: number;
-  totalItems?: number;
-  segmentCount?: number;
-  segments?: unknown[];
-  digestHits?: unknown[];
-  items?: unknown[];
-  page?: number;
-  pageSize?: number;
-  hasNext?: boolean;
-  coverage?: unknown;
-  text?: string;
-  error?: { code: string; message: string; [key: string]: unknown };
 }
 interface FabricMemoryExpandArgs {
   session: string;
@@ -868,6 +854,12 @@ interface FabricMemoryExpandArgs {
   entryIds?: string[];
   operationAddresses?: string[];
   entryRange?: FabricMemoryEntryRange;
+  before?: number;
+  after?: number;
+  entryOffset?: number;
+  textOffset?: number;
+  maxChars?: number;
+  maxEntries?: number;
   id?: string;
   file?: string;
   path?: string;
@@ -876,14 +868,111 @@ interface FabricMemoryExpandArgs {
   entry_ids?: string[];
   operation_addresses?: string[];
   entry_range?: FabricMemoryEntryRange;
+  entry_offset?: number;
+  text_offset?: number;
+  max_chars?: number;
+  max_entries?: number;
+}
+interface FabricMemoryCall<Ref extends string, Args> {
+  ref: Ref;
+  args: Args;
+}
+interface FabricMemoryRecallEntryHit {
+  kind: "entry";
+  sessionId: string;
+  tier: "hot" | "cold";
+  index: number;
+  entryId: string | null;
+  parentId: string | null;
+  operationAddress: string | null;
+  type: string;
+  role: string | null;
+  tool: string | null;
+  ref: string | null;
+  provider: string | null;
+  action: string | null;
+  timestamp: number | null;
+  isError: boolean;
+  outcome?: "succeeded" | "failed" | "aborted" | "timed_out";
+  score: number;
+  snippet: string;
+  truncated: boolean;
+  follow: FabricMemoryCall<"memory.expand", FabricMemoryExpandArgs>;
+}
+interface FabricMemoryRecallSessionHit {
+  kind: "session";
+  sessionId: string;
+  tier: "cold";
+  cwd: string;
+  lastTimestamp: number | null;
+  score: number;
+  matchedTerms: number;
+  matchedStructuralEntries: number;
+  follow: FabricMemoryCall<"memory.recall", FabricMemoryRecallArgs>;
+}
+type FabricMemoryRecallHit = FabricMemoryRecallEntryHit | FabricMemoryRecallSessionHit;
+interface FabricMemoryError {
+  code: string;
+  message: string;
+  [key: string]: unknown;
+}
+interface FabricMemoryCoverage {
+  complete: boolean;
+  indexedSessions: number;
+  eligibleSessions: number;
+  staleSessions: number;
+  incompleteSessions: number;
+  reasons: string[];
+  error?: FabricMemoryError;
+}
+interface FabricMemoryRecallResult {
+  total: number;
+  hits: FabricMemoryRecallHit[];
+  next: FabricMemoryCall<"memory.recall", FabricMemoryRecallArgs> | null;
+  coverage: FabricMemoryCoverage;
+  error?: FabricMemoryError;
+}
+interface FabricMemoryExpandedEntry {
+  index: number;
+  entryId: string | null;
+  parentId: string | null;
+  type: string | null;
+  role: string | null;
+  timestamp: number | null;
+  isError: boolean;
+  anchor?: boolean;
+  text: string;
+  textRange: { start: number; end: number; total: number; complete: boolean };
+  parentEntryId?: string | null;
+  operationAddress?: string | null;
+  tool?: string | null;
+  ref?: string | null;
+  provider?: string | null;
+  action?: string | null;
+  outcome?: "succeeded" | "failed" | "aborted" | "timed_out";
+  filesTouched?: Array<string | null>;
+  operation?: unknown;
+  branchFact?: unknown;
+  structuredTruncated?: boolean;
+  factAddress?: string | null;
+  carrierEntryId?: string | null;
+  carrierParentId?: string | null;
+  carrierFromId?: string | null;
 }
 interface FabricMemoryExpandResult {
   session?: string;
   sourceHash?: string;
   branches?: FabricMemoryBranches;
   lineageFingerprint?: string;
-  expanded?: unknown[];
-  error?: { code: string; message: string; [key: string]: unknown };
+  entryCount?: number;
+  entries: FabricMemoryExpandedEntry[];
+  next?: FabricMemoryCall<"memory.expand", FabricMemoryExpandArgs> | null;
+  error?: FabricMemoryError;
+}
+interface FabricMemoryWalkResult {
+  visited: number;
+  stopped: boolean;
+  error?: FabricMemoryError;
 }
 interface FabricMemorySessionInfo {
   id: string;
@@ -898,6 +987,13 @@ interface FabricMemorySessionInfo {
 interface FabricMemoryApi {
   recall(args?: FabricMemoryRecallArgs): Promise<FabricMemoryRecallResult>;
   expand(args: FabricMemoryExpandArgs): Promise<FabricMemoryExpandResult>;
+  walk(
+    args: FabricMemoryExpandArgs,
+    visitor: (
+      entry: FabricMemoryExpandedEntry,
+      index: number,
+    ) => boolean | void | Promise<boolean | void>,
+  ): Promise<FabricMemoryWalkResult>;
   sessions(args?: {
     scope?: string;
     branches?: FabricMemoryBranches;
@@ -907,7 +1003,7 @@ interface FabricMemoryApi {
     scope?: string;
     branches?: FabricMemoryBranches;
     sessions?: FabricMemorySessionInfo[];
-    error?: { code: string; message: string; [key: string]: unknown };
+    error?: FabricMemoryError;
   }>;
 }
 interface FabricStateTransitionArgs {

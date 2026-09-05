@@ -257,7 +257,7 @@ export const claimFabricHandoff = (
 };
 
 // Filesystem-fallback claim path (PREWALK_FS_DRIFT_REF): reached when an armed
-// session ran a successful pi.bash inside the program but no audited pi.edit /
+// session ran a successful Pi shell call inside the program but no audited pi.edit /
 // pi.write / schema.commit fired — heredocs, sed -i, formatter binaries. The
 // rest of the boundary pipeline (in-place switch or trajectory fork) is
 // identical; only the trigger evidence differs.

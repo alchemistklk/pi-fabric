@@ -18,6 +18,36 @@ import {
   type FabricPrewalkRequestResultV1,
 } from "../protocol.js";
 import { awaitPeerSettle, buildPeerCards } from "../topology/peer-settle.js";
+import type { RepairStatus } from "../repairs/types.js";
+import { ENTROPY_METRIC_VERSION } from "../entropy/types.js";
+import {
+  entropySurfaceHash,
+  liveSurfaceSnapshot,
+  surfaceFreedomReport,
+} from "../entropy/surface.js";
+import {
+  machineSessionFilesAsync,
+  measureSessionCorpusAsync,
+  projectSessionFilesAsync,
+  sessionWindowEvidenceAsync,
+} from "../entropy/sessions.js";
+import { measureEntropyAsync } from "../entropy/meter.js";
+import { entropyRepairRows } from "../entropy/corpus.js";
+import { entropyReviewSignals, formatEntropyReviewSignal } from "../entropy/compiler.js";
+import { loadObservationPoolAsync } from "../entropy/pool-store.js";
+import { mergeObservationWindowAsync, poolToValueObservations } from "../entropy/pool.js";
+import { applyCompiledSurface } from "../entropy/compiled-surface.js";
+import {
+  loadCompiledSurfaceAsync,
+  parseCompiledSurfaceArtifact,
+  saveCompiledSurfaceAsync,
+} from "../entropy/compiled-store.js";
+import {
+  formatEntropyCommandHints,
+  formatEntropyMetric,
+} from "../entropy/presentation.js";
+import { mergeCompiledSurfaces } from "../entropy/compiled-surface.js";
+import { setActiveCompiledSurface } from "../entropy/active.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -225,6 +255,28 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
     });
   }
 
+  const formatRepairStatus = (status: RepairStatus): string => {
+    const top = status.fingerprints
+      .slice(0, 8)
+      .map((entry) => `  ${entry.count}× ${entry.fingerprint}`)
+      .join("\n");
+    const rows = status.repairs
+      .slice(0, 12)
+      .map((repair) =>
+        repair.kind === "keyAlias"
+          ? `  ${repair.ref}: ${repair.from} → ${repair.to}`
+          : `  ${repair.provider}.${repair.from} → ${repair.to}`,
+      )
+      .join("\n");
+    return [
+      `repairs: ${status.enabled ? "on" : "off"} · digest ${status.catalogDigest.slice(0, 12) || "none"}`,
+      `table: ${status.repairCount} · apply hits ${status.applyHits} · invocation ${status.invocationErrors} · effect dropped ${status.effectDropped}`,
+      status.repairs.length > 0 ? `current:\n${rows}` : "current: (empty)",
+      ...(status.storeError ? [`store: ${status.storeError}`] : []),
+      top ? `fingerprints:\n${top}` : "fingerprints: (none this session)",
+    ].join("\n");
+  };
+
   pi.registerCommand("fabric", {
     description: "Open Fabric, arm prewalk, reload, or manage agents and actors",
     getArgumentCompletions: (argumentPrefix: string): AutocompleteItem[] | null => {
@@ -250,6 +302,8 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         "import",
         "export",
         "kill",
+        "repairs",
+        "entropy",
       ];
       const idCommands = new Set([
         "messages",
@@ -812,9 +866,249 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
         }
         return;
       }
+      if (command === "repairs") {
+        if (argumentsList[0] !== undefined) {
+          context.ui.notify("Usage: /fabric repairs", "warning");
+          return;
+        }
+        context.ui.notify(formatRepairStatus(state.repairs.status()), "info");
+        return;
+      }
+      if (command === "entropy") {
+        const exportArtifactIndex = argumentsList.indexOf("export-artifact");
+        if (exportArtifactIndex >= 0) {
+          const target = argumentsList[exportArtifactIndex + 1];
+          try {
+            const loaded = await loadCompiledSurfaceAsync(resolveAgentDir());
+            if (loaded.error) {
+              context.ui.notify(loaded.error, "error");
+              return;
+            }
+            if (!loaded.file) {
+              context.ui.notify(
+                "No compiled surface to export; wait for a compile to pass its gate",
+                "warning",
+              );
+              return;
+            }
+            const dest = path.resolve(
+              target ?? path.join(resolveAgentDir(), "fabric", "entropy", "artifact.json"),
+            );
+            await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+            await fs.promises.writeFile(dest, `${JSON.stringify(loaded.file, null, 2)}\n`, {
+              encoding: "utf-8",
+              mode: 0o600,
+            });
+            context.ui.notify(
+              `Exported compiled surface (${loaded.file.actions.length} tightened · ${loaded.file.quarantined.length} quarantined) → ${dest}`,
+              "info",
+            );
+          } catch (error) {
+            context.ui.notify(
+              error instanceof Error ? error.message : String(error),
+              "error",
+            );
+          }
+          return;
+        }
+        const importIndex = argumentsList.indexOf("import");
+        if (importIndex >= 0) {
+          const source = argumentsList[importIndex + 1];
+          if (!source) {
+            context.ui.notify("Usage: /fabric entropy import <artifact.json>", "warning");
+            return;
+          }
+          try {
+            const raw: unknown = JSON.parse(
+              await fs.promises.readFile(path.resolve(source), "utf-8"),
+            );
+            const incoming = parseCompiledSurfaceArtifact(raw);
+            if (!incoming) {
+              context.ui.notify(`Artifact is invalid: ${source}`, "error");
+              return;
+            }
+            const agentDir = resolveAgentDir();
+            const localLoaded = await loadCompiledSurfaceAsync(agentDir);
+            if (localLoaded.error) {
+              context.ui.notify(localLoaded.error, "error");
+              return;
+            }
+            const live = await liveSurfaceSnapshot({
+              registry: state.registry,
+              extensionContext: context,
+              cwd: state.cwd ?? context.cwd,
+            });
+            const merged = mergeCompiledSurfaces(localLoaded.file, incoming, live);
+            const saved = await saveCompiledSurfaceAsync(agentDir, merged.file);
+            if (state.config.entropy.compile) setActiveCompiledSurface(saved.file);
+            context.ui.notify(
+              `Imported compiled surface: ${merged.file.actions.length} tightened · ${merged.file.quarantined.length} quarantined · ${merged.droppedOverlays + merged.droppedQuarantines} dropped (base digest mismatch)`,
+              "info",
+            );
+          } catch (error) {
+            context.ui.notify(
+              error instanceof Error ? error.message : String(error),
+              "error",
+            );
+          }
+          return;
+        }
+        const exportIndex = argumentsList.indexOf("export");
+        if (exportIndex >= 0) {
+          const target = argumentsList[exportIndex + 1];
+          try {
+            const snapshot = await liveSurfaceSnapshot({
+              registry: state.registry,
+              extensionContext: context,
+              cwd: state.cwd ?? context.cwd,
+            });
+            const dest = path.resolve(
+              target ?? path.join(resolveAgentDir(), "fabric", "entropy", "surface.json"),
+            );
+            await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+            await fs.promises.writeFile(dest, `${JSON.stringify(snapshot, null, 2)}\n`, {
+              encoding: "utf8",
+              mode: 0o600,
+            });
+            context.ui.notify(
+              `Exported ${snapshot.actions.length} surface actions → ${dest}`,
+              "info",
+            );
+          } catch (error) {
+            context.ui.notify(
+              error instanceof Error ? error.message : String(error),
+              "error",
+            );
+          }
+          return;
+        }
+        const projectScope = argumentsList.includes("--project");
+        const scopedArguments = argumentsList.filter((argument) => argument !== "--project");
+        if (scopedArguments[0] !== undefined) {
+          context.ui.notify(
+            "Usage: /fabric entropy [--project] [export [path] | export-artifact [path] | import <path>]",
+            "warning",
+          );
+          return;
+        }
+        try {
+          const status = state.repairs.status();
+          const agentDir = resolveAgentDir();
+          const scopeCwd = state.cwd ?? context.cwd;
+          const [loadedCompiled, live, files] = await Promise.all([
+            loadCompiledSurfaceAsync(agentDir),
+            liveSurfaceSnapshot({
+              registry: state.registry,
+              extensionContext: context,
+              cwd: scopeCwd,
+            }),
+            projectScope
+              ? projectSessionFilesAsync(agentDir, scopeCwd)
+              : machineSessionFilesAsync(agentDir, scopeCwd),
+          ]);
+          const snapshot = loadedCompiled.file
+            ? applyCompiledSurface(live, loadedCompiled.file)
+            : live;
+          const freedom = surfaceFreedomReport(snapshot);
+          const surfaceDigest = entropySurfaceHash(snapshot);
+          const corpus = await measureSessionCorpusAsync({
+            files,
+            surface: snapshot,
+            catalogDigest: surfaceDigest,
+          });
+          const formatFreedom = (value: number): string =>
+            String(Math.round(value * 100) / 100);
+          const worst = freedom.actions
+            .slice(0, 4)
+            .map((action) => `${action.ref} ${formatFreedom(action.freedom)}`)
+            .join(" · ");
+          const latest = corpus.latest;
+          const sessionsLine =
+            corpus.sessions.length === 0 || latest === undefined
+              ? `session entropy (observed): no fabric_exec traces in the latest ${files.length} ${projectScope ? "project" : "machine"} sessions`
+              : `session entropy (observed): ${corpus.sessions.length} sessions · latest ${latest.totals.operations} ops · behavioral ${formatEntropyMetric(latest.behavioralScore)} + surface ${formatEntropyMetric(latest.staticScore)} = ${formatEntropyMetric(latest.behavioralScore + latest.staticScore)} · lower is better · slope ${formatEntropyMetric(corpus.trend.slopePerStep)}/session · ${
+                  latest.totals.invocationRejectionsPer1k === 0 && corpus.trend.slopePerStep <= 0
+                    ? "ratchet holding"
+                    : "ratchet slipping"
+                }`;
+          const modelsLine =
+            corpus.models.length > 1
+              ? `models: ${corpus.models
+                  .map(
+                    (model) =>
+                      `${model.model} behavioral ${formatEntropyMetric(model.latestBehavioralScore)} · slope ${formatEntropyMetric(model.slopePerSession)}`,
+                  )
+                  .join(" · ")}`
+              : undefined;
+          const compiledLine = loadedCompiled.error
+            ? `compiled: unavailable — ${loadedCompiled.error}`
+            : loadedCompiled.file
+              ? `compiled: v${loadedCompiled.file.metricVersion} · ${loadedCompiled.file.actions.length} tightened · ${loadedCompiled.file.quarantined.length} quarantined · ${loadedCompiled.file.applied.length} applied · gate ${loadedCompiled.file.gate.passed ? "pass" : "REJECTED"} (${formatEntropyMetric(loadedCompiled.file.gate.beforeScore)} → ${formatEntropyMetric(loadedCompiled.file.gate.afterScore)})`
+              : "compiled: none";
+          // Review listing: the signals the compiler declined to apply,
+          // derived read-only from the current window plus the pool (the
+          // merge is in memory; the listing never writes the pool).
+          let reviewLine: string;
+          try {
+            const [windowEvidence, poolLoaded] = await Promise.all([
+              sessionWindowEvidenceAsync(files),
+              loadObservationPoolAsync(agentDir),
+            ]);
+            if (poolLoaded.error) {
+              reviewLine = `review: unavailable — ${poolLoaded.error}`;
+            } else if (windowEvidence.traces.length === 0) {
+              reviewLine = "review: no window evidence";
+            } else {
+              const mergedPool = await mergeObservationWindowAsync(
+                poolLoaded.file,
+                windowEvidence.observationWindows,
+              );
+              const signals = entropyReviewSignals({
+                report: await measureEntropyAsync({
+                  traces: windowEvidence.traces,
+                  surface: snapshot,
+                  catalogDigest: surfaceDigest,
+                }),
+                traces: windowEvidence.traces,
+                surface: snapshot,
+                repairs: entropyRepairRows(state.repairs.repairs),
+                valueObservations: poolToValueObservations(mergedPool.file),
+              });
+              reviewLine =
+                signals.length === 0
+                  ? "review: none"
+                  : `review: ${signals.length} suggestion${signals.length === 1 ? "" : "s"} · ${signals
+                      .slice(0, 4)
+                      .map(formatEntropyReviewSignal)
+                      .join(" · ")}${signals.length > 4 ? ` · +${signals.length - 4} more` : ""}`;
+            }
+          } catch {
+            reviewLine = "review: unavailable";
+          }
+          context.ui.notify(
+            [
+              `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
+              `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · aliases ${status.repairCount} · alias hits ${status.applyHits}`,
+              compiledLine,
+              reviewLine,
+              `surface freedom (potential): mean ${formatFreedom(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
+              sessionsLine,
+              ...(modelsLine ? [modelsLine] : []),
+              ...formatEntropyCommandHints(),
+            ].join("\n"),
+            "info",
+          );
+        } catch (error) {
+          context.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
+        }
+        return;
+      }
       if (command !== "status") {
         context.ui.notify(
-          "Usage: /fabric [status|dashboard|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>]",
+          "Usage: /fabric [status|dashboard|prewalk [task]|prewalk --off|--disable|--enable|reload|providers|agents|actors|global|import <name> [as <new>]|export <id> [--overwrite]|messages <id>|clear-messages <id>|events <id> [event...]|log <id>|export-log <id>|attach <id>|stop <id>|remove <id>|kill <id>|repairs|entropy]",
           "warning",
         );
         return;

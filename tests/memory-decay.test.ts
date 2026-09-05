@@ -158,6 +158,19 @@ describe("memory sleep cycle", () => {
       null,
       null,
     ]);
+
+    const fileBounded = foldSessionDigest({
+      sessionId: "digest",
+      file,
+      cwd,
+      entries: normalized.entries,
+      filesTouchedLimit: 0,
+    });
+    expect(fileBounded.filesTouched).toEqual([]);
+    expect(fileBounded.indexCoverage).toMatchObject({
+      complete: false,
+      reasons: expect.arrayContaining(["max_files_touched"]),
+    });
   });
 
   it("returns a cold session pointer instead of entry matches", async () => {
@@ -176,16 +189,24 @@ describe("memory sleep cycle", () => {
       { scope: "project", query: "narwhal" },
       invocationContext(cwd),
     ) as {
-      segments: unknown[];
-      digestHits: { sessionId: string; tier: string }[];
-      text: string;
+      hits: Array<{
+        kind: string;
+        sessionId: string;
+        tier: string;
+        follow: { ref: string; args: Record<string, unknown> };
+      }>;
     };
 
-    expect(result.segments).toEqual([]);
-    expect(result.digestHits).toEqual([expect.objectContaining({ sessionId: "cold", tier: "cold" })]);
-    expect(result.text).toContain("session cold (cold,");
-    expect(result.text).toContain("expectedSourceHash");
-    expect(result.text).not.toContain("#0 [user]");
+    expect(result.hits).toEqual([expect.objectContaining({
+      kind: "session",
+      sessionId: "cold",
+      tier: "cold",
+      follow: expect.objectContaining({
+        ref: "memory.recall",
+        args: expect.objectContaining({ expectedSourceHash: expect.any(String) }),
+      }),
+    })]);
+    expect(result.hits[0]).not.toHaveProperty("snippet");
   });
 
   it("hydrates an explicitly scoped cold session at entry granularity without persisting a shard", async () => {
@@ -201,11 +222,23 @@ describe("memory sleep cycle", () => {
       "recall",
       { scope: "session:cold", query: "quasar" },
       invocationContext(cwd),
-    ) as { segments: { sessionId: string; tier: string }[]; digestHits: unknown[]; text: string };
+    ) as {
+      hits: Array<{
+        kind: string;
+        sessionId: string;
+        tier: string;
+        index: number;
+        follow: { ref: string };
+      }>;
+    };
 
-    expect(result.digestHits).toEqual([]);
-    expect(result.segments[0]).toEqual(expect.objectContaining({ sessionId: "cold", tier: "cold" }));
-    expect(result.text).toContain("#0 [user]");
+    expect(result.hits).toEqual(expect.arrayContaining([expect.objectContaining({
+      kind: "entry",
+      sessionId: "cold",
+      tier: "cold",
+      index: 0,
+      follow: expect.objectContaining({ ref: "memory.expand" }),
+    })]));
     expect(fs.existsSync(shardPathForSession(cold, indexDir))).toBe(false);
     expect(fs.existsSync(digestPathForSession(cold, indexDir))).toBe(true);
   });

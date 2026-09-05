@@ -54,6 +54,18 @@ const provider = (counter: Counter): FabricProvider => ({
   },
 });
 
+const taggedProvider = (tag: string, counter: Counter): FabricProvider => {
+  const base = provider(counter);
+  return {
+    ...base,
+    async invoke(name, args) {
+      const value = String((args as { value?: string }).value ?? "");
+      counter.invokeCalls.push(`${name}:${value}`);
+      return `${tag}:${value}`;
+    },
+  };
+};
+
 const context: FabricInvocationContext = {
   cwd: process.cwd(),
   signal: undefined,
@@ -81,7 +93,7 @@ const launchSpeculation = async (
   const replay: FabricSpeculationReplay = {};
   const spec = await registry.speculate(ref, args, { ...context, parentToolCallId: toolCallId }, replay);
   if (!spec) return false;
-  return store.launch(toolCallId, ref, spec.preparedArgs, spec.execute, undefined, replay);
+  return store.launch(toolCallId, ref, spec.preparedArgs, spec.execute, undefined, replay, spec.bindingToken);
 };
 
 describe("ActionRegistry speculation integration", () => {
@@ -153,6 +165,114 @@ describe("ActionRegistry speculation integration", () => {
     expect(result).toBe("ran:echo:hi");
     expect(counter.invokeCalls).toEqual(["echo:hi"]); // only the real retry
     expect(store.stats()).toMatchObject({ served: 0, failed: 1 });
+  });
+
+  it("invalidates unpinned speculation when a provider binding changes", async () => {
+    const oldCounter: Counter = { invokeCalls: [] };
+    const newCounter: Counter = { invokeCalls: [] };
+    const registry = new ActionRegistry();
+    registry.register(taggedProvider("old", oldCounter));
+    const store = new FabricSpeculationStore({ maxConcurrent: 4, maxEntries: 8, entryTtlMs: 60_000 });
+    registry.setSpeculation(store, () => true);
+    expect(await launchSpeculation(registry, store, "tc1", "spec.echo", { value: "hi" })).toBe(true);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+
+    registry.register(taggedProvider("new", newCounter), { overwrite: true });
+    expect(await registry.invoke("spec.echo", { value: "hi" }, fullContext("tc1", []))).toBe(
+      "new:hi",
+    );
+    expect(oldCounter.invokeCalls).toEqual(["echo:hi"]);
+    expect(newCounter.invokeCalls).toEqual(["echo:hi"]);
+    expect(store.stats()).toMatchObject({ served: 0, pending: 0 });
+    await registry.close();
+  });
+
+  it("cannot serve a speculation resolved against a replaced binding", async () => {
+    const oldCounter: Counter = { invokeCalls: [] };
+    const newCounter: Counter = { invokeCalls: [] };
+    const registry = new ActionRegistry();
+    let releaseDescribe: (() => void) | undefined;
+    const base = taggedProvider("old", oldCounter);
+    const slowOld: FabricProvider = {
+      ...base,
+      async describe(name, ctx) {
+        await new Promise<void>((resolvePromise) => {
+          releaseDescribe = resolvePromise;
+        });
+        return base.describe(name, ctx);
+      },
+    };
+    registry.register(slowOld);
+    const store = new FabricSpeculationStore({ maxConcurrent: 4, maxEntries: 8, entryTtlMs: 60_000 });
+    registry.setSpeculation(store, () => true);
+
+    const replay: FabricSpeculationReplay = {};
+    const speculationPromise = registry.speculate(
+      "spec.echo",
+      { value: "hi" },
+      fullContext("tc1", []),
+      replay,
+    );
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+    expect(releaseDescribe).toBeDefined();
+
+    // Replace the binding while speculate() is still awaiting describe().
+    // reset() cannot abort a launch that has not happened yet, so the stale
+    // entry is stored afterwards — keyed by the retired binding.
+    registry.register(taggedProvider("new", newCounter), { overwrite: true });
+    releaseDescribe!();
+    const speculation = await speculationPromise;
+    expect(speculation).toBeDefined();
+    expect(
+      store.launch(
+        "tc1",
+        "spec.echo",
+        speculation!.preparedArgs,
+        speculation!.execute,
+        undefined,
+        replay,
+        speculation!.bindingToken,
+      ),
+    ).toBe(true);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+
+    const result = await registry.invoke("spec.echo", { value: "hi" }, fullContext("tc1", []));
+    expect(result).toBe("new:hi");
+    // The stale launch may have executed as waste, but its result can never be
+    // served: the real call resolved the replacement binding and missed.
+    expect(newCounter.invokeCalls).toEqual(["echo:hi"]);
+    expect(store.stats()).toMatchObject({ served: 0 });
+    registry.endInvocation("tc1");
+    expect(store.stats().pending).toBe(0);
+    await registry.close();
+  });
+
+  it("speculates through the exact binding in a committed capability view", async () => {
+    const oldCounter: Counter = { invokeCalls: [] };
+    const newCounter: Counter = { invokeCalls: [] };
+    const registry = new ActionRegistry();
+    registry.register(taggedProvider("old", oldCounter));
+    registry.setSpeculation(
+      new FabricSpeculationStore({ maxConcurrent: 4, maxEntries: 8, entryTtlMs: 60_000 }),
+      () => true,
+    );
+    const pinned = await registry.acquireCapabilityView(["spec.echo"], context);
+    expect(pinned.satisfied).toBe(true);
+    registry.register(taggedProvider("new", newCounter), { overwrite: true });
+
+    const replay: FabricSpeculationReplay = {};
+    const speculation = await registry.speculate(
+      "spec.echo",
+      { value: "hi" },
+      { ...context, capabilityView: pinned.view! },
+      replay,
+    );
+    expect(speculation).toBeDefined();
+    await expect(speculation!.execute(undefined)).resolves.toBe("old:hi");
+    expect(oldCounter.invokeCalls).toEqual(["echo:hi"]);
+    expect(newCounter.invokeCalls).toEqual([]);
+    await pinned.release();
+    await registry.close();
   });
 
   it("refuses to speculate when the eligibility gate declines", async () => {

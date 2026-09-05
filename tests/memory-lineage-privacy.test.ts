@@ -98,17 +98,16 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: "session", query: "ABANDONED_SIBLING_DECOY_71" },
       invocation(cwd),
-    ) as { branches: string; matchedCount: number };
-    expect(active).toEqual(expect.objectContaining({ branches: "active", matchedCount: 0 }));
+    ) as { total: number };
+    expect(active.total).toBe(0);
 
     const all = await provider.invoke(
       "recall",
       { scope: "session", branches: "all", query: "ABANDONED_SIBLING_DECOY_71" },
       invocation(cwd),
-    ) as { branches: string; matchedCount: number; segments: Array<{ branches: string }> };
-    expect(all.matchedCount).toBe(1);
-    expect(all.branches).toBe("all");
-    expect(all.segments[0]!.branches).toBe("all");
+    ) as { total: number; hits: Array<{ follow: { args: { branches: string } } }> };
+    expect(all.total).toBe(1);
+    expect(all.hits[0]!.follow.args.branches).toBe("all");
   });
 
   it("uses the current live SessionManager branch getter after navigation without an append", async () => {
@@ -139,14 +138,14 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { query: "LIVE_NAVIGATED_FACT_93" },
       invocation(cwd),
-    ) as { matchedCount: number };
+    ) as { total: number };
     const decoy = await provider.invoke(
       "recall",
       { query: "LAST_APPEND_DECOY_94" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(navigated.matchedCount).toBe(1);
-    expect(decoy.matchedCount).toBe(0);
+    ) as { total: number };
+    expect(navigated.total).toBe(1);
+    expect(decoy.total).toBe(0);
   });
 
   it("keeps cold active and all vocabularies in separate non-contaminating caches", async () => {
@@ -169,20 +168,20 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: "project", query: "COLD_SIBLING_VOCAB_15" },
       invocation(cwd),
-    ) as { matchedCount: number };
+    ) as { total: number };
     const all = await provider.invoke(
       "recall",
       { scope: "project", branches: "all", query: "COLD_SIBLING_VOCAB_15" },
       invocation(cwd),
-    ) as { matchedCount: number };
+    ) as { total: number };
     const activeAgain = await provider.invoke(
       "recall",
       { scope: "project", query: "COLD_SIBLING_VOCAB_15" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(active.matchedCount).toBe(0);
-    expect(all.matchedCount).toBe(1);
-    expect(activeAgain.matchedCount).toBe(0);
+    ) as { total: number };
+    expect(active.total).toBe(0);
+    expect(all.total).toBe(1);
+    expect(activeAgain.total).toBe(0);
 
     const activeCache = JSON.parse(fs.readFileSync(digestPathForSession(file, indexDir), "utf8")) as {
       branches: string;
@@ -206,7 +205,7 @@ describe("memory active lineage and privacy policy", () => {
       sessionHeader("expand-tree", cwd),
       message("root", null, "root", 0),
       message("off-lineage", "root", "OFF_LINEAGE_EXPAND_21", 1),
-      message("active-leaf", "root", "ACTIVE_POINTER_FACT_22", 2),
+      message("active-leaf", "root", `ACTIVE_POINTER_FACT_22 ${"x".repeat(2_000)}`, 2),
     ]);
     let live = {
       entries: [{ id: "root" }, { id: "active-leaf" }],
@@ -226,42 +225,43 @@ describe("memory active lineage and privacy policy", () => {
       "expand",
       { session: file, entryIds: ["off-lineage"] },
       invocation(cwd),
-    ) as { error: { code: string }; expanded: unknown[] };
+    ) as { error: { code: string }; entries: unknown[] };
     expect(hidden.error.code).toBe("address_not_found");
-    expect(hidden.expanded).toEqual([]);
+    expect(hidden.entries).toEqual([]);
 
     const visible = await provider.invoke(
       "expand",
       { session: file, branches: "all", entryIds: ["off-lineage"] },
       invocation(cwd),
-    ) as { branches: string; expanded: Array<{ entryId: string }> };
+    ) as { branches: string; entries: Array<{ entryId: string }> };
     expect(visible.branches).toBe("all");
-    expect(visible.expanded[0]!.entryId).toBe("off-lineage");
+    expect(visible.entries[0]!.entryId).toBe("off-lineage");
 
     const recalled = await provider.invoke(
       "recall",
       { scope: "session", query: "ACTIVE_POINTER_FACT_22" },
       invocation(cwd),
     ) as {
-      segments: Array<{ sourceHash: string; lineageFingerprint: string }>;
+      hits: Array<{ follow: { args: { expectedSourceHash: string; expectedLineageFingerprint: string } } }>;
     };
-    const pointer = recalled.segments[0]!;
+    const pointer = recalled.hits[0]!.follow.args;
+    const firstPage = await provider.invoke(
+      "expand",
+      { ...pointer, entryIds: ["active-leaf"], maxChars: 256 },
+      invocation(cwd),
+    ) as { next: { args: Record<string, unknown> } | null };
+    expect(firstPage.next).not.toBeNull();
     live = {
       entries: [{ id: "root" }, { id: "off-lineage" }],
       leafId: "off-lineage",
     };
     const staleLineage = await provider.invoke(
       "expand",
-      {
-        session: file,
-        expectedSourceHash: pointer.sourceHash,
-        expectedLineageFingerprint: pointer.lineageFingerprint,
-        entryIds: ["active-leaf"],
-      },
+      firstPage.next!.args,
       invocation(cwd),
     ) as { error: { code: string; actualLineageFingerprint: string } };
     expect(staleLineage.error.code).toBe("stale_pointer");
-    expect(staleLineage.error.actualLineageFingerprint).not.toBe(pointer.lineageFingerprint);
+    expect(staleLineage.error.actualLineageFingerprint).not.toBe(pointer.expectedLineageFingerprint);
 
     fs.appendFileSync(file, `${JSON.stringify(message("new-source", "off-lineage", "new", 3))}\n`);
     const staleSource = await provider.invoke(
@@ -269,7 +269,7 @@ describe("memory active lineage and privacy policy", () => {
       {
         session: file,
         branches: "all",
-        expectedSourceHash: pointer.sourceHash,
+        expectedSourceHash: pointer.expectedSourceHash,
         indices: [0],
       },
       invocation(cwd),
@@ -318,20 +318,20 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: `session:${file}`, query: "ACTIVE_CARRIER_TYPED_FACT_31" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(recalled.matchedCount).toBe(1);
+    ) as { total: number };
+    expect(recalled.total).toBe(1);
     const compacted = await provider.invoke(
       "recall",
       { scope: `session:${file}`, query: "ACTIVE_COMPACTION_CARRIER_30" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(compacted.matchedCount).toBe(1);
+    ) as { total: number };
+    expect(compacted.total).toBe(1);
     const expanded = await provider.invoke(
       "expand",
       { session: file, entryIds: [fact.address] },
       invocation(cwd),
-    ) as { expanded: Array<{ branchFact: { address: string }; carrierEntryId: string }> };
-    expect(expanded.expanded[0]).toEqual(expect.objectContaining({
+    ) as { entries: Array<{ branchFact: { address: string }; carrierEntryId: string }> };
+    expect(expanded.entries[0]).toEqual(expect.objectContaining({
       carrierEntryId: "summary-carrier",
       branchFact: expect.objectContaining({ address: fact.address }),
     }));
@@ -370,8 +370,8 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: "project", query: "PRIVATE_THINKING_TOKEN_41" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(thinkingDefault.matchedCount).toBe(0);
+    ) as { total: number };
+    expect(thinkingDefault.total).toBe(0);
     const firstCache = JSON.parse(fs.readFileSync(shardPathForSession(file, indexDir), "utf8")) as {
       policy: string;
       entries: Array<{ text: string }>;
@@ -382,8 +382,8 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: "project", query: "PRIVATE_THINKING_TOKEN_41" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(thinkingOptIn.matchedCount).toBe(1);
+    ) as { total: number };
+    expect(thinkingOptIn.total).toBe(1);
     const thinkingCache = JSON.parse(fs.readFileSync(shardPathForSession(file, indexDir), "utf8")) as {
       policy: string;
     };
@@ -393,20 +393,20 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: "project", query: "TOOL_OUTPUT_BODY_42" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(outputDefault.matchedCount).toBe(1);
+    ) as { total: number };
+    expect(outputDefault.total).toBe(1);
     const outputOptOut = await provider({ indexToolOutput: false }).invoke(
       "recall",
       { scope: "project", query: "TOOL_OUTPUT_BODY_42" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(outputOptOut.matchedCount).toBe(0);
+    ) as { total: number };
+    expect(outputOptOut.total).toBe(0);
     const metadata = await provider({ indexToolOutput: false }).invoke(
       "recall",
       { scope: "project", query: "read privacy", tool: "read" },
       invocation(cwd),
-    ) as { matchedCount: number };
-    expect(metadata.matchedCount).toBeGreaterThan(0);
+    ) as { total: number };
+    expect(metadata.total).toBeGreaterThan(0);
     const optOutCache = JSON.parse(fs.readFileSync(shardPathForSession(file, indexDir), "utf8")) as {
       policy: string;
       entries: Array<{ text: string }>;
@@ -435,26 +435,26 @@ describe("memory active lineage and privacy policy", () => {
       "recall",
       { scope: "project", query: "SCOPE_COMMON_TOKEN_51" },
       invocation(cwd),
-    ) as { coverage: { eligibleSessions: number }; totalItems: number };
+    ) as { coverage: { eligibleSessions: number }; total: number };
     expect(project.coverage.eligibleSessions).toBe(1);
-    expect(project.totalItems).toBe(1);
+    expect(project.total).toBe(1);
 
     for (const branches of ["active", "all"] as const) {
       const pageOne = await provider.invoke(
         "recall",
-        { scope: "global", branches, query: "SCOPE_COMMON_TOKEN_51", page: 1, pageSize: 1 },
+        { scope: "global", branches, query: "SCOPE_COMMON_TOKEN_51", pageSize: 1 },
         invocation(cwd),
-      ) as { coverage: { eligibleSessions: number }; totalItems: number; hasNext: boolean; items: unknown[] };
+      ) as { coverage: { eligibleSessions: number }; total: number; next: { args: Record<string, unknown> } | null; hits: unknown[] };
       const pageTwo = await provider.invoke(
         "recall",
-        { scope: "global", branches, query: "SCOPE_COMMON_TOKEN_51", page: 2, pageSize: 1 },
+        pageOne.next!.args,
         invocation(cwd),
-      ) as { totalItems: number; hasNext: boolean; items: unknown[] };
+      ) as { total: number; next: null; hits: unknown[] };
       expect(pageOne.coverage.eligibleSessions).toBe(2);
-      expect(pageOne).toEqual(expect.objectContaining({ totalItems: 2, hasNext: true }));
-      expect(pageTwo).toEqual(expect.objectContaining({ totalItems: 2, hasNext: false }));
-      expect(pageOne.items).toHaveLength(1);
-      expect(pageTwo.items).toHaveLength(1);
+      expect(pageOne).toEqual(expect.objectContaining({ total: 2, next: expect.any(Object) }));
+      expect(pageTwo).toEqual(expect.objectContaining({ total: 2, next: null }));
+      expect(pageOne.hits).toHaveLength(1);
+      expect(pageTwo.hits).toHaveLength(1);
     }
 
     expect(new Set([first, second]).size).toBe(2);

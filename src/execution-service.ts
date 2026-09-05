@@ -10,6 +10,7 @@ import {
 } from "./audit/trace.js";
 import { FabricActivityStore } from "./activity/store.js";
 import type { CapturedToolCatalog } from "./capture/catalog.js";
+import { isPiShellRef } from "./core/pi-tools.js";
 import type {
   FabricActivityEventInput,
   FabricActivityItemInput,
@@ -402,7 +403,7 @@ export class FabricExecutionService {
         !Array.isArray(args.args)
           ? (args.args as Record<string, unknown>)
           : args;
-      if (targetRef === "pi.bash") {
+      if (isPiShellRef(targetRef)) {
         const seconds = targetArgs.timeout;
         const milliseconds = targetArgs.timeoutMs;
         const requested =

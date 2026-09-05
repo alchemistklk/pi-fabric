@@ -60,7 +60,7 @@ V1 keeps `type: "call"` for wire compatibility. Exact internal refs separate dis
 - `pi.grep`: local `path`, numeric `context`, numeric `limit`. Drops pattern and query
 - `pi.find`, `pi.ls`: local `path`, numeric `limit`. Drops pattern and query
 - `pi.edit`, `pi.write`: local `path` only. Drops edit replacements and write content. `pi.write` can keep `{ created: true }`
-- `pi.bash`: bounded command text
+- `pi.bash`, `pi.powershell`: bounded command text
 - selected `agents.*` lifecycle calls: `id` only. Drops task, message, instructions, names, model options, and outputs
 - `mesh.publish`/`read`: topic/address and numeric cursor/limit. Drops payload text and data
 - `mesh.get`/`put`/`delete`/`list`: key or prefix and limit. Drops values

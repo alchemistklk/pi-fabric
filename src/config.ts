@@ -113,7 +113,7 @@ interface FabricPrewalkConfig {
   // model after an in-place continuation settles.
   compactOnReturn: boolean;
   // Filesystem fallback trigger: when an armed boundary ran a successful
-  // pi.bash without an audited mutation, claim on stat-manifest drift so
+  // pi.bash or pi.powershell without an audited mutation, claim on stat-manifest drift so
   // shell heredocs / sed -i / formatter writes also hand off.
   detectShellWrites: boolean;
   // Reasoning effort for the trajectory executor; unset inherits agents.thinking.
@@ -223,6 +223,14 @@ export interface FabricMeshConfig {
   actorContextEntries: number;
 }
 
+interface FabricRepairsConfig {
+  enabled: boolean;
+}
+
+interface FabricEntropyConfig {
+  compile: boolean;
+}
+
 export interface FabricMemoryConfig {
   enabled: boolean;
   indexDir?: string;
@@ -284,6 +292,8 @@ export interface FabricConfig {
   retention: FabricRetentionConfig;
   mesh: FabricMeshConfig;
   memory: FabricMemoryConfig;
+  entropy: FabricEntropyConfig;
+  repairs: FabricRepairsConfig;
   schema: FabricSchemaConfig;
   speculation: FabricSpeculationConfig;
   codePreview: CodePreviewSettings;
@@ -435,6 +445,12 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     regexMaxHaystackTerms: 20_000,
     regexMaxHaystackBytes: 2 * 1024 * 1024,
     regexTimeoutMs: 250,
+  },
+  entropy: {
+    compile: true,
+  },
+  repairs: {
+    enabled: true,
   },
   schema: {
     mode: "off",
@@ -624,6 +640,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const retention = objectValue(input.retention);
   const mesh = objectValue(input.mesh);
   const memory = objectValue(input.memory);
+  const entropy = objectValue(input.entropy);
+  const repairs = objectValue(input.repairs);
   const modelsSection = objectValue(input.models);
   const schema = objectValue(input.schema);
   const schemaMode = schemaModeValue(schema.mode, DEFAULT_FABRIC_CONFIG.schema.mode);
@@ -1106,6 +1124,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         10_000,
       ),
     },
+    entropy: {
+      compile: booleanValue(entropy.compile, DEFAULT_FABRIC_CONFIG.entropy.compile),
+    },
+    repairs: {
+      enabled: booleanValue(repairs.enabled, DEFAULT_FABRIC_CONFIG.repairs.enabled),
+    },
     schema: {
       mode: schemaMode,
       certificateTtlMs: boundedInteger(
@@ -1221,7 +1245,7 @@ const planConfigFile = (filePath: string): FabricConfigFilePlan | undefined => {
 const writeJsonAtomic = (
   filePath: string,
   document: Record<string, unknown>,
-  expectedSource?: string,
+  expectedSource: string | null,
 ): void => {
   const resolvedPath = fs.existsSync(filePath) ? fs.realpathSync(filePath) : filePath;
   const directory = path.dirname(resolvedPath);
@@ -1238,7 +1262,11 @@ const writeJsonAtomic = (
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
-    if (expectedSource !== undefined) {
+    if (expectedSource === null) {
+      if (fs.existsSync(resolvedPath)) {
+        throw new Error(`Fabric configuration changed while updating ${filePath}`);
+      }
+    } else {
       let currentSource: string;
       try {
         currentSource = fs.readFileSync(resolvedPath, "utf8");
@@ -1274,6 +1302,7 @@ const resolveFabricConfig = (
     agentDir: string;
   },
   includeProject: boolean,
+  applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
   const plans = [
@@ -1287,7 +1316,10 @@ const resolveFabricConfig = (
     merged = mergeObjects(merged, plan.document);
   }
   const inheritedFullCodeMode = process.env.PI_FABRIC_FULL_CODE_MODE;
-  if (inheritedFullCodeMode === "true" || inheritedFullCodeMode === "false") {
+  if (
+    applyEnvironmentOverrides &&
+    (inheritedFullCodeMode === "true" || inheritedFullCodeMode === "false")
+  ) {
     merged.fullCodeMode = inheritedFullCodeMode === "true";
   }
   return normalizeFabricConfig(merged);
@@ -1304,7 +1336,7 @@ export const loadFabricConfigForScope = (
   if (scope === "project" && !options.projectTrusted) {
     throw new Error("Cannot load project Fabric configuration for an untrusted project");
   }
-  return resolveFabricConfig(options, scope === "project");
+  return resolveFabricConfig(options, scope === "project", false);
 };
 
 export const loadFabricConfig = (options: {
@@ -1312,7 +1344,7 @@ export const loadFabricConfig = (options: {
   agentDir: string;
   projectTrusted: boolean;
 }): FabricConfig => {
-  const config = resolveFabricConfig(options, options.projectTrusted);
+  const config = resolveFabricConfig(options, options.projectTrusted, true);
   if (config.compaction.engine === "fabric") {
     process.env.PI_FABRIC_COMPACTION_ENGINE = "fabric";
   } else {
@@ -1348,6 +1380,6 @@ export const saveFabricConfig = (
     typeof merged.configVersion === "number" ? merged.configVersion : 0,
     CURRENT_FABRIC_CONFIG_VERSION,
   );
-  writeJsonAtomic(targetPath, merged, input?.source);
+  writeJsonAtomic(targetPath, merged, input?.source ?? null);
   return { scope, path: targetPath };
 };

@@ -6,10 +6,13 @@ import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { getActiveRepairCompiler } from "../src/repairs/active.js";
+import { catalogDigestFromSurface } from "../src/repairs/catalog-digest.js";
 import {
   FABRIC_COMPONENT_DISCOVER_EVENT,
   FABRIC_PROVIDER_DISCOVER_EVENT,
   type FabricComponentDiscovery,
+  type FabricProviderDiscovery,
 } from "../src/protocol.js";
 
 describe("Fabric runtime provider components", () => {
@@ -46,6 +49,13 @@ describe("Fabric runtime provider components", () => {
                 .filter((component) => component.state === "active")
                 .map((component) => component.id)
                 .sort(),
+            });
+            (payload as FabricProviderDiscovery).register({
+              name: "external",
+              description: "External provider",
+              async list() { return []; },
+              async describe() { return undefined; },
+              async invoke() { return undefined; },
             });
           }
         }),
@@ -99,6 +109,12 @@ describe("Fabric runtime provider components", () => {
     try {
       await runtime.initialize(context, config);
 
+      expect(getActiveRepairCompiler()).toBe(runtime.repairs);
+      expect(runtime.repairs.catalogDigest).toBe(catalogDigestFromSurface({
+        providers: runtime.registry.providers().map((provider) => provider.name),
+        capturedTools: [],
+      }));
+      expect(runtime.registry.providers().map((provider) => provider.name)).toContain("external");
       expect(discoverySnapshots).toEqual([{
         initialized: true,
         active: [
@@ -165,6 +181,105 @@ describe("Fabric runtime provider components", () => {
       );
     } finally {
       await runtime.shutdown();
+      expect(getActiveRepairCompiler()).toBeUndefined();
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("freezes repair surfaces across capture suspension and reload", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runtime-repairs-"));
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
+
+    const pi = {
+      events: { emit: vi.fn() },
+      getThinkingLevel: vi.fn(() => "off"),
+      sendMessage: vi.fn(),
+    } as unknown as ExtensionAPI;
+    const context = {
+      cwd,
+      hasUI: false,
+      isProjectTrusted: () => true,
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      modelRegistry: { find: vi.fn(), getApiKeyAndHeaders: vi.fn() },
+      sessionManager: {
+        getSessionId: () => "runtime-repairs-session",
+        getSessionFile: () => undefined,
+        getBranch: () => [],
+        getLeafId: () => undefined,
+      },
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+    const capturedTools = new CapturedToolCatalog();
+    const config = normalizeFabricConfig({
+      fullCodeMode: true,
+      capture: { enabled: true },
+      mcp: { enabled: false, cache: { enabled: false } },
+      mesh: { enabled: true },
+      memory: { enabled: true },
+      agents: { enabled: false },
+      residency: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const fixture = path.join(cwd, "unused.mjs");
+    fs.writeFileSync(fixture, "export default {};");
+    const runtime = new FabricRuntimeState(pi, capturedTools, {
+      paths: {
+        extension: fixture,
+        worker: fixture,
+        residentHost: fixture,
+        skills: cwd,
+      },
+    });
+    const tableFile = (): string =>
+      path.join(cwd, "agent", "fabric", "repairs", "current.json");
+
+    try {
+      await runtime.initialize(context, config);
+      const before = runtime.repairs;
+      const digest = before.catalogDigest;
+      expect(getActiveRepairCompiler()).toBe(before);
+
+      // Suspension clears the catalog transiently (the interceptor setPolicy
+      // path): the repair surface must not flip to the empty-catalog digest
+      // that promotion could then persist over the stable table.
+      capturedTools.markSuspended();
+      capturedTools.clear();
+      expect(getActiveRepairCompiler()).toBe(before);
+      expect(before.catalogDigest).toBe(digest);
+
+      // Reload while suspended: the replacement compiler activates with an
+      // uncommitted surface and must refuse to persist anything.
+      await runtime.initialize(context, config);
+      const reloaded = runtime.repairs;
+      expect(reloaded).not.toBe(before);
+      expect(getActiveRepairCompiler()).toBe(reloaded);
+      expect(reloaded.catalogDigest).toBe("");
+      expect(
+        reloaded.observeInvalidArgs("memory.recall", { sessionId: "s1" }, ["session"], "extra"),
+      ).toBeUndefined();
+      expect(fs.existsSync(tableFile())).toBe(false);
+
+      // Re-arm: the stable surface re-commits and promotion resumes.
+      capturedTools.markResumed();
+      capturedTools.clear();
+      expect(reloaded.catalogDigest).toBe(digest);
+      expect(
+        reloaded.observeInvalidArgs("memory.recall", { sessionId: "s1" }, ["session"], "extra"),
+      ).toEqual({
+        kind: "keyAlias",
+        ref: "memory.recall",
+        from: "sessionId",
+        to: "session",
+      });
+      await reloaded.flush();
+      expect(fs.existsSync(tableFile())).toBe(true);
+    } finally {
+      await runtime.shutdown();
+      expect(getActiveRepairCompiler()).toBeUndefined();
       vi.unstubAllEnvs();
       fs.rmSync(cwd, { recursive: true, force: true });
     }

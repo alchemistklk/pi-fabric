@@ -532,37 +532,22 @@ const createMemoryCertification = async ({ agentDir, cwd, sessionDir, contextRes
     { scope: "global", query: "cold_exact_quasar_7f91", queryMode: "literal", pageSize: 20 },
     invocationContext(cwd),
   );
-  const rareHit = recalled.digestHits.find(
-    (hit) => hit.sessionId === SessionManager.open(rareSessionFile).getSessionId(),
+  const rareHit = recalled.hits.find(
+    (hit) => hit.kind === "session"
+      && hit.sessionId === SessionManager.open(rareSessionFile).getSessionId(),
   );
   const rareHydration = rareHit
-    ? await provider.invoke(
-      "recall",
-      {
-        scope: `session:${rareHit.sessionFile}`,
-        expectedSourceHash: rareHit.sourceHash,
-        query: "cold_exact_quasar_7f91",
-        queryMode: "literal",
-        pageSize: 20,
-      },
-      invocationContext(cwd),
-    )
-    : { segments: [], error: { code: "missing_cold_pointer" } };
-  const hydratedEntryIds = rareHydration.segments.flatMap((segment) =>
-    segment.entries
-      .filter((item) => item.matched && item.entry.entryId)
-      .map((item) => item.entry.entryId));
-  const rareExpansion = rareHit
-    ? await provider.invoke(
-      "expand",
-      {
-        session: rareHit.sessionFile,
-        expectedSourceHash: rareHit.sourceHash,
-        entryIds: hydratedEntryIds,
-      },
-      invocationContext(cwd),
-    )
-    : { expanded: [], error: { code: "missing_cold_pointer" } };
+    ? await provider.invoke("recall", rareHit.follow.args, invocationContext(cwd))
+    : { hits: [], error: { code: "missing_cold_pointer" } };
+  const hydratedEntryIds = rareHydration.hits
+    .filter((hit) => hit.kind === "entry" && hit.entryId)
+    .map((hit) => hit.entryId);
+  const rareEntryHit = rareHydration.hits.find(
+    (hit) => hit.kind === "entry" && hit.entryId === rareEntryId,
+  );
+  const rareExpansion = rareEntryHit
+    ? await provider.invoke("expand", rareEntryHit.follow.args, invocationContext(cwd))
+    : { entries: [], error: { code: "missing_cold_pointer" } };
 
   const structuralRecall = await provider.invoke(
     "recall",
@@ -574,25 +559,14 @@ const createMemoryCertification = async ({ agentDir, cwd, sessionDir, contextRes
     },
     invocationContext(cwd),
   );
-  const structuralHit = structuralRecall.digestHits.find(
-    (hit) => hit.sessionId === SessionManager.open(rareSessionFile).getSessionId(),
+  const structuralHit = structuralRecall.hits.find(
+    (hit) => hit.kind === "session"
+      && hit.sessionId === SessionManager.open(rareSessionFile).getSessionId(),
   );
   const structuralHydration = structuralHit
-    ? await provider.invoke(
-      "recall",
-      {
-        scope: `session:${structuralHit.sessionFile}`,
-        expectedSourceHash: structuralHit.sourceHash,
-        expectedLineageFingerprint: structuralHit.lineageFingerprint,
-        ref: "pi.grep",
-        outcome: "succeeded",
-        pageSize: 20,
-      },
-      invocationContext(cwd),
-    )
-    : { segments: [], error: { code: "missing_structural_pointer" } };
-  const structuralEntries = structuralHydration.segments.flatMap((segment) =>
-    segment.entries.filter((item) => item.matched).map((item) => item.entry));
+    ? await provider.invoke("recall", structuralHit.follow.args, invocationContext(cwd))
+    : { hits: [], error: { code: "missing_structural_pointer" } };
+  const structuralEntries = structuralHydration.hits.filter((hit) => hit.kind === "entry");
   const structuralNegative = await provider.invoke(
     "recall",
     { scope: "global", ref: "pi.nonexistent", pageSize: 20 },
@@ -619,7 +593,7 @@ const createMemoryCertification = async ({ agentDir, cwd, sessionDir, contextRes
     },
     invocationContext(cwd),
   );
-  const expandedById = new Map(expandedAddresses.expanded.map((entry) => [entry.entryId, entry.text]));
+  const expandedById = new Map(expandedAddresses.entries.map((entry) => [entry.entryId, entry.text]));
   const expandedCorrectly = emittedIds.filter((id) => expandedById.get(id) === sourceById.get(id)).length;
   const rareTier = rareHit?.tier ?? "missing";
   const sourceRoot = path.join(agentDir, "sessions");
@@ -634,22 +608,19 @@ const createMemoryCertification = async ({ agentDir, cwd, sessionDir, contextRes
       && rareHydration.error === undefined
       && hydratedEntryIds.includes(rareEntryId)
       && rareExpansion.error === undefined
-      && rareExpansion.expanded.some(
+      && rareExpansion.entries.some(
         (entry) => entry.entryId === rareEntryId && entry.text === coldRareFact,
       ),
-    structuralRecallExact: structuralRecall.matchMode === "structural"
-      && structuralRecall.coverage.complete === true
+    structuralRecallExact: structuralRecall.coverage.complete === true
       && structuralHit?.matchedStructuralEntries === 1
-      && structuralHydration.matchMode === "structural"
       && structuralHydration.error === undefined
       && structuralEntries.length === 1
       && structuralEntries[0].ref === "pi.grep"
       && structuralEntries[0].provider === "pi"
       && structuralEntries[0].action === "grep"
       && structuralEntries[0].outcome === "succeeded",
-    structuralNegativeControl: structuralNegative.matchMode === "structural"
-      && structuralNegative.coverage.complete === true
-      && structuralNegative.matchedCount === 0,
+    structuralNegativeControl: structuralNegative.coverage.complete === true
+      && structuralNegative.total === 0,
     emittedAddresses: emittedIds.length,
     expandedAddresses: expandedCorrectly,
     addressExpansionRate: emittedIds.length === 0 ? 0 : expandedCorrectly / emittedIds.length,

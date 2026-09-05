@@ -44,7 +44,9 @@ export interface FabricSpeculationRuntime {
     parentToolCallId: string,
     ref: string,
     preparedArgs: Record<string, unknown>,
+    bindingToken: string,
   ): Promise<FabricSpeculationServeResult>;
   bumpEpoch(): void;
+  reset?(): void;
   onInvocationEnd?(parentToolCallId: string): void;
 }

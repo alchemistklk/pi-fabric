@@ -114,15 +114,17 @@ In the guest, `agents.handoff()` resolves to `{ scheduled: true, status: "deferr
 /fabric prewalk Implement the token guard and run its tests
 /fabric prewalk --status
 /fabric prewalk --off
+/fabric prewalk --disable
+/fabric prewalk --enable
 ```
 
-When you supply a task, Fabric arms prewalk and immediately submits the task to Main. Without a task, it captures the next user input. Select the executor in `/fabric settings` under **Prewalk**. **Always re-arm** uses `prewalk.model` to arm prewalk automatically at each session start without interaction. It also arms prewalk after each completed handoff. `/fabric prewalk --off` cancels it until the next session starts.
+When you supply a task, Fabric arms prewalk and immediately submits the task to Main. Without a task, it captures the next user input. Select the executor in `/fabric settings` under **Prewalk**. **Always re-arm** uses `prewalk.model` to arm prewalk automatically at each session start without interaction. It also arms prewalk after each completed handoff. `/fabric prewalk --off` cancels only the current session arm. `/fabric prewalk --disable` persists the master switch to the project config when trusted (global config otherwise), cancels any live arm, and keeps prewalk inert after restart; `--enable` reverses it.
 
 Host extensions that must serialize work after prewalk can use the acknowledged protocol exported from `pi-fabric/protocol`. Emit `FABRIC_PREWALK_REQUEST_EVENT` with `{ version: 1, context, claim, respond }`. Fabric calls `claim()` synchronously; the first claimant owns the request. It calls `respond({ ok: true })` only after prewalk is armed, or `respond({ ok: false, error })` after cancellation or failure. A request that is not claimed means no compatible Fabric runtime is installed. The protocol intentionally arms without submitting a task, so the caller can deliver its next queued row only after the acknowledgment.
 
 The default value of `prewalk.mode` is `"in-place"`:
 
-1. Fabric detects a successful `pi.edit`, `pi.write`, or `schema.commit`, then lets the full outer program settle. A successful `pi.bash` can also trigger detection when no audited mutation occurred. In that case, a stat-baseline diff of the work tree identifies shell writes such as heredocs, `sed -i`, and formatter binaries as a filesystem trigger (`fs.drift`). Set `prewalk.detectShellWrites` to `false` to disable this behavior.
+1. Fabric detects a successful `pi.edit`, `pi.write`, or `schema.commit`, then lets the full outer program settle. A successful `pi.bash` or `pi.powershell` can also trigger detection when no audited mutation occurred. In that case, a stat-baseline diff of the work tree identifies shell writes such as heredocs, `sed -i`, and formatter binaries as a filesystem trigger (`fs.drift`). Set `prewalk.detectShellWrites` to `false` to disable this behavior.
 2. At the finalized outer result boundary, Fabric selects `prewalk.model` on Main.
 3. Fabric queues a hidden follow-up. It tells Main to continue the current task, complete the remaining implementation, check related call sites, and run verification.
 4. The terminating outer tool prevents an automatic turn on the old model. Pi drains the queued follow-up and continues the same Main session on the executor model.
@@ -136,7 +138,7 @@ Set `prewalk.mode` to `"trajectory"` to use child-based behavior. Fabric forks t
 
 Prewalk does not add system-prompt instructions. It queues its hidden continuation only after a matching mutation boundary. The continuation is not an open-ended prompt on each turn. A turn that settles without a handoff leaves prewalk armed. A matching mutation consumes the arm through an in-place switch or trajectory spawn. A completed explicit `agents.handoff()` also consumes it, as does `/fabric prewalk --off`. Fabric drops the settled turn's captured task text so that it captures the next prompt as new input. Both modes require full code mode. Schema enforce mode does not support them.
 
-The filesystem fallback compares each file's size and mtime with a baseline captured when prewalk was armed. Fabric refreshes the baseline after every considered boundary and settle. In Git work trees, it lists files through the index, so ignored build output does not register. In trees without Git, it walks the files and skips only `.git` and `node_modules`. Artifact writes then count as drift. The diff cannot identify who made a change. An external editor save during a bash-running window also counts. The fallback scans only programs that ran `pi.bash`, so read-only turns have no scan cost and cannot trigger it. Stat drift can occur without a content change, for example from rare `touch` churn. This drift triggers prewalk. The report lists affected files in `trigger.files`.
+The filesystem fallback compares each file's size and mtime with a baseline captured when prewalk was armed. Fabric refreshes the baseline after every considered boundary and settle. In Git work trees, it lists files through the index, so ignored build output does not register. In trees without Git, it walks the files and skips only `.git` and `node_modules`. Artifact writes then count as drift. The diff cannot identify who made a change. An external editor save during a shell-running window also counts. The fallback scans only programs that ran `pi.bash`, so read-only turns have no scan cost and cannot trigger it. Stat drift can occur without a content change, for example from rare `touch` churn. This drift triggers prewalk. The report lists affected files in `trigger.files`.
 
 ### Claude Code runner
 
@@ -203,7 +205,7 @@ await agents.switchModel({ model: "cheap" });
 
 The selector resolves in order: a `models.aliases` entry (a string alias is one target; an array is a fallback chain where the first authenticated target wins), an exact `provider/id`, an exact model id, then the closest match across provider, id, and display name. Closeness ties fall to the most recently used model, read from the [pi-model-sort](https://github.com/monotykamary/pi-model-sort) extension's usage store when it is installed, and then to the highest-sorting key, mirroring pi's newest-alias convention. An optional `provider` argument narrows every stage. Selectors with no resemblance to an authenticated entry and exhausted alias chains throw; the session model stays unchanged. `agents.models()` enumerates the authenticated registry entries this resolution runs against. The result reports the active model, the previous one, and how the selector resolved: `via` is the alias name for configured aliases, or `closest`, `recent`, or `latest` for fuzzy picks. A call naming the active model returns `{ switched: false, reason: "already-active" }`. The switch applies to the next model turn and later, unlike `prewalk`, which temporarily installs an executor model at a mutation boundary and then restores the boundary model.
 
-Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff` resolve through the same selector logic (aliases, closest match, recency) before the child starts. A selector matching nothing in the authenticated registry passes through unchanged, so freshly released or custom ids still reach the child Pi runtime, which reports its own resolution error when it cannot place them.
+Pi-runner `model` arguments on `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff`, plus actor defaults and activation overrides, resolve through the same selector logic (aliases, closest match, recency). The execution owner's `agents.models({ runner: "pi" })` result is authoritative: unresolved exact IDs, fuzzy selectors with no match, and exhausted aliases fail with a session-availability error. Fabric revalidates the canonical model at the worker launch boundary, including remote and durable actor execution, so stale bindings cannot start a model that is no longer visible. Catalog-fresh or custom IDs must appear in the owner's visible registry before a Pi participant can use them. Claude and Veda model values keep their runner-specific behavior.
 
 This is the host-level equivalent of the `pi-model-switch` extension's `switch_model` tool, with aliases moved into Fabric configuration so project and agent scopes behave like every other Fabric section.
 
@@ -236,14 +238,12 @@ Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-
 
 Fabric uses one participant directory for each project. Every live entity has a fixed `kind` of `root`, `agent`, or `actor`. It also has a `rootId`, an optional `parentId`, an `ownerHostId`, and an authenticated owner identity for the process that controls its lifecycle. **Main** is the local user-facing view of one root. **Peers** provide compatibility views of the other roots. These views do not use separate registries or control planes. **Fabric reserves Peer for another root Pi session. The term never means a child agent.** When asked about a peer, call `agents.peers()` first. `agents.list()` reports only child agents, so it cannot determine whether a peer root has settled.
 
-`agents.self()` returns the participant record for the caller. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` provide convenient root projections. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
+`agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
 
 ```ts
 const main = await agents.main();
-const project = await agents.members({ scope: "project" });
-const peerRoot = project.find(
-  (participant) => participant.kind === "root" && participant.id !== main.id,
-);
+const sessions = await agents.sessions();
+const peerRoot = sessions.find((participant) => participant.id !== main.id);
 if (peerRoot) {
   await agents.steer({ id: peerRoot.id, message: "Coordinate on the shared migration." });
 }
@@ -331,7 +331,7 @@ Claude actors can keep context and use mapped Claude Code tools to inspect or ed
 
 ### Shared actors and session bindings
 
-`mesh.actorScope: "project"` stores one actor definition for the project. Fabric keeps three pieces of state:
+A project-scoped actor stores one definition for the project. Select storage per actor with `agents.create({ scope: "project" | "session", ... })`; omitted scope uses `mesh.actorScope` as a compatibility default. Fabric keeps three pieces of state:
 
 - **Project definition.** The shared registry stores the actor ID, instructions, runner, subscriptions, tools, and project model and thinking defaults.
 - **Session binding.** A mode-`0600` file stores only `model` and `thinking` for one Pi session ID. It survives a resume of that session and does not rewrite `actors.json`.
@@ -372,7 +372,7 @@ Fabric stores the resolved binding on each mailbox item before it queues. Later 
 
 The mailbox, history, and runner session remain shared. Host events and mesh subscriptions run once on the owner and use the owner's session binding. Opening another Pi session does not start another copy of the actor.
 
-Use `mesh.actorScope: "session"` when each Pi session needs its own definitions, mailbox, history, and runtime. Under project scope, every trusted session can read shared actor definitions, mailbox history, and logs. Do not store secrets in them.
+Use `scope: "session"` when one root Pi session needs its own definition, mailbox, history, and runtime; use `scope: "project"` for repository-wide guardians. Both run concurrently. Session identity propagates to recursive participant agents in the same lineage. Under project scope, every trusted session can read shared actor definitions, mailbox history, and logs. Do not store secrets in them.
 
 Use `requires` to declare exact `provider.action` capabilities for every activation. An entry can use `{ ref, optional: true }`. Before launch, the host resolves and keeps one view identified by its descriptor hash. Pi children separately resolve the portable semantic digest. They run with a closed-world Fabric surface, so a live provider addition cannot expand the actor during a run. When required refs are missing, mailbox work stays queued. `missingCapabilities` reports which capabilities are available, separately from `idle | queued | running | stopped`. Changes to providers or catalogs retry dispatch. Actor status and run metadata include the normalized requirements and last committed digest. Claude actors receive the host availability commitment. They have no child Fabric surface to limit. If the private Claude session was removed, the next activation reports a clear failure and preserves actor context. Recreate the actor when you need a new Claude session.
 

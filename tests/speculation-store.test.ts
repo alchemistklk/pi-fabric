@@ -19,29 +19,29 @@ describe("FabricSpeculationStore", () => {
     const store = makeStore();
     const call = deferred<string>();
     const executor = vi.fn(() => call.promise);
-    expect(store.launch("tc1", "pi.read", { path: "a.ts" }, executor, undefined, {})).toBe(true);
+    expect(store.launch("tc1", "pi.read", { path: "a.ts" }, executor, undefined, {}, "b1")).toBe(true);
     call.resolve("contents");
-    const served = await store.tryServe("tc1", "pi.read", { path: "a.ts" });
+    const served = await store.tryServe("tc1", "pi.read", { path: "a.ts" }, "b1");
     expect(served).toEqual({ hit: true, value: "contents", replay: {} });
     // Take-once: the identical second call must miss.
-    expect((await store.tryServe("tc1", "pi.read", { path: "a.ts" })).hit).toBe(false);
+    expect((await store.tryServe("tc1", "pi.read", { path: "a.ts" }, "b1")).hit).toBe(false);
     expect(store.stats()).toMatchObject({ launched: 1, served: 1 });
   });
 
   it("awaits an in-flight speculation", async () => {
     const store = makeStore();
     const call = deferred<string>();
-    store.launch("tc1", "pi.read", { path: "a.ts" }, () => call.promise, undefined, {});
-    const serving = store.tryServe("tc1", "pi.read", { path: "a.ts" });
+    store.launch("tc1", "pi.read", { path: "a.ts" }, () => call.promise, undefined, {}, "b1");
+    const serving = store.tryServe("tc1", "pi.read", { path: "a.ts" }, "b1");
     call.resolve("late");
     expect(await serving).toEqual({ hit: true, value: "late", replay: {} });
   });
 
   it("misses when the mutation epoch advanced after launch", async () => {
     const store = makeStore();
-    store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {});
+    store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {}, "b1");
     store.bumpEpoch();
-    const served = await store.tryServe("tc1", "pi.read", { path: "a.ts" });
+    const served = await store.tryServe("tc1", "pi.read", { path: "a.ts" }, "b1");
     expect(served).toEqual({ hit: false, reason: "epoch" });
     expect(store.stats().epochInvalidated).toBe(1);
   });
@@ -56,9 +56,10 @@ describe("FabricSpeculationStore", () => {
       () => Promise.resolve("x"),
       () => fresh,
       {},
+      "b1",
     );
     fresh = false;
-    expect(await store.tryServe("tc1", "pi.read", { path: "a.ts" })).toEqual({
+    expect(await store.tryServe("tc1", "pi.read", { path: "a.ts" }, "b1")).toEqual({
       hit: false,
       reason: "freshness",
     });
@@ -73,10 +74,11 @@ describe("FabricSpeculationStore", () => {
       () => Promise.reject(new Error("ENOENT")),
       undefined,
       {},
+      "b1",
     );
     // Let the entry's internal catch run.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(await store.tryServe("tc1", "pi.read", { path: "gone.ts" })).toEqual({
+    expect(await store.tryServe("tc1", "pi.read", { path: "gone.ts" }, "b1")).toEqual({
       hit: false,
       reason: "failed",
     });
@@ -84,8 +86,8 @@ describe("FabricSpeculationStore", () => {
 
   it("scopes entries to the streaming tool call that produced them", async () => {
     const store = makeStore();
-    store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {});
-    expect(await store.tryServe("tc2", "pi.read", { path: "a.ts" })).toEqual({
+    store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {}, "b1");
+    expect(await store.tryServe("tc2", "pi.read", { path: "a.ts" }, "b1")).toEqual({
       hit: false,
       reason: "absent",
     });
@@ -104,15 +106,16 @@ describe("FabricSpeculationStore", () => {
       },
       undefined,
       replay,
+      "b1",
     );
-    const served = await store.tryServe("tc1", "pi.read", { path: "a.ts" });
+    const served = await store.tryServe("tc1", "pi.read", { path: "a.ts" }, "b1");
     expect(served.hit && served.replay.preview).toEqual({ renderer: "rich" });
   });
 
   it("drops and counts unserved entries when the invocation ends", async () => {
     const store = makeStore();
-    store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {});
-    store.launch("tc1", "pi.read", { path: "b.ts" }, () => Promise.resolve("y"), undefined, {});
+    store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {}, "b1");
+    store.launch("tc1", "pi.read", { path: "b.ts" }, () => Promise.resolve("y"), undefined, {}, "b1");
     store.onInvocationEnd("tc1");
     expect(store.stats()).toMatchObject({ wasted: 2, pending: 0 });
   });
@@ -120,10 +123,10 @@ describe("FabricSpeculationStore", () => {
   it("respects the entries cap", () => {
     const store = new FabricSpeculationStore({ maxConcurrent: 100, maxEntries: 1, entryTtlMs: 60_000 });
     expect(
-      store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {}),
+      store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {}, "b1"),
     ).toBe(true);
     expect(
-      store.launch("tc1", "pi.read", { path: "b.ts" }, () => Promise.resolve("y"), undefined, {}),
+      store.launch("tc1", "pi.read", { path: "b.ts" }, () => Promise.resolve("y"), undefined, {}, "b1"),
     ).toBe(false);
     expect(store.stats().skipped).toBe(1);
   });
@@ -132,9 +135,9 @@ describe("FabricSpeculationStore", () => {
     vi.useFakeTimers();
     try {
       const store = new FabricSpeculationStore({ maxConcurrent: 4, maxEntries: 8, entryTtlMs: 1_000 });
-      store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {});
+      store.launch("tc1", "pi.read", { path: "a.ts" }, () => Promise.resolve("x"), undefined, {}, "b1");
       vi.advanceTimersByTime(2_000);
-      store.launch("tc1", "pi.read", { path: "b.ts" }, () => Promise.resolve("y"), undefined, {});
+      store.launch("tc1", "pi.read", { path: "b.ts" }, () => Promise.resolve("y"), undefined, {}, "b1");
       expect(store.stats()).toMatchObject({ wasted: 1, pending: 1 });
     } finally {
       vi.useRealTimers();
@@ -146,7 +149,7 @@ describe("FabricSpeculationStore", () => {
     store.launch("tc1", "pi.read", { path: "a.ts" }, (signal) => {
       expect(signal.aborted).toBe(false);
       return new Promise(() => {});
-    }, undefined, {});
+    }, undefined, {}, "b1");
     store.reset();
     expect(store.stats().pending).toBe(0);
   });

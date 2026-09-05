@@ -26,10 +26,14 @@ interface SpeculationEntry {
  * Correctness contract: a stored promise may only be served to a real call
  * when (1) the mutation epoch has not advanced since the speculation launched
  * — the epoch bumps after any real in-program invocation whose effect kind is
- * not "none" — and (2) the entry's freshness checker, when present, still
- * holds. Entries are take-once (identical duplicate calls each need their own
- * speculation) and are aborted + counted wasted when their execution finishes
- * without serving them or when the turn resets.
+ * not "none" — (2) the entry's freshness checker, when present, still holds,
+ * and (3) the entry was launched against the same provider binding the real
+ * call resolved: the binding token is part of the cache key, so an entry that
+ * a reset could not abort (its speculate() was still mid-describe when the
+ * binding was replaced) can never match the replacement's serve key. Entries
+ * are take-once (identical duplicate calls each need their own speculation)
+ * and are aborted + counted wasted when their execution finishes without
+ * serving them or when the turn resets.
  */
 export class FabricSpeculationStore implements FabricSpeculationRuntime {
   #epoch = 0;
@@ -69,8 +73,9 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
     parentToolCallId: string,
     ref: string,
     preparedArgs: Record<string, unknown>,
+    bindingToken: string,
   ): string {
-    return `${parentToolCallId}\n${ref}\n${stableJsonHash(preparedArgs)}`;
+    return `${parentToolCallId}\n${ref}\n${stableJsonHash(preparedArgs)}\n${bindingToken}`;
   }
 
   /**
@@ -85,13 +90,14 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
     execute: (signal: AbortSignal) => Promise<unknown>,
     freshness: FabricFreshnessChecker | undefined,
     replay: FabricSpeculationReplay,
+    bindingToken: string,
   ): boolean {
     this.#sweepExpired(Date.now());
     if (this.#entries.size >= this.#maxEntries || this.#inFlightCount() >= this.#maxConcurrent) {
       this.#stats.skipped += 1;
       return false;
     }
-    const key = FabricSpeculationStore.key(parentToolCallId, ref, preparedArgs);
+    const key = FabricSpeculationStore.key(parentToolCallId, ref, preparedArgs, bindingToken);
     if (this.#entries.has(key)) {
       this.#stats.skipped += 1;
       return false;
@@ -124,8 +130,9 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
     parentToolCallId: string,
     ref: string,
     preparedArgs: Record<string, unknown>,
+    bindingToken: string,
   ): Promise<FabricSpeculationServeResult> {
-    const key = FabricSpeculationStore.key(parentToolCallId, ref, preparedArgs);
+    const key = FabricSpeculationStore.key(parentToolCallId, ref, preparedArgs, bindingToken);
     const entry = this.#entries.get(key);
     if (!entry || entry.parentToolCallId !== parentToolCallId) {
       return { hit: false, reason: "absent" };

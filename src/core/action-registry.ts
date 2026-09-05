@@ -33,6 +33,16 @@ import {
   formatUnknownActionMessage,
   repairActionName,
 } from "./action-repair.js";
+import {
+  applyActiveActionName,
+  applyActiveArgRepairs,
+  getActiveRepairCompiler,
+} from "../repairs/active.js";
+import {
+  activeQuarantinedRefNames,
+  effectiveInputSchema,
+  isActiveQuarantine,
+} from "../entropy/active.js";
 import { formatFabricEffectConflict } from "./effect-conflict.js";
 import { stableJsonHash } from "./stable-hash.js";
 import type {
@@ -302,6 +312,7 @@ const unexpectedKeys = (
 ): string[] => {
   if ((schema as { type?: unknown }).type !== "object") return [];
   if ((schema as { additionalProperties?: unknown }).additionalProperties !== false) return [];
+  if ((schema as { patternProperties?: unknown }).patternProperties !== undefined) return [];
   const properties = (schema as { properties?: Record<string, unknown> }).properties;
   if (!properties) return [];
   return Object.keys(value).filter((key) => !(key in properties));
@@ -334,6 +345,59 @@ const validationMessage = (
   }
 };
 
+const declaredPropertyNames = (schema: Record<string, unknown>): string[] => {
+  const properties = (schema as { properties?: Record<string, unknown> }).properties;
+  return properties ? Object.keys(properties) : [];
+};
+
+const repairCatalogInput = (
+  ref: string,
+  schema: Record<string, unknown>,
+  args: Record<string, unknown>,
+): { args: Record<string, unknown>; observedUnexpected: string | undefined } => {
+  const extras = unexpectedKeys(schema, args).sort();
+  const observedUnexpected = extras.length > 0 ? extras.join("\0") : undefined;
+  if (extras.length > 0) {
+    getActiveRepairCompiler()?.observeInvalidArgs(
+      ref,
+      args,
+      declaredPropertyNames(schema),
+      extras.join(","),
+      { countError: false, extraKeys: extras },
+    );
+  }
+  return {
+    args: applyActiveArgRepairs(ref, args, schema),
+    observedUnexpected,
+  };
+};
+
+const validateCatalogArgs = (
+  ref: string,
+  schema: Record<string, unknown>,
+  args: Record<string, unknown>,
+  observedUnexpected: string | undefined,
+): { args: Record<string, unknown>; invalid?: string } => {
+  const compiler = getActiveRepairCompiler();
+  const first = applyActiveArgRepairs(ref, args, schema);
+  const invalid = validationMessage(schema, first);
+  if (!invalid) return { args: first };
+  const extras = unexpectedKeys(schema, first).sort();
+  if (observedUnexpected === undefined || extras.join("\0") !== observedUnexpected) {
+    compiler?.observeInvalidArgs(
+      ref,
+      first,
+      declaredPropertyNames(schema),
+      invalid,
+      { countError: false, extraKeys: extras },
+    );
+  }
+  const second = applyActiveArgRepairs(ref, first, schema);
+  const stillInvalid = validationMessage(schema, second);
+  if (stillInvalid) compiler?.recordInvocationError();
+  return stillInvalid ? { args: second, invalid: stillInvalid } : { args: second };
+};
+
 export class ActionRegistry {
   readonly #providerBindings = new FabricProviderBindings();
   readonly #activeEffects = new Map<string, { ref: string; effect: FabricActionEffect }>();
@@ -341,7 +405,9 @@ export class ActionRegistry {
   #speculation: FabricSpeculationRuntime | undefined;
   #speculationEligibility: ((action: ResolvedFabricAction) => boolean) | undefined;
 
-  constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {}
+  constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {
+    this.#providerBindings.subscribe(() => this.#speculation?.reset?.());
+  }
 
   /**
    * Attach the speculative-PTC runtime. Eligibility is re-checked against the
@@ -485,7 +551,16 @@ export class ActionRegistry {
           tools = new Map();
           byServer.set(server, tools);
         }
-        tools.set(toolName, { name: toolName, inputSchema: descriptor.inputSchema });
+        // Teaching: the type gate checks programs against the compiled
+        // schema, the same shape invoke validates against, so shape
+        // mistakes surface before the sandbox runs.
+        tools.set(toolName, {
+          name: toolName,
+          inputSchema: effectiveInputSchema(
+            `mcp.${descriptor.name}`,
+            descriptor.inputSchema,
+          ) as Record<string, unknown>,
+        });
       }
       if (byServer.size > 0) {
         sources.mcpServers = [...byServer.entries()].map(([server, tools]) => ({
@@ -501,7 +576,10 @@ export class ActionRegistry {
         if (descriptors.length > 0) {
           sources.extensionTools = descriptors.map((descriptor) => ({
             name: descriptor.name,
-            inputSchema: descriptor.inputSchema,
+            inputSchema: effectiveInputSchema(
+              `extensions.${descriptor.name}`,
+              descriptor.inputSchema,
+            ) as Record<string, unknown>,
           }));
         }
       } catch {
@@ -512,13 +590,22 @@ export class ActionRegistry {
     return sources;
   }
 
+  // The model-facing discovery view: quarantined refs hide here, and the
+  // compiled overlay teaches: listed schemas show the compiled shape so
+  // tightened enums are visible before the first call. Pass `declared: true`
+  // for the compile's base-surface truth, which keeps quarantined refs
+  // visible and schemas declared so base-digest proofs and artifact
+  // carry-forward read the live contract. Capability-view paths stay
+  // declared everywhere (see describe): committed views pin declared
+  // digests, and a surface activation must never invalidate them.
   async list(
-    request: FabricProviderListRequest & { provider?: string },
+    request: FabricProviderListRequest & { provider?: string; declared?: boolean },
     context: FabricInvocationContext,
   ): Promise<ResolvedFabricAction[]> {
     if (context.capabilityView) {
       const refs = Object.keys(context.capabilityView.bindings)
         .filter((ref) => !request.provider || ref.startsWith(`${request.provider}.`))
+        .filter((ref) => request.declared || !activeQuarantinedRefNames().has(ref))
         .sort();
       const actions = await Promise.all(refs.map((ref) => this.describe(ref, context)));
       const query = request.query?.normalize("NFKC").trim().toLowerCase();
@@ -535,7 +622,26 @@ export class ActionRegistry {
     const lists = await Promise.all(
       providers.map(async (provider) => {
         const descriptors = await provider.list(request, context);
-        return descriptors.map((descriptor) => resolveDescriptor(provider, descriptor));
+        return descriptors
+          .filter(
+            (descriptor) =>
+              request.declared ||
+              !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
+          )
+          .map((descriptor) => {
+            const action = resolveDescriptor(provider, descriptor);
+            // Teaching: the listing carries the compiled schema. Declared
+            // requests (the compile snapshot) keep the live contract.
+            return request.declared
+              ? action
+              : {
+                  ...action,
+                  inputSchema: effectiveInputSchema(
+                    action.ref,
+                    action.inputSchema,
+                  ) as Record<string, unknown>,
+                };
+          });
       }),
     );
     const limit = Math.max(1, Math.min(request.limit ?? 100, 1_000));
@@ -569,6 +675,10 @@ export class ActionRegistry {
         actions: context.capabilityView
           ? await this.list({ provider: provider.name, limit: 1_000 }, context)
           : (await provider.list({}, context))
+              .filter(
+                (descriptor) =>
+                  !activeQuarantinedRefNames().has(`${provider.name}.${descriptor.name}`),
+              )
               .map((descriptor) => resolveDescriptor(provider, descriptor)),
       })),
     );
@@ -784,18 +894,28 @@ export class ActionRegistry {
       if (!provider.acquire) {
         throw new Error(`Fabric provider does not implement scoped acquisition: ${provider.name}`);
       }
+      const effectiveSchema = effectiveInputSchema(
+        action.ref,
+        action.inputSchema,
+      ) as Record<string, unknown>;
+      const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(providerActionName, args, context),
+            provider.prepareArguments!(providerActionName, catalogInput.args, context),
           )
-        : args;
+        : catalogInput.args;
       if (typeof preparedArgs !== "object" || preparedArgs === null || Array.isArray(preparedArgs)) {
         throw new Error(`Argument preparation for ${ref} did not return an object`);
       }
-      const invalid = validationMessage(action.inputSchema, preparedArgs);
-      if (invalid) throw new Error(`Invalid arguments for ${ref}: ${invalid}`);
+      const catalog = validateCatalogArgs(
+        action.ref,
+        effectiveSchema,
+        preparedArgs,
+        catalogInput.observedUnexpected,
+      );
+      if (catalog.invalid) throw new Error(`Invalid arguments for ${ref}: ${catalog.invalid}`);
       const acquired = await runAbortable(context.signal, () =>
-        provider.acquire!(providerActionName, preparedArgs, context),
+        provider.acquire!(providerActionName, catalog.args, context),
       );
       if (!acquired || typeof acquired.dispose !== "function") {
         throw new Error(`Scoped acquisition ${ref} did not return a disposer`);
@@ -864,24 +984,90 @@ export class ActionRegistry {
       }
 
       failureStage = "prepare";
+      const effectiveSchema = effectiveInputSchema(
+        action.ref,
+        action.inputSchema,
+      ) as Record<string, unknown>;
+      const catalogInput = repairCatalogInput(action.ref, effectiveSchema, args);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(providerActionName, args, context),
+            provider.prepareArguments!(providerActionName, catalogInput.args, context),
           )
-        : args;
+        : catalogInput.args;
       if (typeof preparedArgs !== "object" || preparedArgs === null || Array.isArray(preparedArgs)) {
         throw new FabricTraceSafeError(`Argument preparation for ${ref} did not return an object`);
       }
-      traceOperation?.prepared(preparedArgs);
 
       failureStage = "validate";
-      const invalid = validationMessage(action.inputSchema, preparedArgs);
+      const catalog = validateCatalogArgs(
+        action.ref,
+        effectiveSchema,
+        preparedArgs,
+        catalogInput.observedUnexpected,
+      );
+      traceOperation?.prepared(catalog.args);
       // TypeBox validator messages describe schema expectations only — they
       // never echo argument values — so they are safe for durable traces.
-      if (invalid) throw new FabricTraceSafeError(`Invalid arguments for ${ref}: ${invalid}`);
+      if (catalog.invalid) {
+        // A validate-rejected attempt is in-domain evidence against the
+        // effective surface, but rejected argument values are untrusted
+        // input and never enter the durable record. The trace-safe feed
+        // persists only values the live schema's own enums declare: for a
+        // closed-domain parameter the refused value is already the author's
+        // public vocabulary, so the observation pool can carry it and a
+        // later reset (base drift or review) re-derives with it included.
+        // Values outside the declared enums (typos, payloads) drop here,
+        // the same pre-birth rule the derivation applies.
+        const declaredSchema = action.inputSchema;
+        const declaredProperties =
+          typeof declaredSchema === "object" &&
+          declaredSchema !== null &&
+          !Array.isArray(declaredSchema) &&
+          typeof (declaredSchema as Record<string, unknown>).properties === "object" &&
+          (declaredSchema as Record<string, unknown>).properties !== null
+            ? ((declaredSchema as Record<string, unknown>).properties as Record<string, unknown>)
+            : undefined;
+        const attemptArgs: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(catalog.args)) {
+          const property = declaredProperties ? declaredProperties[key] : undefined;
+          const declaredEnum =
+            typeof property === "object" && property !== null
+              ? (property as Record<string, unknown>).enum
+              : undefined;
+          if (!Array.isArray(declaredEnum)) continue;
+          if (
+            typeof value !== "string" &&
+            typeof value !== "number" &&
+            typeof value !== "boolean"
+          ) {
+            continue;
+          }
+          if (String(value).length > MAX_AUDIT_VALUE_CHARS) continue;
+          if (!declaredEnum.includes(value)) continue;
+          attemptArgs[key] = value;
+        }
+        if (Object.keys(attemptArgs).length > 0) {
+          const attempt: FabricCallAudit = {
+            ref,
+            nestedToolCallId: `${NESTED_TOOL_CALL_ID_PREFIX}${randomUUID()}`,
+            startedAt: Date.now(),
+            tool: action.name,
+            provider: action.provider,
+            args: attemptArgs,
+            success: false,
+            error: `Invalid arguments for ${ref}: ${catalog.invalid}`,
+            endedAt: Date.now(),
+            ...(resolved.repairedFrom !== undefined
+              ? { repairedFrom: resolved.repairedFrom }
+              : {}),
+          };
+          context.audits.push(attempt);
+        }
+        throw new FabricTraceSafeError(`Invalid arguments for ${ref}: ${catalog.invalid}`);
+      }
 
       failureStage = "approve";
-      await runAbortable(context.signal, () => context.approve(action, preparedArgs));
+      await runAbortable(context.signal, () => context.approve(action, catalog.args));
 
       failureStage = "invoke";
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}${randomUUID()}`;
@@ -902,7 +1088,7 @@ export class ActionRegistry {
             .join("; ")}`,
         );
       }
-      const argsPreview = previewArgs(ref, preparedArgs);
+      const argsPreview = previewArgs(ref, catalog.args);
       const activeAudit: FabricCallAudit = {
         ref,
         nestedToolCallId,
@@ -933,7 +1119,7 @@ export class ActionRegistry {
       let providerValue: unknown;
       if (this.#speculation && effect.kind === "none") {
         const served = await runAbortable(context.signal, () =>
-          this.#speculation!.tryServe(context.parentToolCallId, ref, preparedArgs));
+          this.#speculation!.tryServe(context.parentToolCallId, ref, catalog.args, binding.id));
         if (served.hit) {
           servedFromSpeculation = true;
           activeAudit.speculated = true;
@@ -963,7 +1149,7 @@ export class ActionRegistry {
         if (!servedFromSpeculation) {
         providerInvoked = true;
         providerValue = await runAbortable(context.signal, () =>
-          provider.invoke(providerActionName, preparedArgs, {
+          provider.invoke(providerActionName, catalog.args, {
           ...context,
           nestedToolCallId,
           update(message) {
@@ -1018,7 +1204,7 @@ export class ActionRegistry {
       const value = this.toolResultProxy
         ? await runAbortable(context.signal, () => this.toolResultProxy!.proxy({
             action,
-            args: preparedArgs,
+            args: catalog.args,
             toolCallId: nestedToolCallId,
             value: providerValue,
             ...(context.signal ? { signal: context.signal } : {}),
@@ -1075,7 +1261,10 @@ export class ActionRegistry {
    * Prepare + pre-launch a speculative call discovered in a partially
    * streamed program (see src/speculation). Pure pipeline only: descriptor
    * resolution, the eligibility gate on the resolved action, argument
-   * preparation, and schema validation. authorize/approve/audits are skipped
+   * preparation, and schema validation. The compiled entropy surface gates
+   * launches too: quarantined refs never pre-launch and overlays validate
+   * prepared arguments, so the store never warms a call the serve path
+   * would reject. authorize/approve/audits are skipped
    * because the eligibility gate restricts this path to actions that never
    * prompt, and the real call re-runs the full pipeline on a serve miss.
    * Side-channel outputs are captured into `replay` so the serve path can
@@ -1089,22 +1278,37 @@ export class ActionRegistry {
   ): Promise<
     | {
         preparedArgs: Record<string, unknown>;
+        bindingToken: string;
         execute(signal: AbortSignal | undefined): Promise<unknown>;
       }
     | undefined
   > {
     if (!this.#speculationEligibility) return undefined;
     try {
-      const { binding, provider, actionName } = this.#parseRef(ref, context.capabilityView);
+      const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
+        ref,
+        context.capabilityView,
+      );
       const descriptor = await runAbortable(context.signal, () =>
         provider.describe(actionName, context));
       if (!descriptor) return undefined;
       const action = resolveDescriptor(provider, descriptor);
+      if (expectedDescriptorHash && actionDescriptorHash(action) !== expectedDescriptorHash) {
+        return undefined;
+      }
+      if (isActiveQuarantine(provider.name, actionName, descriptor.inputSchema)) {
+        return undefined;
+      }
       if (!this.#speculationEligibility(action)) return undefined;
+      const effectiveSchema = effectiveInputSchema(
+        action.ref,
+        action.inputSchema,
+      ) as Record<string, unknown>;
+      const catalogInput = applyActiveArgRepairs(action.ref, args, effectiveSchema);
       const preparedArgs = provider.prepareArguments
         ? await runAbortable(context.signal, () =>
-            provider.prepareArguments!(actionName, args, context))
-        : args;
+            provider.prepareArguments!(actionName, catalogInput, context))
+        : catalogInput;
       if (
         typeof preparedArgs !== "object" ||
         preparedArgs === null ||
@@ -1112,15 +1316,21 @@ export class ActionRegistry {
       ) {
         return undefined;
       }
-      if (validationMessage(action.inputSchema, preparedArgs)) return undefined;
+      const repairedArgs = applyActiveArgRepairs(
+        action.ref,
+        preparedArgs,
+        effectiveSchema,
+      );
+      if (validationMessage(effectiveSchema, repairedArgs)) return undefined;
       const nestedToolCallId = `${NESTED_TOOL_CALL_ID_PREFIX}spec-${randomUUID()}`;
       return {
-        preparedArgs,
+        preparedArgs: repairedArgs,
+        bindingToken: binding.id,
         execute: async (signal) => {
           const endBindingInvocation = this.#providerBindings.beginInvocation(binding.id);
           try {
             return await runAbortable(signal, () =>
-              provider.invoke(actionName, preparedArgs, {
+              provider.invoke(actionName, repairedArgs, {
                 ...context,
                 signal,
                 nestedToolCallId,
@@ -1273,13 +1483,38 @@ export class ActionRegistry {
     const descriptor = await runAbortable(context.signal, () =>
       provider.describe(actionName, context),
     );
-    if (descriptor) return { action: resolveDescriptor(provider, descriptor), suggestions: [] };
+    // A quarantined ref resolves as unknown: the model-facing catalog never
+    // shows it, and a direct call gets the standard not-found message with
+    // suggestions, exactly like any retired action.
+    if (descriptor && !isActiveQuarantine(provider.name, actionName, descriptor.inputSchema)) {
+      return {
+        action: resolveDescriptor(provider, descriptor),
+        suggestions: [],
+      };
+    }
     if (!allowRepair) return { suggestions: [] };
-    const repair = repairActionName(
-      await this.#declaredActionNames(provider, context),
-      actionName,
+    const declared = (await this.#declaredActionNames(provider, context)).filter(
+      (name) => !activeQuarantinedRefNames().has(`${provider.name}.${name}`),
     );
+    const catalogName = applyActiveActionName(provider.name, actionName, declared);
+    if (catalogName !== actionName) {
+      const catalogDescriptor = await runAbortable(context.signal, () =>
+        provider.describe(catalogName, context),
+      );
+      if (catalogDescriptor) {
+        return {
+          action: resolveDescriptor(provider, catalogDescriptor),
+          suggestions: [],
+          repairedFrom: actionName,
+        };
+      }
+    }
+    const repair = repairActionName(declared, actionName);
+    const compiler = getActiveRepairCompiler();
     if (repair.repaired !== undefined) {
+      compiler?.observeUnknownAction(provider.name, actionName, declared, {
+        countError: false,
+      });
       const repairedDescriptor = await runAbortable(context.signal, () =>
         provider.describe(repair.repaired!, context),
       );
@@ -1290,6 +1525,9 @@ export class ActionRegistry {
           repairedFrom: actionName,
         };
       }
+      compiler?.recordInvocationError();
+    } else {
+      compiler?.observeUnknownAction(provider.name, actionName, declared);
     }
     return {
       suggestions: repair.suggestions.map((name) => `${provider.name}.${name}`),

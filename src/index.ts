@@ -12,6 +12,26 @@ import { registerFabricActorHostEventObservers } from "./actors/host-event-obser
 import { CapturedToolCatalog } from "./capture/catalog.js";
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
+import { resolveAgentDir } from "./core/agent-dir.js";
+import {
+  AUTO_APPLY_PROPOSAL_KINDS,
+  compileEntropySurfaceAsync,
+  compiledSurfaceEffectChanged,
+  entropyRepairRows,
+  entropyReviewKey,
+  formatEntropyCompileNotice,
+  formatEntropyReviewNotice,
+  liveSurfaceSnapshot,
+  loadCompiledSurfaceAsync,
+  loadObservationPoolAsync,
+  machineSessionFilesAsync,
+  mergeObservationWindowAsync,
+  poolToValueObservations,
+  saveCompiledSurfaceAsync,
+  saveObservationPoolAsync,
+  sessionWindowEvidenceAsync,
+} from "./entropy/index.js";
+import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
   settleInPlacePrewalk,
@@ -62,6 +82,8 @@ import {
 import { buildSkillReferenceGuidance } from "./core/skill-references.js";
 import { createFabricExecTool } from "./fabric-exec-tool.js";
 import { FabricState } from "./fabric-state.js";
+import { classifyToolResult } from "./repairs/classify.js";
+import { getActiveRepairCompiler } from "./repairs/active.js";
 import { piHostCompatibilityWarning } from "./host-compatibility.js";
 import {
   FABRIC_COMPONENT_REGISTER_EVENT,
@@ -247,6 +269,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {
+    // Re-applying the persistent policy ends any suspension window; do it
+    // before setPolicy so a config-disabled policy recomputes derived
+    // surfaces against the (now stable) empty catalog.
+    capturedTools.markResumed();
     toolCapture.setPolicy(capturePolicy());
     pi.registerTool(fabricTool);
     toolOwnership.apply(
@@ -256,6 +282,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     capturedTools.refresh();
   };
   const suspendToolCapture = (): void => {
+    // Mark the suspension before the policy flip: setPolicy clears the
+    // catalog, and the freeze must already be in effect when that clear
+    // reaches derived-surface listeners.
+    capturedTools.markSuspended();
     toolCapture.setPolicy(inactiveCapturePolicy);
   };
 
@@ -356,7 +386,140 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     installHaltOnEscape(context);
   }, cleanupActivationSideEffects);
 
+  // Continual entropy reduction runs off the interaction path. Session-tree
+  // discovery and JSONL ingestion use async I/O, scoring yields in fixed trace
+  // chunks, and durable stores acquire locks cooperatively. Turn hooks only
+  // enqueue work; a pending turn coalesces to the newest context.
+  let entropyEvidenceThisTurn = false;
+  let entropyCompileInFlight: Promise<void> | undefined;
+  let entropyCompilePending: EntropyCompileRequest | undefined;
+  let entropyLastReview = "";
+  let entropyLifecycleEpoch = 0;
+
+  interface EntropyCompileRequest {
+    context: ExtensionContext;
+    delayMs: number;
+    epoch: number;
+  }
+
+  const compileEntropyNow = async (
+    context: ExtensionContext,
+    epoch: number,
+  ): Promise<void> => {
+    const current = (): boolean =>
+      epoch === entropyLifecycleEpoch && state.initialized && state.config.entropy.compile;
+    if (!current()) return;
+    const startedAt = performance.now();
+    const agentDir = resolveAgentDir();
+    const cwd = state.cwd ?? context.cwd;
+    const repairs = entropyRepairRows(state.repairs.repairs);
+    const [files, loaded, poolLoaded, snapshot] = await Promise.all([
+      machineSessionFilesAsync(agentDir, cwd),
+      loadCompiledSurfaceAsync(agentDir),
+      loadObservationPoolAsync(agentDir),
+      liveSurfaceSnapshot({ registry: state.registry, extensionContext: context, cwd }),
+    ]);
+    if (!current() || files.length === 0 || loaded.error || poolLoaded.error) return;
+    const evidence = await sessionWindowEvidenceAsync(files);
+    if (!current() || evidence.traces.length === 0) return;
+    const mergedPool = await mergeObservationWindowAsync(
+      poolLoaded.file,
+      evidence.observationWindows,
+    );
+    await saveObservationPoolAsync(agentDir, mergedPool.file);
+    if (!current()) return;
+    const outcome = await compileEntropySurfaceAsync({
+      traces: evidence.traces,
+      surface: snapshot,
+      repairs,
+      valueObservations: poolToValueObservations(mergedPool.file),
+      auditCalls: evidence.auditCalls,
+      ...(loaded.file ? { artifact: loaded.file } : {}),
+    });
+    if (!current()) return;
+    const review = outcome.proposals.filter(
+      (proposal) => !(AUTO_APPLY_PROPOSAL_KINDS as readonly string[]).includes(proposal.kind),
+    );
+    const reviewKey = entropyReviewKey(review);
+    const reviewChanged = reviewKey !== entropyLastReview;
+    let compileNotified = false;
+    if (outcome.status === "compiled" && outcome.artifact) {
+      const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact);
+      if (saved.written && current()) {
+        // Activate immediately: enforcement follows the background compile,
+        // never waiting for the next session start. Provenance-only artifact
+        // updates stay silent because they do not alter the live surface.
+        setActiveCompiledSurface(outcome.artifact);
+        if (compiledSurfaceEffectChanged(loaded.file, outcome.artifact) && context.hasUI) {
+          context.ui.notify(
+            formatEntropyCompileNotice({
+              proposals: outcome.proposals,
+              beforeScore: outcome.report.score,
+              afterScore: outcome.after?.score ?? outcome.report.score,
+              elapsedMs: performance.now() - startedAt,
+              ...(reviewChanged && review.length > 0 ? { reviewCount: review.length } : {}),
+            }),
+            "info",
+          );
+          compileNotified = true;
+        }
+      }
+    }
+    if (epoch !== entropyLifecycleEpoch) return;
+    if (reviewChanged) {
+      entropyLastReview = reviewKey;
+      if (review.length > 0 && !compileNotified && context.hasUI) {
+        context.ui.notify(formatEntropyReviewNotice(review), "info");
+      }
+    }
+  };
+
+  const launchEntropyCompile = (request: EntropyCompileRequest): void => {
+    const task = (async () => {
+      try {
+        if (request.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, request.delayMs));
+        }
+        await compileEntropyNow(request.context, request.epoch);
+      } catch (error) {
+        console.warn(
+          `[pi-fabric] entropy compile failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    })();
+    entropyCompileInFlight = task;
+    void task.finally(() => {
+      if (entropyCompileInFlight !== task) return;
+      entropyCompileInFlight = undefined;
+      const pending = entropyCompilePending;
+      entropyCompilePending = undefined;
+      if (pending) launchEntropyCompile(pending);
+    });
+  };
+
+  const scheduleEntropyCompile = (
+    context: ExtensionContext,
+    delayMs = 250,
+  ): void => {
+    const request = { context, delayMs, epoch: entropyLifecycleEpoch };
+    if (entropyCompileInFlight) {
+      entropyCompilePending = request;
+      return;
+    }
+    launchEntropyCompile(request);
+  };
+
+  const settleEntropyCompiles = async (): Promise<void> => {
+    while (entropyCompileInFlight) await entropyCompileInFlight;
+  };
+
   pi.on("session_start", async (_event, context) => {
+    entropyLifecycleEpoch += 1;
+    entropyEvidenceThisTurn = false;
+    entropyCompilePending = undefined;
+    entropyLastReview = "";
     pendingHandoffs.clear();
     directToolApproval.clear();
     toolDisplay.clear();
@@ -414,6 +577,12 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     // the program never executed (type errors, aborts).
     if (state.initialized) state.resetSpeculation();
     if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
+    // A turn with new action evidence only enqueues the background compiler;
+    // the hook returns without scanning session files or waiting on a lock.
+    if (entropyEvidenceThisTurn) {
+      entropyEvidenceThisTurn = false;
+      scheduleEntropyCompile(context);
+    }
   });
 
   pi.on("agent_settled", async (event, context) => {
@@ -553,8 +722,21 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
 
   pi.on("tool_execution_end", async (event, context) => {
     if (!state.initialized) return;
+    if (event.toolName === "fabric_exec") entropyEvidenceThisTurn = true;
     state.noteMainActivity(context);
     if (event.isError) {
+      const classified = classifyToolResult({
+        toolName: event.toolName,
+        isError: true,
+        content: event.result,
+      });
+      const registryObserved =
+        event.toolName === "fabric_exec" &&
+        (classified?.stage === "invocation_args" ||
+          classified?.stage === "invocation_unknown_action");
+      if (classified && !registryObserved) {
+        getActiveRepairCompiler()?.observe(classified);
+      }
       state.dispatchHostEvent("tool_error", event, context);
       await state.publishHostLifecycle("pi.tool_error", event);
     }
@@ -725,7 +907,16 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     state.dispatchHostEvent(eventName, event, context);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, context) => {
+    // Queue the richest final window and let async I/O/cooperative scoring
+    // finish before teardown; the TUI event loop remains responsive.
+    if (entropyEvidenceThisTurn) {
+      entropyEvidenceThisTurn = false;
+      scheduleEntropyCompile(context, 0);
+    }
+    await settleEntropyCompiles();
+    entropyLifecycleEpoch += 1;
+    entropyCompilePending = undefined;
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
     pendingHandoffs.clear();
@@ -763,4 +954,5 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
 }
 
 export * from "./audit/index.js";
+export * from "./entropy/index.js";
 export * from "./protocol.js";

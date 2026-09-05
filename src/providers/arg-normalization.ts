@@ -242,6 +242,28 @@ const lexiconRepair = (
   return candidates.size === 1 ? [...candidates][0] : undefined;
 };
 
+/** Unique declared key for a spilled spelling, or undefined when already
+ * canonical / ambiguous / unmatched. Used by the catalog repair compiler. */
+export const uniqueDeclaredKeyForSpelling = (
+  spilled: string,
+  declared: readonly string[],
+): string | undefined => {
+  if (declared.includes(spilled)) return undefined;
+  const derived = deriveAction(
+    {
+      type: "object",
+      properties: Object.fromEntries(declared.map((key) => [key, {}])),
+    },
+    undefined,
+  );
+  const form = normalizeForm(spilled);
+  const canonical =
+    derived.declaredForms.get(form) ??
+    derived.singulars.get(form) ??
+    lexiconRepair(form, derived.declaredForms);
+  return canonical && canonical !== spilled ? canonical : undefined;
+};
+
 const applyDerived = (
   args: Record<string, unknown>,
   derived: DerivedAction,

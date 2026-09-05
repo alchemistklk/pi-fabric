@@ -400,7 +400,7 @@ export class DashboardDetailRenderer {
     const tool =
       normalizedName === "glob"
         ? "find"
-        : ["read", "write", "edit", "bash", "grep", "find", "ls"].includes(normalizedName)
+        : ["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"].includes(normalizedName)
           ? normalizedName
           : rawName;
     const rawArgs = entry.args ?? {};
@@ -552,7 +552,7 @@ export class DashboardDetailRenderer {
     const coreCallPreview = (call: FabricActivityCall): boolean => {
       const settings = this.codePreviewSettings;
       const tool = call.ref.startsWith("pi.") ? call.ref.slice(3) : "";
-      if (!settings || !["bash", "read", "write", "edit", "grep", "find", "ls"].includes(tool)) {
+      if (!settings || !["bash", "powershell", "read", "write", "edit", "grep", "find", "ls"].includes(tool)) {
         return false;
       }
       const success = call.status === "completed"
@@ -600,9 +600,12 @@ export class DashboardDetailRenderer {
       if (!args || Object.keys(args).length === 0) return;
       const stringValue = (key: string): string | undefined =>
         typeof args[key] === "string" ? args[key] : undefined;
-      if (call.ref === "pi.bash") {
+      if (call.ref === "pi.bash" || call.ref === "pi.powershell") {
         const command = stringValue("command");
-        if (command) markdownField("Command", "```bash\n" + command + "\n```", "command");
+        const language = call.ref === "pi.powershell" ? "powershell" : "bash";
+        if (command) {
+          markdownField("Command", `\`\`\`${language}\n${command}\n\`\`\``, "command");
+        }
       }
       const edits = Array.isArray(args.edits) ? args.edits : [];
       if (call.ref === "pi.edit" && edits.length > 0) {

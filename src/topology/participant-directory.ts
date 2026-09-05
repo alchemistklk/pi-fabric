@@ -435,8 +435,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
   }
 
+  sessions(now = Date.now()): FabricParticipantInfo[] {
+    return this.list({ scope: "project", kinds: ["root"] }, now);
+  }
+
   peers(now = Date.now()): FabricPeerInfo[] {
-    return this.list({ scope: "project", kinds: ["root"] }, now)
+    return this.sessions(now)
       .filter((participant) => participant.id !== this.options.rootId)
       .flatMap((participant) => {
         const peer = peerFromParticipant(participant);

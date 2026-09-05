@@ -4,7 +4,7 @@ import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
-import type { FabricActorRequest } from "../src/actors/types.js";
+import type { FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type {
@@ -25,6 +25,7 @@ import type {
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentsProvider, collectAgentToolPreviewNodes } from "../src/providers/agents-provider.js";
+import type { ResidencyClient } from "../src/residency/client.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
@@ -43,12 +44,29 @@ const usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const visiblePiModels = [
+  { provider: "anthropic", id: "executor", name: "Executor" },
+  { provider: "anthropic", id: "frontier", name: "Frontier" },
+  { provider: "provider", id: "project" },
+  { provider: "provider", id: "project-default" },
+  { provider: "provider", id: "one-off" },
+  { provider: "provider", id: "session" },
+  { provider: "provider", id: "model-a" },
+  { provider: "provider", id: "model-b" },
+];
+
+const visibleModelRegistry = {
+  getAvailable: () => visiblePiModels,
+  find: (provider: string, id: string) =>
+    visiblePiModels.find((model) => model.provider === provider && model.id === id),
+};
+
 const context: FabricInvocationContext = {
   cwd: process.cwd(),
   signal: undefined,
   parentToolCallId: "test",
   nestedToolCallId: "nested",
-  extensionContext: {} as ExtensionContext,
+  extensionContext: { modelRegistry: visibleModelRegistry } as unknown as ExtensionContext,
   update() {},
   activity() {},
 };
@@ -68,6 +86,7 @@ const setup = (
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
+    vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
     runRoot: path.join(root, "runs"),
   });
   agentManagers.push(agents);
@@ -169,7 +188,20 @@ const setup = (
     undefined,
     () => options?.modelsConfig ?? DEFAULT_FABRIC_CONFIG.models,
   );
-  return { root, actors, agents, globalActors, provider, mainDeliveries };
+  return {
+    root,
+    mesh,
+    identity,
+    mainAgent,
+    participants,
+    control,
+    lifecycle,
+    actors,
+    agents,
+    globalActors,
+    provider,
+    mainDeliveries,
+  };
 };
 
 afterEach(async () => {
@@ -330,13 +362,15 @@ describe("AgentsProvider runner support", () => {
     const { provider } = setup();
     const run = await provider.describe("run", context);
     const spawn = await provider.describe("spawn", context);
-    const runProperties = (run?.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
-    const spawnProperties = (spawn?.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
+    type RunnerProperty = { enum?: string[]; type?: string; description?: string };
+    const runProperties = (run?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
+    const spawnProperties = (spawn?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
     expect(runProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
     expect(spawnProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
-    const persona = { type: "string", description: expect.stringContaining("Veda persona") };
-    expect(runProperties.persona).toMatchObject(persona);
-    expect(spawnProperties.persona).toMatchObject(persona);
+    expect(runProperties.persona?.type).toBe("string");
+    expect(runProperties.persona?.description).toContain("Veda persona");
+    expect(spawnProperties.persona?.type).toBe("string");
+    expect(spawnProperties.persona?.description).toContain("Veda persona");
     // Veda forwards any -m value to the backend, so model discovery is an
     // empty advisory list rather than a runtime enumeration.
     await expect(provider.invoke("models", { runner: "veda" }, context)).resolves.toEqual([]);
@@ -358,6 +392,171 @@ describe("AgentsProvider runner support", () => {
     ).rejects.toThrow("trusted project");
     expect(actors.list()).toEqual([]);
   });
+
+  it("routes durable creates and imports when the local registry is already owned", async () => {
+    const state = setup();
+    // Simulate the transferred registry: a live foreign actor over the shared
+    // registry makes the local manager's create guard throw.
+    const peerIdentity: MeshIdentity = {
+      id: "session:foreign-owner",
+      name: "main",
+      kind: "main",
+      sessionId: "foreign-owner",
+    };
+    const peer = new ActorManager(
+      "foreign-owner",
+      peerIdentity,
+      state.mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
+      state.agents,
+      () => {},
+      {
+        actorRoot: path.join(state.root, "actors"),
+        persistent: true,
+        claimResidency: "session",
+        rootId: peerIdentity.id,
+      },
+    );
+    actorManagers.push(peer);
+    const foreign = await peer.create({
+      name: "first-durable",
+      instructions: "Ceded to the resident host.",
+      residency: "durable",
+    });
+    // A manager that sees every live actor as owned by another host, like
+    // Main after the registry transferred to the resident host.
+    const guardedActors = new ActorManager(
+      "guarded-main",
+      state.identity,
+      state.mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
+      state.agents,
+      () => {},
+      {
+        actorRoot: path.join(state.root, "actors"),
+        persistent: true,
+        claimResidency: "session",
+        rootId: state.identity.id,
+        canManageActor: () => false,
+      },
+    );
+    actorManagers.push(guardedActors);
+    await waitFor(() => guardedActors.list().some((entry) => entry.id === foreign.id));
+
+    let sequence = 0;
+    const createActor = vi.fn(async (request: FabricActorRequest): Promise<FabricActorInfo> => {
+      const now = Date.now();
+      sequence += 1;
+      return {
+        id: `resident-actor-${sequence}`,
+        scope: request.scope ?? "project",
+        name: request.name,
+        status: "idle",
+        runner: request.runner ?? "pi",
+        events: request.events ?? [],
+        topics: request.topics ?? [],
+        delivery: request.delivery ?? "mailbox",
+        responseMode: request.responseMode ?? "text",
+        triggerTurn: request.triggerTurn ?? false,
+        coalesce: request.coalesce ?? true,
+        residency: "durable",
+        queued: 0,
+        messages: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+    const residency = {
+      ensureHost: vi.fn(async () => undefined),
+      createActor,
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(
+      state.agents,
+      guardedActors,
+      state.globalActors,
+      state.mainAgent,
+      state.participants,
+      state.control,
+      state.lifecycle,
+      undefined,
+      residency,
+      undefined,
+      () => DEFAULT_FABRIC_CONFIG.models,
+    );
+
+    const created = (await provider.invoke(
+      "create",
+      {
+        name: "second-durable",
+        instructions: "Created via the resident host.",
+        residency: "durable",
+      },
+      context,
+    )) as FabricActorInfo;
+    state.globalActors.create({
+      name: "durable-template",
+      instructions: "Imported via the resident host.",
+      residency: "durable",
+    });
+    const imported = (await provider.invoke(
+      "import",
+      { name: "durable-template" },
+      context,
+    )) as FabricActorInfo;
+
+    expect(created).toMatchObject({ id: "resident-actor-1", name: "second-durable" });
+    expect(imported).toMatchObject({ id: "resident-actor-2", name: "durable-template" });
+    expect(createActor).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ name: "second-durable", residency: "durable" }),
+    );
+    expect(createActor).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ name: "durable-template", residency: "durable" }),
+    );
+  });
+
+  it("does not reroute a failed local durable activation", async () => {
+    const state = setup();
+    const activationError = new Error(
+      "Fabric actor registry is owned by another host after local creation",
+    );
+    const createActor = vi.fn();
+    const residency = {
+      ensureHost: vi.fn(async () => undefined),
+      ensureActor: vi.fn(async () => {
+        throw activationError;
+      }),
+      removeActor: vi.fn(async () => ({ removed: true })),
+      createActor,
+    } as unknown as ResidencyClient;
+    const provider = new AgentsProvider(
+      state.agents,
+      state.actors,
+      state.globalActors,
+      state.mainAgent,
+      state.participants,
+      state.control,
+      state.lifecycle,
+      undefined,
+      residency,
+      undefined,
+      () => DEFAULT_FABRIC_CONFIG.models,
+    );
+
+    await expect(
+      provider.invoke(
+        "create",
+        {
+          name: "activation-failure",
+          instructions: "Do not reroute this failed transfer.",
+          residency: "durable",
+        },
+        context,
+      ),
+    ).rejects.toBe(activationError);
+    expect(createActor).not.toHaveBeenCalled();
+  });
   it("lists live peer sessions separately from Main", async () => {
     const peer: FabricPeerInfo = {
       id: "session:peer",
@@ -377,6 +576,29 @@ describe("AgentsProvider runner support", () => {
 
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     expect((await provider.describe("peers", context))?.risk).toBe("read");
+  });
+
+  it("lists current and peer roots as symmetric session agents", async () => {
+    const roots: FabricParticipantInfo[] = [
+      {
+        format: 1, id: "session:test", kind: "root", rootId: "session:test",
+        ownerHostId: "session:test", ownerIdentityId: "session:test", name: "main",
+        status: "idle", runner: "pi", transport: "host",
+        capabilities: ["steer", "followUp", "fabric"], sessionId: "test",
+        startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
+      },
+      {
+        format: 1, id: "session:peer", kind: "root", rootId: "session:peer",
+        ownerHostId: "session:peer", ownerIdentityId: "session:peer", name: "main",
+        status: "running", runner: "pi", transport: "host",
+        capabilities: ["steer", "followUp", "fabric"], sessionId: "peer",
+        startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false,
+      },
+    ];
+    const { provider } = setup([], roots);
+
+    await expect(provider.invoke("sessions", {}, context)).resolves.toEqual(roots);
+    expect((await provider.describe("sessions", context))?.risk).toBe("read");
   });
 
   it("creates, lists, and removes source-qualified lifecycle subscriptions", async () => {
@@ -589,6 +811,7 @@ describe("AgentsProvider runner support", () => {
     const handoffContext: FabricInvocationContext = {
       ...context,
       extensionContext: {
+        ...context.extensionContext,
         sessionManager: source,
         model: { provider: "anthropic", id: "frontier" },
       } as unknown as ExtensionContext,
@@ -688,7 +911,10 @@ describe("AgentsProvider runner support", () => {
     const source = SessionManager.inMemory(root);
     const handoffContext = {
       ...context,
-      extensionContext: { sessionManager: source } as unknown as ExtensionContext,
+      extensionContext: {
+        ...context.extensionContext,
+        sessionManager: source,
+      } as unknown as ExtensionContext,
     };
     await expect(provider.invoke("handoff", {}, handoffContext)).rejects.toThrow(
       /requires an explicit Pi target model/,
@@ -809,7 +1035,10 @@ describe("AgentsProvider runner support", () => {
     const source = SessionManager.inMemory(root);
     const handoffContext = {
       ...context,
-      extensionContext: { sessionManager: source } as unknown as ExtensionContext,
+      extensionContext: {
+        ...context.extensionContext,
+        sessionManager: source,
+      } as unknown as ExtensionContext,
     };
     const handoffDescriptor = await provider.describe("handoff", handoffContext);
     const handoffSchema = handoffDescriptor?.inputSchema as { properties: Record<string, unknown> };
@@ -888,6 +1117,7 @@ describe("AgentsProvider runner support", () => {
     const handoffContext: FabricInvocationContext = {
       ...context,
       extensionContext: {
+        ...context.extensionContext,
         sessionManager: source,
         model: { provider: "anthropic", id: "frontier" },
       } as unknown as ExtensionContext,
@@ -2149,32 +2379,142 @@ describe("AgentsProvider switchModel", () => {
     );
   });
 
-  it("resolves inexact run models to the canonical provider/id before spawning", async () => {
-    const { provider, agents } = setup();
+  it("resolves visible exact, fuzzy, and alias run models before spawning", async () => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: { fast: ["opencode/hidden", "google/gemini-2.5-flash"] },
+      },
+    });
     const spawn = vi.spyOn(agents, "spawn");
-    await provider.invoke(
-      "run",
-      { task: "return a short result", model: "gemini" },
-      modelContext(),
-    );
-    expect(spawn).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "google/gemini-2.5-pro" }),
-      undefined,
-    );
+    const selectors = [
+      ["google/gemini-2.5-flash", "google/gemini-2.5-flash"],
+      ["gemini", "google/gemini-2.5-pro"],
+      ["fast", "google/gemini-2.5-flash"],
+    ] as const;
+
+    for (const [model, expected] of selectors) {
+      await provider.invoke(
+        "run",
+        { task: `run ${model}`, model },
+        modelContext(),
+      );
+      expect(spawn).toHaveBeenLastCalledWith(
+        expect.objectContaining({ model: expected }),
+        undefined,
+      );
+    }
   });
 
-  it("passes unresolvable run models through verbatim for the child runtime", async () => {
+  it.each(["run", "spawn"] as const)(
+    "rejects unavailable exact models for agents.%s",
+    async (action) => {
+      const { provider, agents } = setup();
+      const spawn = vi.spyOn(agents, "spawn");
+
+      await expect(
+        provider.invoke(
+          action,
+          { task: "do not launch", model: "opencode/ox-alpha" },
+          modelContext(),
+        ),
+      ).rejects.toThrow(/not available to this Pi session/);
+      expect(spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects exhausted Pi model aliases instead of forwarding them", async () => {
+    const { provider } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: { retired: ["opencode/old", "opencode/older"] },
+      },
+    });
+
+    await expect(
+      provider.invoke(
+        "run",
+        { task: "do not launch", model: "retired" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session.*opencode\/old, opencode\/older/);
+  });
+
+  it("rejects unavailable Pi models for handoff and actor creation", async () => {
+    const { provider, actors } = setup();
+    const deferHandoff = vi.fn(() => ({
+      scheduled: true as const,
+      status: "deferred" as const,
+      boundary: "fabric_exec_end" as const,
+    }));
+    const invocation = { ...modelContext(), deferHandoff };
+
+    await expect(
+      provider.invoke("handoff", { model: "opencode/ox-alpha" }, invocation),
+    ).rejects.toThrow(/not available to this Pi session/);
+    expect(deferHandoff).not.toHaveBeenCalled();
+    await expect(
+      provider.invoke(
+        "create",
+        { name: "hidden actor", instructions: "Do not create.", model: "opencode/ox-alpha" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session/);
+    expect(actors.list()).toEqual([]);
+  });
+
+  it("rejects unavailable actor setModel and activation overrides", async () => {
+    const { provider } = setup();
+    const actor = await provider.invoke(
+      "create",
+      {
+        name: "visible actor",
+        instructions: "Use only visible models.",
+        model: "google/gemini-2.5-flash",
+      },
+      modelContext(),
+    ) as FabricActorInfo;
+
+    await expect(
+      provider.invoke("setModel", { id: actor.id, model: "opencode/ox-alpha" }, modelContext()),
+    ).rejects.toThrow(/not available to this Pi session/);
+    await expect(
+      provider.invoke(
+        "ask",
+        { id: actor.id, message: "Do not run", model: "opencode/ox-alpha" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session/);
+    await expect(
+      provider.invoke(
+        "tell",
+        { id: actor.id, message: "Do not queue", model: "opencode/ox-alpha" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session/);
+  });
+
+  it("passes Claude and Veda model strings through unchanged", async () => {
     const { provider, agents } = setup();
     const spawn = vi.spyOn(agents, "spawn");
+
     await provider.invoke(
-      "run",
-      { task: "return a short result", model: "opencode/ox-alpha" },
+      "spawn",
+      { task: "Claude pass-through", runner: "claude", model: "private/claude-model" },
       modelContext(),
     );
-    expect(spawn).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "opencode/ox-alpha" }),
-      undefined,
+    await provider.invoke(
+      "spawn",
+      { task: "Veda pass-through", runner: "veda", model: "private/veda-model" },
+      modelContext(),
     );
+
+    expect(spawn.mock.calls[0]?.[0]).toMatchObject({
+      runner: "claude",
+      model: "private/claude-model",
+    });
+    expect(spawn.mock.calls[1]?.[0]).toMatchObject({
+      runner: "veda",
+      model: "private/veda-model",
+    });
   });
 
   it("rejects unknown selectors and exhausted alias chains", async () => {

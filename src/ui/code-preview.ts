@@ -2,7 +2,7 @@ type DiffBackgroundIntensity = "off" | "subtle" | "medium";
 type DiffWordEmphasis = "all" | "smart" | "off";
 type ToolCallBackgroundMode = "on" | "border" | "off";
 type PathIconMode = "unicode" | "nerd" | "off";
-type CodePreviewToolName = "bash" | "read" | "write" | "edit" | "grep" | "find" | "ls";
+type CodePreviewToolName = "bash" | "powershell" | "read" | "write" | "edit" | "grep" | "find" | "ls";
 
 export interface CodePreviewSettings {
   // Shiki theme preference: "auto" follows Pi's resolved light/dark variant,
@@ -75,7 +75,7 @@ export const resolveShikiTheme = (
   return variant === "light" ? parsed.lightTheme : parsed.darkTheme;
 };
 
-const TOOLS: CodePreviewToolName[] = ["bash", "read", "write", "edit", "grep", "find", "ls"];
+const TOOLS: CodePreviewToolName[] = ["bash", "powershell", "read", "write", "edit", "grep", "find", "ls"];
 const booleanEnv = (name: string, fallback: boolean): boolean => {
   const value = process.env[name]?.toLowerCase();
   if (value === "1" || value === "true" || value === "yes" || value === "on") return true;

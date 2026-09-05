@@ -8,13 +8,18 @@ import {
   createLsToolDefinition,
   createReadToolDefinition,
   type AgentToolResult,
+  type ExtensionContext,
   type ExtensionRunner,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
-import { PI_CORE_TOOL_NAMES, type PiCoreToolName } from "../core/pi-tools.js";
+import {
+  isPiShellToolName,
+  PI_CORE_TOOL_NAMES,
+  type PiCoreToolName,
+} from "../core/pi-tools.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
 import { expandSkillDirMarkersForRead } from "../core/skill-dir.js";
 import type {
@@ -30,14 +35,25 @@ import { CapturedToolsProvider } from "./captured-tools-provider.js";
 import {
   BashCwdDefinitions,
   PI_BASH_CWD_KEY,
-  resolveBashCwdArgument,
-  withBashCwdSchema,
+  PowerShellCwdDefinitions,
+  powerShellToolDefinitionFactory,
+  resolveShellCwdArgument,
+  type ShellDefinitionFactory,
+  withShellCwdSchema,
 } from "./pi-bash-cwd.js";
 import { writeContentForPreview } from "./write-diff-limits.js";
 import { createPreviewWriteToolDefinition } from "./write-preview.js";
 
 const MAX_RENDERER_ARGUMENT_CHARS = 200_000;
 const MAX_REPLACE_ALL_FILE_CHARS = 2_000_000;
+
+interface PiToolsProviderHostCapabilities {
+  powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
+}
+
+const DEFAULT_HOST_CAPABILITIES: PiToolsProviderHostCapabilities = {
+  powerShellToolDefinitionFactory,
+};
 
 const expandReplaceAllEdit = (
   cwd: string,
@@ -143,7 +159,7 @@ const normalizeResult = (
     return text;
   }
   let details = result.details;
-  if (name === "bash" && details && typeof details === "object" && !Array.isArray(details)) {
+  if (isPiShellToolName(name) && details && typeof details === "object" && !Array.isArray(details)) {
     const detailRecord = details as Record<string, unknown>;
     const truncation = detailRecord.truncation;
     if (truncation && typeof truncation === "object" && !Array.isArray(truncation)) {
@@ -176,21 +192,28 @@ interface PiToolResult {
 export class PiToolsProvider implements FabricProvider {
   readonly name = "pi";
   readonly description = "Pi's built-in coding tools";
-  readonly #tools: Record<PiCoreToolName, ToolDefinition<any, any, any>>;
+  readonly #tools: Partial<Record<PiCoreToolName, ToolDefinition<any, any, any>>>;
   readonly #catalog: CapturedToolCatalog | undefined;
   readonly #capturedTools: CapturedToolsProvider | undefined;
   readonly #cwd: string;
   readonly #bashDefinitions = new BashCwdDefinitions();
+  readonly #powershellDefinitions: PowerShellCwdDefinitions | undefined;
 
   constructor(
     cwd: string,
     catalog?: CapturedToolCatalog,
     capturedTools?: CapturedToolsProvider,
+    hostCapabilities: PiToolsProviderHostCapabilities = DEFAULT_HOST_CAPABILITIES,
   ) {
     this.#cwd = cwd;
+    const powerShellFactory = hostCapabilities.powerShellToolDefinitionFactory;
+    this.#powershellDefinitions = powerShellFactory
+      ? new PowerShellCwdDefinitions(powerShellFactory)
+      : undefined;
     this.#tools = {
       read: createReadToolDefinition(cwd),
       bash: createBashToolDefinition(cwd),
+      ...(powerShellFactory ? { powershell: powerShellFactory(cwd) } : {}),
       edit: createEditToolDefinition(cwd),
       write: createPreviewWriteToolDefinition(cwd),
       grep: createGrepToolDefinition(cwd),
@@ -220,11 +243,11 @@ export class PiToolsProvider implements FabricProvider {
     actionName: string,
     _context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    if (!(actionName in this.#tools)) return undefined;
     const name = actionName as PiCoreToolName;
+    const tool = this.#tools[name];
+    if (!tool) return undefined;
     const override = await this.#capturedTools?.describe(name, _context);
     if (override) return { ...override, namespace: "extension-override" };
-    const tool = this.#tools[name];
     return this.#descriptor(name, tool);
   }
 
@@ -232,17 +255,25 @@ export class PiToolsProvider implements FabricProvider {
     if (this.#catalog?.get(actionName)) {
       return this.#capturedTools!.prepareArguments(actionName, args);
     }
-    if (!(actionName in this.#tools)) return args;
+    const tool = this.#tools[actionName as PiCoreToolName];
+    if (!tool) return args;
     const input = actionName === "edit" && Object.hasOwn(args, "all")
       ? Object.fromEntries(Object.entries(args).filter(([key]) => key !== "all"))
       : args;
-    const prepare = this.#tools[actionName as PiCoreToolName].prepareArguments;
+    const prepare = tool.prepareArguments;
     const prepared = prepare ? prepare(input) : input;
     if (typeof prepared !== "object" || prepared === null || Array.isArray(prepared)) {
       throw new Error(`Pi tool ${actionName} prepared non-object arguments`);
     }
     const record = prepared as Record<string, unknown>;
-    if (actionName === "bash") return resolveBashCwdArgument(this.#cwd, record);
+    if (isPiShellToolName(actionName)) {
+      // pi 0.85 preparation strips schema-external keys. Preserve Fabric's
+      // advertised cwd before preparation, then validate and resolve it here.
+      const shellArgs = Object.hasOwn(args, PI_BASH_CWD_KEY)
+        ? { ...record, [PI_BASH_CWD_KEY]: args[PI_BASH_CWD_KEY] }
+        : record;
+      return resolveShellCwdArgument(actionName, this.#cwd, shellArgs);
+    }
     const hasPerEditAll = actionName === "edit"
       && Array.isArray(record.edits)
       && record.edits.some(
@@ -254,16 +285,32 @@ export class PiToolsProvider implements FabricProvider {
       : record;
   }
 
-  // The tool definition carrying this call's execution directory. Read-only:
-  // `cwd` stays in the arguments so events, approval, and previews see it, and
-  // pi's bash ignores the extra key.
+  // Keep a cwd-bound definition for pi <=0.84, while pi 0.85+ receives the
+  // same directory through ExtensionContext.cwd. `cwd` also stays in the
+  // arguments so lifecycle events, approval, and previews see it.
   #definitionFor(
     name: PiCoreToolName,
     args: Record<string, unknown>,
   ): ToolDefinition<any, any, any> {
-    if (name !== "bash") return this.#tools[name];
+    const tool = this.#tools[name];
+    if (!tool) throw new Error(`Unknown Pi tool: ${name}`);
+    if (!isPiShellToolName(name)) return tool;
     const cwd = args[PI_BASH_CWD_KEY];
-    return typeof cwd === "string" ? this.#bashDefinitions.get(cwd) : this.#tools.bash;
+    if (typeof cwd !== "string") return tool;
+    return name === "bash"
+      ? this.#bashDefinitions.get(cwd)
+      : this.#powershellDefinitions?.get(cwd) ?? tool;
+  }
+
+  #executionContextFor(
+    name: PiCoreToolName,
+    args: Record<string, unknown>,
+    context: ExtensionContext,
+  ): ExtensionContext {
+    const cwd = args[PI_BASH_CWD_KEY];
+    return isPiShellToolName(name) && typeof cwd === "string"
+      ? { ...context, cwd }
+      : context;
   }
 
   async invoke(
@@ -271,8 +318,8 @@ export class PiToolsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
-    if (!(actionName in this.#tools)) throw new Error(`Unknown Pi tool: ${actionName}`);
     const name = actionName as PiCoreToolName;
+    if (!this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
     if (name === "bash") {
       const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
       if (intercepted) {
@@ -302,11 +349,11 @@ export class PiToolsProvider implements FabricProvider {
           args,
           context.signal,
           (partialResult) => this.#attachPartialPreview(name, partialResult, args, context),
-          context.extensionContext,
+          this.#executionContextFor(name, args, context.extensionContext),
         ),
       ).catch((error) => {
         throwIfAborted(context.signal);
-        throw name === "bash" ? classifyPiBashError(error) : error;
+        throw isPiShellToolName(name) ? classifyPiBashError(error) : error;
       });
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
@@ -373,10 +420,10 @@ export class PiToolsProvider implements FabricProvider {
             )
             .catch(() => undefined);
         },
-        context.extensionContext,
+        this.#executionContextFor(name, args, context.extensionContext),
       ))) as PiToolResult;
     } catch (error) {
-      thrown = name === "bash" && executionStarted ? classifyPiBashError(error) : error;
+      thrown = isPiShellToolName(name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
       result = {
         content: [
@@ -426,7 +473,9 @@ export class PiToolsProvider implements FabricProvider {
     }));
 
     if (isError) {
-      if (name === "bash") throw piBashResultError(thrown, textContent(result.content));
+      if (isPiShellToolName(name)) {
+        throw piBashResultError(thrown, textContent(result.content));
+      }
       const text = textContent(result.content).trim();
       throw new Error(text || (thrown instanceof Error ? thrown.message : `Pi tool ${name} failed`));
     }
@@ -456,7 +505,7 @@ export class PiToolsProvider implements FabricProvider {
     const progress = textContent(partialResult.content).trim();
     const boundedProgress = Array.from(progress).slice(-4_000).join("");
     const bashCommand =
-      name === "bash" &&
+      isPiShellToolName(name) &&
       typeof args.command === "string" &&
       args.command.length <= MAX_RENDERER_ARGUMENT_CHARS
         ? args.command
@@ -481,7 +530,7 @@ export class PiToolsProvider implements FabricProvider {
         ? (details as Record<string, unknown>)
         : undefined;
     const bashCommand =
-      name === "bash" &&
+      isPiShellToolName(name) &&
       typeof args.command === "string" &&
       args.command.length <= MAX_RENDERER_ARGUMENT_CHARS
         ? args.command
@@ -570,7 +619,9 @@ export class PiToolsProvider implements FabricProvider {
     name: PiCoreToolName,
     tool: ToolDefinition<any, any, any>,
   ): FabricActionDescriptor {
-    const inputSchema = name === "bash" ? withBashCwdSchema(tool.parameters) : tool.parameters;
+    const inputSchema = isPiShellToolName(name)
+      ? withShellCwdSchema(tool.parameters)
+      : tool.parameters;
     return {
       name,
       description: tool.description,

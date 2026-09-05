@@ -38,6 +38,23 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     return manager.run({ task, transport: "process" });
   };
 
+  it("propagates the root Fabric session identity through the worker", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "fabric-session-env";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath,
+      piBinary,
+      runRoot: root,
+      fabricSessionId: "root-session",
+    });
+    managers.push(manager);
+
+    const result = await manager.run({ task: "report session", transport: "process" });
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("root-session");
+  });
+
   const cases: Array<{
     behavior: string;
     timeoutMs?: number;

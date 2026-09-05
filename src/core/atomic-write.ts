@@ -96,3 +96,59 @@ export const writeJsonAtomic = (
     JSON.stringify(value, null, space) + (options?.newline === true ? "\n" : "");
   writeFileAtomic(filePath, serialized, options);
 };
+
+const asyncSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const renameAtomicAsync = async (
+  source: string,
+  target: string,
+  options?: AtomicWriteOptions,
+): Promise<void> => {
+  const attempts = Math.max(1, options?.renameRetries ?? 8);
+  const delay = options?.renameRetryDelayMs ?? 25;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await fs.promises.rename(source, target);
+      return;
+    } catch (error) {
+      const code = errorCode(error);
+      if (attempt === attempts || code === undefined || !RETRYABLE_RENAME_CODES.has(code)) {
+        throw error;
+      }
+      await asyncSleep(delay * attempt);
+    }
+  }
+};
+
+const writeFileAtomicAsync = async (
+  filePath: string,
+  contents: string,
+  options?: AtomicWriteOptions,
+): Promise<void> => {
+  await fs.promises.mkdir(path.dirname(filePath), {
+    recursive: true,
+    mode: options?.dirMode ?? 0o700,
+  });
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.promises.writeFile(temporary, contents, {
+      encoding: "utf8",
+      mode: options?.mode ?? 0o600,
+    });
+    await renameAtomicAsync(temporary, filePath, options);
+  } finally {
+    await fs.promises.rm(temporary, { force: true });
+  }
+};
+
+export const writeJsonAtomicAsync = async (
+  filePath: string,
+  value: unknown,
+  options?: AtomicJsonOptions,
+): Promise<void> => {
+  const space = options?.space;
+  const serialized =
+    JSON.stringify(value, null, space) + (options?.newline === true ? "\n" : "");
+  await writeFileAtomicAsync(filePath, serialized, options);
+};

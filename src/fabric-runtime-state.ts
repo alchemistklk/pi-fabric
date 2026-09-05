@@ -1,11 +1,17 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import {
+  resolveAvailablePiModel,
+  type FabricModelCandidate,
+} from "./core/model-resolution.js";
+import { loadModelUsage } from "./core/model-usage.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
-import { ActorManager } from "./actors/manager.js";
+import { ActorDirectory } from "./actors/directory.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
+import { isPiShellRef } from "./core/pi-tools.js";
 import { GlobalActorRegistry } from "./actors/global-registry.js";
 import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
@@ -47,6 +53,16 @@ import { FabricSessionApprovals } from "./core/approval-controller.js";
 import { CompactController, type CompactLastCommit, type CompactPendingIntent } from "./core/compact-controller.js";
 import { FabricToolResultProxy } from "./core/tool-result-proxy.js";
 import { FabricExecutionService, type FabricExecutionResult } from "./execution-service.js";
+import { RepairCompiler } from "./repairs/compiler.js";
+import {
+  clearActiveRepairCompiler,
+  setActiveRepairCompiler,
+} from "./repairs/active.js";
+import { loadCompiledSurface } from "./entropy/compiled-store.js";
+import {
+  clearActiveCompiledSurface,
+  setActiveCompiledSurface,
+} from "./entropy/active.js";
 import {
   isSpeculationEligible,
   mcpAllowlistMatch,
@@ -145,10 +161,11 @@ export class FabricRuntimeState {
   #mcpProvider: McpProvider | undefined;
   #config: FabricConfig | undefined;
   #execution: FabricExecutionService | undefined;
+  #repairs: RepairCompiler | undefined;
   #speculationStore: FabricSpeculationStore | undefined;
   #speculationTap: FabricSpeculationStreamTap | undefined;
   #agents: AgentManager | undefined;
-  #actors: ActorManager | undefined;
+  #actors: ActorDirectory | undefined;
   #globalActors: GlobalActorRegistry | undefined;
   #mesh: MeshStore | undefined;
   #identity: MeshIdentity | undefined;
@@ -286,6 +303,9 @@ export class FabricRuntimeState {
       nestedToolCallId: "fabric-speculation",
       extensionContext: context,
       update() {},
+      ...(this.#sessionCapabilityLease?.view
+        ? { capabilityView: this.#sessionCapabilityLease.view }
+        : {}),
     };
     const speculation = await registry.speculate(
       candidate.ref,
@@ -301,6 +321,7 @@ export class FabricRuntimeState {
       speculation.execute,
       createFreshnessChecker(candidate.ref, speculation.preparedArgs, context.cwd),
       replay,
+      speculation.bindingToken,
     );
   }
 
@@ -324,7 +345,7 @@ export class FabricRuntimeState {
     return this.#agents;
   }
 
-  get actors(): ActorManager {
+  get actors(): ActorDirectory {
     if (!this.#actors) throw new Error("Pi Fabric has not initialized");
     return this.#actors;
   }
@@ -384,6 +405,11 @@ export class FabricRuntimeState {
     return this.#compact;
   }
 
+  get repairs(): RepairCompiler {
+    if (!this.#repairs) throw new Error("Pi Fabric has not initialized");
+    return this.#repairs;
+  }
+
   async initialize(context: ExtensionContext, bootstrapConfig?: FabricConfig): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
     try {
@@ -413,9 +439,11 @@ export class FabricRuntimeState {
       new FabricToolResultProxy(() => this.capturedTools.runner),
     );
     this.#wireSpeculation();
-    this.#unsubscribeCapturedCatalog = this.capturedTools.subscribe(() =>
-      this.#registry?.notifyCatalogChanged("extensions"),
-    );
+    this.#unsubscribeCapturedCatalog?.();
+    this.#unsubscribeCapturedCatalog = this.capturedTools.subscribe(() => {
+      this.#registry?.notifyCatalogChanged("extensions");
+      this.#refreshRepairCatalog();
+    });
     this.#componentSupervisor = new FabricComponentSupervisor(this.#registry, {
       invocationContext: () => ({
         cwd: context.cwd,
@@ -515,6 +543,7 @@ export class FabricRuntimeState {
     }
     const sessionId = context.sessionManager.getSessionId();
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
+    const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const ownsPersistentActorRegistry =
       identity.kind === "main" &&
       !enforceSchema &&
@@ -601,9 +630,55 @@ export class FabricRuntimeState {
     const agentConfig = enforceSchema
       ? { ...this.#config.agents, enabled: false }
       : this.#config.agents;
+    const modelsConfig = this.#config.models;
+    const visiblePiModels = () => {
+      try {
+        return context.modelRegistry.getAvailable();
+      } catch {
+        return [];
+      }
+    };
+    const piModelState = (models = visiblePiModels()) => {
+      const available: FabricModelCandidate[] = models.map((model) => ({
+        provider: String(model.provider),
+        id: String(model.id),
+        ...(typeof model.name === "string" ? { name: model.name } : {}),
+      }));
+      const defaultModel = context.model
+        ? `${context.model.provider}/${context.model.id}`
+        : undefined;
+      return {
+        available,
+        aliases: structuredClone(modelsConfig.aliases),
+        ...(defaultModel ? { defaultModel } : {}),
+      };
+    };
+    const resolveParticipantPiModel = (selector?: string) => {
+      const models = visiblePiModels();
+      const state = piModelState(models);
+      const query = selector?.trim() || state.defaultModel || "";
+      const resolved = resolveAvailablePiModel(query, {
+        aliases: state.aliases,
+        available: state.available,
+        lastUsed: loadModelUsage(),
+      });
+      const model = models.find(
+        (candidate) =>
+          String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
+          String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
+      );
+      if (!model) {
+        throw new Error(
+          `Model ${JSON.stringify(query)} is not available to this Pi session. ` +
+            'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
+        );
+      }
+      return { key: `${resolved.provider}/${resolved.id}`, model };
+    };
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
       mainAgentId,
+      fabricSessionId,
       meshRoot,
       projectRoot,
       hostId,
@@ -627,15 +702,10 @@ export class FabricRuntimeState {
         }).appendText || undefined;
       },
       preparePiModel: async (modelKey) => {
-        const separator = modelKey.indexOf("/");
-        if (separator <= 0 || separator === modelKey.length - 1) return;
-        const model = context.modelRegistry.find(
-          modelKey.slice(0, separator),
-          modelKey.slice(separator + 1),
-        );
-        if (!model) return;
-        const auth = await context.modelRegistry.getApiKeyAndHeaders(model);
+        const resolved = resolveParticipantPiModel(modelKey);
+        const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
+        return resolved.key;
       },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
@@ -669,10 +739,10 @@ export class FabricRuntimeState {
     };
     const lineageAlive = (rootId: string): boolean =>
       this.#participants?.get(rootId) !== undefined;
-    const persistentActorRoot =
-      this.#config.mesh.actorScope === "session"
-        ? path.join(meshRoot, "actors", sessionId)
-        : path.join(meshRoot, "actors");
+    const actorRoots = {
+      project: path.join(meshRoot, "actors"),
+      session: path.join(meshRoot, "actors", fabricSessionId),
+    };
     const acquireActorCapabilityView = (
       requirements: Parameters<ActionRegistry["acquireCapabilityView"]>[0],
       signal: AbortSignal,
@@ -684,8 +754,8 @@ export class FabricRuntimeState {
       extensionContext: context,
       update() {},
     });
-    this.#actors = new ActorManager(
-      sessionId,
+    this.#actors = new ActorDirectory([
+      fabricSessionId,
       identity,
       this.#mesh,
       enforceSchema ? { ...this.#config.mesh, enabled: false } : this.#config.mesh,
@@ -715,7 +785,6 @@ export class FabricRuntimeState {
       },
       ownsPersistentActorRegistry
         ? {
-            actorRoot: persistentActorRoot,
             persistent: true,
             mainAgent,
             canManageActor,
@@ -723,6 +792,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             retention: this.#config.retention,
+            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
           }
         : {
@@ -733,10 +803,14 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             retention: this.#config.retention,
+            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
-    );
-    this.#registry.subscribeProviderChanges(() => this.#actors?.retryCapabilityWaiters());
+    ], actorRoots, this.#config.mesh.actorScope);
+    this.#registry.subscribeProviderChanges(() => {
+      this.#actors?.retryCapabilityWaiters();
+      this.#refreshRepairCatalog();
+    });
     this.#lifecycle = new LifecycleBroker(
       this.#mesh,
       identity,
@@ -761,7 +835,8 @@ export class FabricRuntimeState {
             cwd: context.cwd,
             projectRoot,
             meshRoot,
-            actorRoot: persistentActorRoot,
+            actorRoot: actorRoots.project,
+            sessionActorRoot: actorRoots.session,
             residencyRoot: residentRoot(meshRoot, mainAgentId),
             fullCodeMode: this.#config.fullCodeMode,
             agents: structuredClone(this.#config.agents),
@@ -774,11 +849,13 @@ export class FabricRuntimeState {
               process.env.PI_FABRIC_CLAUDE_BINARY ?? this.#config.agents.claude.binary,
             vedaBinary:
               process.env.PI_FABRIC_VEDA_BINARY ?? this.#config.agents.veda.binary,
+            piModels: piModelState(),
             modelGuidance: [],
           },
           mesh: this.#mesh,
           participants: this.#participants,
           mainAgent,
+          piModelState,
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;
@@ -929,6 +1006,22 @@ export class FabricRuntimeState {
       this.#sessionCapabilityLease = lease;
       this.#execution.setCapabilityView(lease.view);
     }
+    this.#repairs = new RepairCompiler({
+      agentDir: resolveAgentDir(),
+      enabled: this.#config.repairs.enabled,
+    });
+    // Commit the stable catalog surface before promotion can reach the
+    // active compiler: an active compiler whose surface has not been
+    // committed yet must never persist under a mid-reconcile catalog.
+    this.#refreshRepairCatalog();
+    setActiveRepairCompiler(this.#repairs);
+    // The compiled entropy surface loads beside the repair table: every
+    // enforcement consult re-proves the recorded base digest against the
+    // live declared schema, so the overlay follows the live surface. A
+    // damaged artifact keeps enforcement off and surfaces in /fabric entropy.
+    setActiveCompiledSurface(
+      this.#config.entropy.compile ? loadCompiledSurface(resolveAgentDir()).file : undefined,
+    );
   }
 
   async ensure(context: ExtensionContext): Promise<void> {
@@ -995,7 +1088,7 @@ export class FabricRuntimeState {
   }
 
   // Filesystem fallback for writes audits cannot attribute (shell heredocs,
-  // sed -i, formatter binaries). Gated on a successful pi.bash in the program
+  // sed -i, formatter binaries). Gated on a successful Pi shell call in the program
   // so read-only scans never pay the stat walk, and external saves can only
   // mis-fire inside a bash-running window. The tracker refreshes its baseline
   // on every evaluation, claimed or not, so one change never fires twice.
@@ -1005,7 +1098,7 @@ export class FabricRuntimeState {
     resultFormat: FabricResultFormat,
   ): Promise<PendingFabricHandoff | undefined> {
     if (!this.prewalk.isArmed(sessionId) || !this.#cwd) return undefined;
-    if (!execution.audits.some((audit) => audit.ref === "pi.bash" && audit.success === true)) {
+    if (!execution.audits.some((audit) => isPiShellRef(audit.ref) && audit.success === true)) {
       return undefined;
     }
     const drift = await this.prewalkDrift.evaluate(sessionId, this.#cwd);
@@ -1197,6 +1290,8 @@ export class FabricRuntimeState {
 
   async shutdown(): Promise<void> {
     this.#suppressResidentGuidanceSync = true;
+    await this.#deactivateRepairs();
+    clearActiveCompiledSurface();
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();
     await Promise.allSettled([...this.#componentTransitionPublications]);
@@ -1264,7 +1359,29 @@ export class FabricRuntimeState {
     }
   }
 
+  #refreshRepairCatalog(): void {
+    if (!this.#repairs || !this.#registry) return;
+    // Capture suspension (session_start, /fabric reload) clears the catalog
+    // only transiently: the same tools refill on re-arm, so recomputing here
+    // would flip the digest to an empty-catalog value that promotion could
+    // then persist, destroying the stable catalog's table. Freeze the surface
+    // instead; the refill re-commits it (or legitimately starts a new one).
+    if (this.capturedTools.suspended) return;
+    this.#repairs.setCatalogSurface({
+      providers: this.#registry.providers().map((provider) => provider.name),
+      capturedTools: this.capturedTools.list().map((entry) => entry.name),
+    });
+  }
+
+  async #deactivateRepairs(): Promise<void> {
+    const repairs = this.#repairs;
+    this.#repairs = undefined;
+    clearActiveRepairCompiler(repairs);
+    await repairs?.flush();
+  }
+
   async #closeInternal(): Promise<void> {
+    await this.#deactivateRepairs();
     if (!this.#registry) return;
     await this.#participants?.quiesce().catch(() => undefined);
     await this.#componentLoader?.close();

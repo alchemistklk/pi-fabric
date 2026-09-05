@@ -54,9 +54,9 @@ export const wrapRegisteredToolForCapture = (
   const execute = tool.execute;
   return {
     ...tool,
-    execute: async (toolCallId, params, signal, onUpdate): Promise<any> => {
+    execute: async (toolCallId, params, signal, onUpdate, ctx): Promise<any> => {
       const activeBefore = runner.getActiveTools();
-      const result = await execute(toolCallId, params, signal, onUpdate);
+      const result = await execute(toolCallId, params, signal, onUpdate, ctx);
       const activeAfter = runner.getActiveTools();
       if (!activeBefore.every((name) => activeAfter.includes(name))) {
         return result;

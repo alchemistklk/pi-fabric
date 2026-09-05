@@ -426,6 +426,26 @@ describe("Fabric configuration", () => {
     ).toBe(7);
   });
 
+  it("enables catalog repairs by default and accepts an explicit disable", () => {
+    expect(DEFAULT_FABRIC_CONFIG.repairs).toEqual({ enabled: true });
+    expect(normalizeFabricConfig({ repairs: { enabled: false } }).repairs).toEqual({
+      enabled: false,
+    });
+    expect(normalizeFabricConfig({ repairs: { enabled: "no" } }).repairs).toEqual({
+      enabled: true,
+    });
+  });
+
+  it("enables entropy compilation by default and accepts an explicit disable", () => {
+    expect(DEFAULT_FABRIC_CONFIG.entropy).toEqual({ compile: true });
+    expect(normalizeFabricConfig({ entropy: { compile: false } }).entropy).toEqual({
+      compile: false,
+    });
+    expect(normalizeFabricConfig({ entropy: { compile: "no" } }).entropy).toEqual({
+      compile: true,
+    });
+  });
+
   it("normalizes strict Schema mode, transaction bounds, and trusted command definitions", () => {
     const config = normalizeFabricConfig({
       schema: {
@@ -528,6 +548,27 @@ describe("Fabric configuration", () => {
     expect(loadFabricConfigForScope(location, "project").agents.transport).toBe("localterm");
   });
 
+  it("keeps environment overrides out of persisted scope views", () => {
+    const root = temporaryDirectory();
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, "fabric.json"),
+      JSON.stringify({ fullCodeMode: true }),
+    );
+    const inherited = process.env.PI_FABRIC_FULL_CODE_MODE;
+    process.env.PI_FABRIC_FULL_CODE_MODE = "false";
+    try {
+      const location = { cwd, agentDir, projectTrusted: false };
+      expect(loadFabricConfigForScope(location, "global").fullCodeMode).toBe(true);
+      expect(loadFabricConfig(location).fullCodeMode).toBe(false);
+    } finally {
+      if (inherited === undefined) delete process.env.PI_FABRIC_FULL_CODE_MODE;
+      else process.env.PI_FABRIC_FULL_CODE_MODE = inherited;
+    }
+  });
+
   it("updates the compaction engine environment across config re-initialization", () => {
     const root = temporaryDirectory();
     const cwd = path.join(root, "project");
@@ -599,7 +640,7 @@ describe("Fabric configuration", () => {
     expect(result.path).toBe(path.join(cwd, ".pi", "fabric.json"));
     const saved = JSON.parse(fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"));
     expect(saved).toEqual({
-      configVersion: 3,
+      configVersion: 4,
       agents: { transport: "localterm", maxConcurrent: 8 },
       fullCodeMode: false,
     });
@@ -625,7 +666,7 @@ describe("Fabric configuration", () => {
 
     expect(result).toEqual({ scope: "global", path: path.join(agentDir, "fabric.json") });
     expect(JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"))).toEqual({
-      configVersion: 3,
+      configVersion: 4,
       executor: { timeoutMs: 45_000 },
     });
     expect(JSON.parse(fs.readFileSync(projectPath, "utf8"))).toEqual({ fullCodeMode: false });
@@ -638,7 +679,7 @@ describe("Fabric configuration", () => {
     fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
     fs.mkdirSync(agentDir, { recursive: true });
     const globalPath = path.join(agentDir, "fabric.json");
-    const future = { configVersion: 4, futureSection: { enabled: true } };
+    const future = { configVersion: 5, futureSection: { enabled: true } };
     fs.writeFileSync(globalPath, JSON.stringify(future));
 
     // Load path: forward-compatible docs are accepted as-is and never rewritten.
@@ -671,7 +712,7 @@ describe("Fabric configuration", () => {
     expect(result.path).toBe(path.join(agentDir, "fabric.json"));
     expect(fs.existsSync(path.join(cwd, ".pi", "fabric.json"))).toBe(false);
     const saved = JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"));
-    expect(saved).toEqual({ configVersion: 3, executor: { timeoutMs: 30_000 } });
+    expect(saved).toEqual({ configVersion: 4, executor: { timeoutMs: 30_000 } });
   });
 
   it("rejects explicit project saves for untrusted projects", () => {
