@@ -160,7 +160,7 @@ describe("validate-rejected attempts", () => {
 });
 
 describe("entropyValueObservationsFromSessionJsonl", () => {
-  it("extracts verbatim audit values for value-dropped params and surfaces declare-enum", () => {
+  it("extracts verbatim audit values for an explicitly marked enum candidate", () => {
     const formats = ["pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "pdf", "html"];
     const envelope: FabricExecutionTraceV1 = {
       kind: "pi-fabric.execution",
@@ -199,11 +199,27 @@ describe("entropyValueObservationsFromSessionJsonl", () => {
       key: "format",
       value: "pdf",
     });
-    const report = measureEntropy({ traces });
-    expect(proposeEntropyReductions({ report, traces })).toEqual([]);
+    const surface = {
+      version: 1 as const,
+      actions: [
+        {
+          ref: "mcp.report.render",
+          inputSchema: {
+            type: "object",
+            properties: {
+              format: { type: "string", "x-fabric-enum-candidate": true },
+            },
+            additionalProperties: false,
+          },
+        },
+      ],
+    };
+    const report = measureEntropy({ traces, surface });
+    expect(proposeEntropyReductions({ report, traces, surface })).toEqual([]);
     const proposals = proposeEntropyReductions({
       report,
       traces,
+      surface,
       valueObservations: observations,
     });
     expect(proposals).toHaveLength(1);

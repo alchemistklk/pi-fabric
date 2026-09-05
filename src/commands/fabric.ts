@@ -42,7 +42,10 @@ import {
   parseCompiledSurfaceArtifact,
   saveCompiledSurfaceAsync,
 } from "../entropy/compiled-store.js";
-import { formatEntropyMetric } from "../entropy/presentation.js";
+import {
+  formatEntropyCommandHints,
+  formatEntropyMetric,
+} from "../entropy/presentation.js";
 import { mergeCompiledSurfaces } from "../entropy/compiled-surface.js";
 import { setActiveCompiledSurface } from "../entropy/active.js";
 import fs from "node:fs";
@@ -1085,15 +1088,13 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
           context.ui.notify(
             [
               `entropy: metric v${ENTROPY_METRIC_VERSION} · surface ${surfaceDigest.slice(0, 12)} · ${freedom.actions.length} actions`,
-              `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · repair rows ${status.repairCount} · apply hits ${status.applyHits}`,
+              `live: invocation errors ${status.invocationErrors} · effect dropped ${status.effectDropped} · aliases ${status.repairCount} · alias hits ${status.applyHits}`,
               compiledLine,
               reviewLine,
               `surface freedom (potential): mean ${formatFreedom(freedom.mean)}${worst ? ` · worst ${worst}` : ""}`,
               sessionsLine,
               ...(modelsLine ? [modelsLine] : []),
-              "export: /fabric entropy export [path]          # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
-              "share: /fabric entropy export-artifact [path]     # write the compiled artifact (default <agent dir>/fabric/entropy/artifact.json)",
-              "merge: /fabric entropy import <path>             # merge a peer artifact (digest-proven entries only)",
+              ...formatEntropyCommandHints(),
             ].join("\n"),
             "info",
           );

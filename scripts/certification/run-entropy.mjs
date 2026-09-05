@@ -189,17 +189,25 @@ const ratchetRepairs = () => [
 const structureTraces = () => [
   trace(
     [
-      op("pi.read", { path: "a" }),
-      op("pi.grep", { path: "." }),
-      op("pi.edit", { path: "a" }),
+      op("memory.recall", { query: "a" }),
+      op("memory.expand", { session: "a" }),
+      op("state.get", { key: "a" }),
     ],
     "loop",
   ),
   trace(
     [
-      op("pi.read", { path: "b" }),
-      op("pi.grep", { path: "." }),
-      op("pi.edit", { path: "b" }),
+      op("memory.recall", { query: "b" }),
+      op("memory.expand", { session: "b" }),
+      op("state.get", { key: "b" }),
+    ],
+    "loop",
+  ),
+  trace(
+    [
+      op("memory.recall", { query: "c" }),
+      op("memory.expand", { session: "c" }),
+      op("state.get", { key: "c" }),
     ],
     "loop",
   ),
@@ -389,9 +397,8 @@ export const runEntropyCertification = async (options = {}) => {
   const kinds = proposals.map((proposal) => proposal.kind);
   check(
     "ratchet-proposals",
-    kinds.length === 3 &&
+    kinds.length === 2 &&
       kinds.filter((kind) => kind === "enum-tighten").length === 1 &&
-      kinds.filter((kind) => kind === "modal-rename").length === 1 &&
       kinds.filter((kind) => kind === "noise-quarantine").length === 1,
     `kinds ${kinds.join(",")}`,
   );
@@ -403,35 +410,25 @@ export const runEntropyCertification = async (options = {}) => {
     JSON.stringify(originalSurface) === originalJson,
     "applyProposalsToSurface mutated its input",
   );
-  const retiredRows = ratchetRepairs().filter(
-    (row) =>
-      !proposals.some(
-        (proposal) =>
-          proposal.kind === "modal-rename" &&
-          proposal.level === "key" &&
-          proposal.ref === row.ref &&
-          proposal.from === row.from,
-      ),
-  );
   const after = measureEntropy({
     traces: ratchetTraces(),
     surface: compiledSurface,
-    repairs: retiredRows,
+    repairs: ratchetRepairs(),
   });
   const gate = evaluateGate(before, after);
   check(
     "ratchet-monotone",
     gate.passed &&
       before.score === 0.323019 &&
-      after.score === 0.179789 &&
-      gate.delta === -0.14323,
+      after.score === 0.304789 &&
+      gate.delta === -0.01823,
     `score ${before.score} → ${after.score} delta ${gate.delta} reasons ${gate.reasons.join("; ")}`,
   );
   const roundTwo = proposeEntropyReductions({
     report: after,
     traces: ratchetTraces(),
     surface: compiledSurface,
-    repairs: retiredRows,
+    repairs: ratchetRepairs(),
   });
   check(
     "ratchet-converged",
@@ -441,9 +438,7 @@ export const runEntropyCertification = async (options = {}) => {
 
   // The autonomous compile loop: measure → propose → apply the mechanical
   // subset → re-measure → gate, then converge on the compiled artifact.
-  // Modal-rename is surfaced but never applied here: a pure rename drops
-  // the declared key every successful call recorded, so it cannot pass the
-  // replay gate as a schema rewrite.
+  // Repair rows remain guarded aliases and do not become surface rewrites.
   const compileInput = () => ({
     traces: ratchetTraces(),
     surface: ratchetSurface(),
@@ -480,7 +475,7 @@ export const runEntropyCertification = async (options = {}) => {
     "compiler-converged",
     recompiled.status === "converged" &&
       recompiled.artifact === compiledOutcome.artifact &&
-      recompiled.proposals.every((proposal) => proposal.kind === "modal-rename"),
+      recompiled.proposals.length === 0,
     `status ${recompiled.status} proposals ${recompiled.proposals.map((p) => p.kind).join(",")}`,
   );
   check(
@@ -565,9 +560,9 @@ export const runEntropyCertification = async (options = {}) => {
   check(
     "structure-proposals",
     Boolean(fuse) &&
-      fuse.occurrences === 2 &&
+      fuse.occurrences === 3 &&
       JSON.stringify(fuse.sequence) ===
-        JSON.stringify(["pi.read", "pi.grep", "pi.edit"]) &&
+        JSON.stringify(["memory.recall", "memory.expand", "state.get"]) &&
       Boolean(split) &&
       split.clusters.length === 2 &&
       JSON.stringify(split.clusters.map((cluster) => cluster.keys)) ===
@@ -620,13 +615,28 @@ export const runEntropyCertification = async (options = {}) => {
   const renderObservations = valueObservations.filter(
     (observation) => observation.ref === "mcp.report.render",
   );
+  const auditSurface = surfaceOf([
+    {
+      ref: "mcp.report.render",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: { type: "string", "x-fabric-enum-candidate": true },
+        },
+        additionalProperties: false,
+      },
+    },
+  ]);
+  const auditReport = measureEntropy({ traces: ingestedTraces, surface: auditSurface });
   const fromTraces = proposeEntropyReductions({
-    report: ingestionReport,
+    report: auditReport,
     traces: ingestedTraces,
+    surface: auditSurface,
   });
   const fromAudits = proposeEntropyReductions({
-    report: ingestionReport,
+    report: auditReport,
     traces: ingestedTraces,
+    surface: auditSurface,
     valueObservations,
   });
   const auditProposal = fromAudits.find((proposal) => proposal.kind === "declare-enum");
@@ -644,10 +654,8 @@ export const runEntropyCertification = async (options = {}) => {
     `observations ${valueObservations.length} renders ${renderObservations.length}`,
   );
 
-  // Closed-domain guard: a stable vocabulary on a free parameter never
-  // auto-applies. The compile converges and the evidence surfaces as a
-  // declare-enum review signal for the surface author, because inventing a
-  // domain the schema never claimed is sharpening the wrong entropy.
+  // Open-domain guard: a stable vocabulary on an unannotated free parameter
+  // proves neither a closed domain nor an enum declaration candidate.
   const guardSurface = () =>
     surfaceOf([
       {
@@ -673,16 +681,11 @@ export const runEntropyCertification = async (options = {}) => {
     traces: guardTraces,
     surface: guardSurface(),
   });
-  const guardSignal = guardOutcome.proposals.find((proposal) => proposal.kind === "declare-enum");
   check(
     "closed-domain-guard",
     guardOutcome.status === "converged" &&
       guardOutcome.artifact === undefined &&
-      Boolean(guardSignal) &&
-      guardSignal.ref === "mcp.report.render" &&
-      guardSignal.key === "format" &&
-      JSON.stringify(guardSignal.values) === JSON.stringify(["pdf", "html"]) &&
-      !guardOutcome.proposals.some((proposal) => proposal.kind === "enum-tighten"),
+      guardOutcome.proposals.length === 0,
     `status ${guardOutcome.status} proposals ${guardOutcome.proposals.map((p) => p.kind).join(",")}`,
   );
 

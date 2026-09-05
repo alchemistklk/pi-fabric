@@ -90,8 +90,8 @@ global report only.
   invocation fingerprints → 0).
 - **Surface share shrinks by compilation, never by behavior.** It is the
   priced potential of the refs the corpus used. It falls only when
-  a compiled surface (enum-tighten, renames, splits, quarantines) removes
-  real freedom; track it across surface releases, bounded by function.
+  a compiled surface (enum tightening, splits, or quarantines) removes real
+  freedom; track it across surface releases, bounded by function.
 - **Slope ≤ 0.** The per-session least-squares slope is the ratchet line:
   flat means the surface converged, negative means it is compiling down,
   positive means something regressed (a new model, a new tool, or a schema
@@ -128,32 +128,37 @@ reviewable, evidence-carrying proposals with fixed thresholds:
   while the overlay holds, and the reset re-derives with it included, so a
   refused in-domain value un-locks at the first drift and survives in the
   corpus.
-- `declare-enum`: the same observation shape on an open parameter (a free
-  string or number, an undeclared key, or a ref absent from the surface
-  entirely) is evidence about the author's domain, not the compiler's to
-  enforce. It surfaces as a review signal naming the observed vocabulary:
-  once the author declares the enum, later compiles tighten beneath it
-  automatically. The auto loop never applies it. The first declaration
-  from this pipeline is `memory.recall.role`, which now enumerates the
-  session normalizer's entry roles, so the compiler tightens it to the
-  roles models filter by.
-- `modal-rename`: a repair row whose target ref is called: compile the
-  modal spilled spelling into the schema (rename the declared key or
-  action) and retire the row. Skipped when the rename is already compiled
-  in. Renamed keys retire their repair rows because the spilled spelling
-  becomes canonical, so the row can no longer fire.
+- `declare-enum`: observations over an open parameter do not establish a
+  finite domain. A schema author must first mark a declared property with
+  `"x-fabric-enum-candidate": true`; only then does the same ≥ 8 observation,
+  2–8 value, and ≥ 50% top-share evidence surface a review signal naming the
+  observed vocabulary. Ordinary free strings, numeric ranges, undeclared
+  keys, and refs absent from the surface produce no enum suggestion. Once
+  the author replaces the annotation with a declared enum, later compiles
+  can tighten beneath it automatically. The auto loop never applies an enum
+  declaration.
+
 - `overload-split`: a ref with ≥ 1.0 bits of shape entropy and ≥ 2 disjoint
   key-set clusters with ≥ 2 calls each splits into separate actions.
-- `sequence-fuse`: a contiguous action sequence of 3–6 refs with ≥ 2
-  distinct refs that occurs ≥ 2 times fuses into a composite action or
-  skill.
+- `sequence-fuse`: a contiguous sequence of 3–6 successful high-level
+  action refs, all distinct, that recurs in at least three independent
+  `fabric_exec` executions can become a composite action or skill. Core
+  `pi.*` primitives are excluded because they are implementation steps to
+  batch, not domain actions to fuse; failed and excluded operations break
+  contiguity.
 - `noise-quarantine`: a ref with ≥ 3 calls, more failures than successes,
   and ≥ 1.0 bits of failure-stage entropy hides from the model-facing
   catalog.
 
-`applyProposalsToSurface` applies the mechanical subset (enum-tighten,
-noise-quarantine, modal-rename) as a pure surface rewrite. Overload-split and
-sequence-fuse author new composite definitions, so they stay review-only.
+Repair rows do not produce proposals. They are already guarded compatibility
+aliases from a spilled key or action spelling to its canonical declaration.
+An alias hit proves the compatibility map is useful, not that the alias should
+replace the canonical public name. `/fabric repairs` shows the mappings and
+`/fabric entropy` reports their count and hits separately.
+
+`applyProposalsToSurface` applies the mechanical subset (enum-tighten and
+noise-quarantine) as a pure surface rewrite. Declare-enum, overload-split, and
+sequence-fuse stay review-only.
 
 ## The gate (ratchet)
 
@@ -173,14 +178,13 @@ certification proves by requiring an empty second round.
 
 The autonomous loop applies only the mechanically safe kinds
 (`enum-tighten` and `noise-quarantine`), and only beneath a domain the
-declared schema already bounds. `overload-split` and `sequence-fuse`
-author new composite definitions, `declare-enum` suggests a domain the
-schema has not claimed, and a pure `modal-rename` drops the declared key
-that every successful call recorded, so all of them stay surfaced for
-review and never auto-apply. Review notifications describe the suggestions in
-plain language and emit each distinct suggestion set once per session. Evidence
+declared schema already bounds. `overload-split` and `sequence-fuse` author
+new composite definitions, while `declare-enum` requires explicit author
+intent, so all three stay surfaced for review and never auto-apply. Review
+notifications describe the suggestions in plain language and emit each
+distinct suggestion set once per session. Evidence
 counts changing underneath the same suggestion do not repeat it; a changed
-vocabulary, split, sequence, or rename does.
+vocabulary, split, or sequence does.
 
 ## The compile loop
 
@@ -295,12 +299,14 @@ project's window), measured against the effective surface (live plus
 the compiled overlay), and the trend is the per-session slope; the display
 carries a `compiled:` line with the artifact's applied proposals and last
 gate outcome, and a `review:` line listing the signals the compiler declined
-to apply (declare-enum vocabularies, overload splits, sequence fusions,
-modal renames), derived read-only from the current window and the
-observation pool. Gate rejections are silent by design: the ratchet kept the
-old surface, and the display shows the compiled state on demand. `/fabric entropy export [path]` snapshots the live
-registry through the discovery path (read-only, authorization-free), defaulting
-to `<agent dir>/fabric/entropy/surface.json` beside the repair table, as
+to apply (opted-in enum vocabularies, overload splits, and high-level
+sequence fusions), derived read-only from the current window and the
+observation pool. Repair rows appear separately as aliases; they are already
+active compatibility mappings and are not review suggestions. Gate rejections
+are silent by design: the ratchet kept the old surface, and the display shows
+the compiled state on demand. `/fabric entropy export [path]` snapshots the
+live registry through the discovery path (read-only, authorization-free),
+defaulting to `<agent dir>/fabric/entropy/surface.json` beside the repair table, as
 `{ version: 1, actions: [{ ref, inputSchema }] }`, sorted by ref so it
 hashes stably. Pass an exported snapshot with `--surface` to measure a
 copied corpus against the surface it ran on; the report then carries the

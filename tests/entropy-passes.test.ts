@@ -146,23 +146,13 @@ const compiledRatchet = () => {
     repairs: ratchetRepairs(),
   });
   const compiled = applyProposalsToSurface(ratchetSurface(), proposals);
-  const retired = ratchetRepairs().filter(
-    (row) =>
-      !proposals.some(
-        (proposal) =>
-          proposal.kind === "modal-rename" &&
-          proposal.level === "key" &&
-          proposal.ref === row.ref &&
-          proposal.from === row.from,
-      ),
-  );
-  return { before, proposals, compiled, retired };
+  return { before, proposals, compiled };
 };
 
 describe("proposeEntropyReductions", () => {
-  it("proposes enum-tighten, modal-rename, and noise-quarantine for the ratchet corpus", () => {
+  it("proposes only mechanically supported reductions for the ratchet corpus", () => {
     const { proposals } = compiledRatchet();
-    expect(proposals).toHaveLength(3);
+    expect(proposals).toHaveLength(2);
     expect(proposals.find((proposal) => proposal.kind === "enum-tighten")).toMatchObject({
       ref: "mcp.report.render",
       key: "format",
@@ -170,14 +160,6 @@ describe("proposeEntropyReductions", () => {
       calls: 8,
       distinct: 2,
       topShare: 0.875,
-    });
-    expect(
-      proposals.find((proposal) => proposal.kind === "modal-rename"),
-    ).toMatchObject({
-      level: "key",
-      ref: "memory.expand",
-      from: "sessionId",
-      to: "session",
     });
     expect(
       proposals.find((proposal) => proposal.kind === "noise-quarantine"),
@@ -190,19 +172,19 @@ describe("proposeEntropyReductions", () => {
     });
   });
 
-  it("converges: a compiled surface stops re-proposing", () => {
-    const { compiled, retired } = compiledRatchet();
+  it("converges while retaining repair rows as compatibility aliases", () => {
+    const { compiled } = compiledRatchet();
     const after = measureEntropy({
       traces: ratchetTraces(),
       surface: compiled,
-      repairs: retired,
+      repairs: ratchetRepairs(),
     });
     expect(
       proposeEntropyReductions({
         report: after,
         traces: ratchetTraces(),
         surface: compiled,
-        repairs: retired,
+        repairs: ratchetRepairs(),
       }),
     ).toEqual([]);
   });
@@ -312,7 +294,7 @@ describe("proposeEntropyReductions", () => {
         traces,
         valueObservations,
       }),
-    ).toEqual([expect.objectContaining({ kind: "declare-enum" })]);
+    ).toEqual([]);
   });
 
   it("applies proposals without mutating the input surface", () => {
@@ -345,23 +327,20 @@ describe("proposeEntropyReductions", () => {
       properties: Record<string, unknown>;
       required: string[];
     };
-    expect(expandSchema.properties.sessionId).toBeDefined();
-    expect(expandSchema.properties.session).toBeUndefined();
-    expect(expandSchema.required).toEqual(["sessionId"]);
+    expect(expandSchema.properties.session).toBeDefined();
+    expect(expandSchema.properties.sessionId).toBeUndefined();
+    expect(expandSchema.required).toEqual(["session"]);
   });
 
-  it("proposes sequence-fuse and overload-split for structural corpora", () => {
+  it("does not mistake repeated Pi primitives for a composite action", () => {
     const report = measureEntropy({ traces: structureTraces() });
     const proposals = proposeEntropyReductions({
       report,
       traces: structureTraces(),
     });
-    expect(proposals).toHaveLength(2);
-    expect(proposals.find((proposal) => proposal.kind === "sequence-fuse")).toMatchObject({
-      sequence: ["pi.read", "pi.grep", "pi.edit"],
-      occurrences: 2,
-    });
-    expect(proposals.find((proposal) => proposal.kind === "overload-split")).toMatchObject({
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({
+      kind: "overload-split",
       ref: "mcp.store.put",
       shapeEntropyBits: 1,
       clusters: [
@@ -369,6 +348,48 @@ describe("proposeEntropyReductions", () => {
         { keys: ["limit", "prefix"], calls: 3 },
       ],
     });
+  });
+
+  it("requires a high-level sequence to recur in independent executions", () => {
+    const workflow = [
+      op("memory.recall", { query: "needle" }),
+      op("memory.expand", { session: "s1" }),
+      op("state.get", { key: "answer" }),
+    ];
+    const repeated = [trace(workflow), trace(workflow), trace(workflow)];
+    const proposals = proposeEntropyReductions({
+      report: measureEntropy({ traces: repeated }),
+      traces: repeated,
+    });
+    expect(proposals).toEqual([
+      expect.objectContaining({
+        kind: "sequence-fuse",
+        sequence: ["memory.recall", "memory.expand", "state.get"],
+        occurrences: 3,
+      }),
+    ]);
+
+    const oneExecution = trace([...workflow, ...workflow]);
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces: [oneExecution] }),
+        traces: [oneExecution],
+      }),
+    ).toEqual([]);
+
+    const repeatedRefWorkflow = Array.from({ length: 3 }, () =>
+      trace([
+        op("extensions.fovea_sketch", {}),
+        op("extensions.fovea_focus", {}),
+        op("extensions.fovea_focus", {}),
+      ]),
+    );
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces: repeatedRefWorkflow }),
+        traces: repeatedRefWorkflow,
+      }),
+    ).toEqual([]);
   });
 
   it("does not quarantine healthy refs", () => {
@@ -383,7 +404,7 @@ describe("proposeEntropyReductions", () => {
     expect(proposeEntropyReductions({ report, traces })).toEqual([]);
   });
 
-  it("renames actions for action-level modal-rename", () => {
+  it("keeps repair rows as aliases without rewriting canonical action names", () => {
     const traces: EntropyTraceInput[] = [
       trace([op("memory.expand", { session: "s1" })]),
     ];
@@ -403,12 +424,49 @@ describe("proposeEntropyReductions", () => {
     ];
     const report = measureEntropy({ traces, surface, repairs });
     const proposals = proposeEntropyReductions({ report, traces, surface, repairs });
-    expect(proposals).toHaveLength(1);
-    const compiled = applyProposalsToSurface(surface, proposals);
-    expect(compiled.actions.map((action) => action.ref)).toEqual(["memory.expandEntry"]);
+    expect(proposals).toEqual([]);
+    expect(applyProposalsToSurface(surface, proposals)).toEqual(surface);
   });
 
-  it("routes open-domain vocabularies to declare-enum review, never auto", () => {
+  it("does not infer enums for dynamic strings or numeric ranges", () => {
+    const surface = surfaceOf([
+      {
+        ref: "agents.run",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: { model: { type: "string" } },
+        },
+      },
+      {
+        ref: "memory.expand",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            maxChars: { type: "number", minimum: 256, maximum: 24_000 },
+          },
+        },
+      },
+    ]);
+    const traces = [
+      trace([
+        ...Array.from({ length: 7 }, () => op("agents.run", { model: "xai/grok" })),
+        op("agents.run", { model: "openai/gpt" }),
+        ...Array.from({ length: 6 }, () => op("memory.expand", { maxChars: 24_000 })),
+        ...Array.from({ length: 2 }, () => op("memory.expand", { maxChars: 12_000 })),
+      ]),
+    ];
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces, surface }),
+        traces,
+        surface,
+      }),
+    ).toEqual([]);
+  });
+
+  it("routes explicitly marked vocabularies to declare-enum review, never auto", () => {
     const surface = surfaceOf([
       {
         ref: "mcp.report.render",
@@ -416,7 +474,9 @@ describe("proposeEntropyReductions", () => {
           type: "object",
           additionalProperties: false,
           required: ["format"],
-          properties: { format: { type: "string" } },
+          properties: {
+            format: { type: "string", "x-fabric-enum-candidate": true },
+          },
         },
       },
     ]);
@@ -443,7 +503,7 @@ describe("proposeEntropyReductions", () => {
     });
   });
 
-  it("signals undeclared keys and unknown refs through declare-enum", () => {
+  it("does not infer finite domains for undeclared keys or unknown refs", () => {
     const surface = surfaceOf([
       {
         ref: "mcp.report.render",
@@ -465,30 +525,13 @@ describe("proposeEntropyReductions", () => {
         ...Array.from({ length: 2 }, () => op("mcp.ghost.run", { level: "debug" })),
       ]),
     ];
-    const proposals = proposeEntropyReductions({
-      report: measureEntropy({ traces, surface }),
-      traces,
-      surface,
-    });
-    expect(proposals).toHaveLength(2);
-    expect(proposals[0]).toMatchObject({
-      kind: "declare-enum",
-      ref: "mcp.ghost.run",
-      key: "level",
-      values: ["info", "debug"],
-      calls: 8,
-      distinct: 2,
-      topShare: 0.75,
-    });
-    expect(proposals[1]).toMatchObject({
-      kind: "declare-enum",
-      ref: "mcp.report.render",
-      key: "dpi",
-      values: [300, 600],
-      calls: 8,
-      distinct: 2,
-      topShare: 0.5,
-    });
+    expect(
+      proposeEntropyReductions({
+        report: measureEntropy({ traces, surface }),
+        traces,
+        surface,
+      }),
+    ).toEqual([]);
   });
 
   it("converges when the observed vocabulary equals the declared enum", () => {
@@ -588,19 +631,19 @@ describe("proposeEntropyReductions", () => {
 
 describe("evaluateGate", () => {
   it("passes a strict decrease and fails any increase", () => {
-    const { before, compiled, retired } = compiledRatchet();
+    const { before, compiled } = compiledRatchet();
     const after = measureEntropy({
       traces: ratchetTraces(),
       surface: compiled,
-      repairs: retired,
+      repairs: ratchetRepairs(),
     });
     const gate = evaluateGate(before, after);
     expect(gate.passed).toBe(true);
-    expect(gate.delta).toBe(-0.14323);
+    expect(gate.delta).toBe(-0.01823);
     expect(before.staticScore).toBe(0.036458);
     expect(before.behavioralScore).toBe(0.286561);
     expect(after.staticScore).toBe(0.018229);
-    expect(after.behavioralScore).toBe(0.16156);
+    expect(after.behavioralScore).toBe(0.28656);
     const regress = evaluateGate(after, before);
     expect(regress.passed).toBe(false);
     expect(regress.reasons[0]).toContain("score increased");

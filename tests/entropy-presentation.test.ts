@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   entropyReviewKey,
+  formatEntropyCommandHints,
   formatEntropyCompileNotice,
   formatEntropyReviewNotice,
   type EntropyProposal,
@@ -77,6 +78,16 @@ describe("entropy user-facing messages", () => {
         elapsedMs: 10,
       }),
     ).toContain("to {literal value, regex}");
+  });
+
+  it("aligns /fabric entropy command comments", () => {
+    const lines = formatEntropyCommandHints();
+    expect(lines).toEqual([
+      "export: /fabric entropy export [path]          # snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
+      "share: /fabric entropy export-artifact [path]  # write the compiled artifact (default <agent dir>/fabric/entropy/artifact.json)",
+      "merge: /fabric entropy import <path>           # merge a peer artifact (digest-proven entries only)",
+    ]);
+    expect(new Set(lines.map((line) => line.indexOf("#")))).toEqual(new Set([47]));
   });
 
   it("summarizes review suggestions in plain language", () => {

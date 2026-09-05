@@ -2,13 +2,11 @@
 // subset → re-measure → gate. The gate proves two things on the retained
 // corpus: the score never increases, and every successful call to a ref
 // the compile touched still parses against the candidate surface.
-// Overload-split and sequence-fuse author new composite definitions, and a
-// pure modal rename drops the declared key that every successful call
-// recorded, so all three stay surfaced for review and never auto-apply.
-// enum-tighten only ever tightens beneath a declared enum (the
-// closed-domain rule), so the auto loop subtracts freedom the schema
-// already claimed and never invents a domain: open vocabularies arrive as
-// declare-enum review signals instead.
+// Overload-split and sequence-fuse author new composite definitions, so they
+// stay surfaced for review and never auto-apply. enum-tighten only ever
+// tightens beneath a declared enum (the closed-domain rule), while an open
+// vocabulary produces a declare-enum review signal only when the schema
+// author explicitly opts into learning that domain.
 
 import { stableJsonHash, stableJsonHashArrayAsync } from "../core/stable-hash.js";
 import { measureEntropy, measureEntropyAsync } from "./meter.js";
@@ -69,9 +67,6 @@ export const formatEntropyReviewSignal = (proposal: EntropyProposal): string => 
   }
   if (proposal.kind === "sequence-fuse") {
     return `sequence-fuse ${proposal.sequence.join(" -> ")}`;
-  }
-  if (proposal.kind === "modal-rename") {
-    return `modal-rename ${proposal.level} ${proposal.from} -> ${proposal.to}`;
   }
   return `${proposal.kind} ${proposal.ref}`;
 };

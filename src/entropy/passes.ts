@@ -14,11 +14,12 @@ import { compareCodeUnits, roundMetric } from "./fingerprint.js";
 // Deterministic reduction proposals. Each pass is a pure function over the
 // same typed artifacts the meter reads, with fixed thresholds, and every
 // proposal carries the evidence that triggered it. `applyProposalsToSurface`
-// rewrites the surface for the mechanically applicable kinds; overload-split
-// and sequence-fuse author new composite definitions, and declare-enum only
-// ever suggests a domain the schema has not claimed, so all three stay
-// review-only. The gate is the ratchet: a compiled surface must never
-// increase the measured score and must never drop successful calls.
+// rewrites only the mechanically applicable kinds. Overload-split and
+// sequence-fuse author new composite definitions, while declare-enum requires
+// an explicit schema annotation, so all three stay review-only. Repair rows
+// remain compatibility aliases and never rewrite canonical names. The gate is
+// the ratchet: a compiled surface must never increase the measured score and
+// must never drop successful calls.
 
 export interface EntropyProposalInput {
   report: EntropyReport;
@@ -35,10 +36,13 @@ const SPLIT_MIN_SHAPE_ENTROPY_BITS = 1;
 const SPLIT_MIN_CLUSTER_CALLS = 2;
 const FUSE_MIN_SEQUENCE_LENGTH = 3;
 const FUSE_MAX_SEQUENCE_LENGTH = 6;
-const FUSE_MIN_OCCURRENCES = 2;
+const FUSE_MIN_OCCURRENCES = 3;
+const FUSE_MIN_EXECUTIONS = 3;
 const QUARANTINE_MIN_CALLS = 3;
 const QUARANTINE_MIN_STAGE_ENTROPY_BITS = 1;
 const MAX_PROPOSALS_PER_KIND = 8;
+
+export const ENTROPY_ENUM_CANDIDATE_ANNOTATION = "x-fabric-enum-candidate";
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -123,8 +127,9 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
   // enum-tighten: a closed-domain parameter whose observed values are few
   // and concentrated tightens beneath its declared enum, so future
   // off-modal values fail (or repair) deterministically instead of
-  // slipping through an unused declared value. Open-domain parameters with
-  // the same shape become declare-enum review signals below.
+  // slipping through an unused declared value. An unbounded parameter is not
+  // evidence of a finite domain; declare-enum is considered only when its
+  // schema author explicitly marks it as an enum candidate.
   const observations = new Map<
     string,
     {
@@ -188,15 +193,11 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
     })
     .filter((candidate) => candidate.topShare >= ENUM_MIN_TOP_SHARE);
   // Closed-domain rule: auto enum-tighten may only remove freedom the
-  // effective schema already declares finite. A parameter whose schema
-  // carries an enum is a closed domain, so tightening beneath it is
-  // measured subtraction of declared freedom. A free parameter, an
-  // undeclared key, or a missing surface proves nothing about the domain:
-  // the same observations become a declare-enum review signal for the
-  // surface author instead, because inventing a domain the schema never
-  // claimed is how a compiler sharpens the wrong entropy. A declared
-  // boolean is already closed and priced below any enum, so it never
-  // proposes.
+  // effective schema already declares finite. Observations over free strings,
+  // numeric ranges, undeclared keys, and unknown refs do not prove a finite
+  // domain. Authors can opt a declared property into a review-only
+  // declare-enum signal with x-fabric-enum-candidate: true. A declared boolean
+  // is already closed and priced below any enum, so it never proposes.
   const closedCandidates: EnumCandidate[] = [];
   const openCandidates: EnumCandidate[] = [];
   for (const candidate of eligibleCandidates) {
@@ -209,7 +210,10 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
     if (declaredDomain) {
       const tightened = tightenBeneathDeclaredEnum(candidate, declaredDomain);
       if (tightened) closedCandidates.push(tightened);
-    } else {
+    } else if (
+      isPlainRecord(target) &&
+      target[ENTROPY_ENUM_CANDIDATE_ANNOTATION] === true
+    ) {
       openCandidates.push(candidate);
     }
   }
@@ -241,38 +245,10 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
     });
   }
 
-  // modal-rename: a repair row whose target is called means the spilled
-  // spelling is the model's modal grammar. Compile it into the schema and
-  // retire the row instead of paying the map forever.
-  const repairRows = [...(input.repairs ?? [])].sort(
-    (left, right) =>
-      compareCodeUnits(left.ref, right.ref) ||
-      compareCodeUnits(left.from, right.from) ||
-      compareCodeUnits(left.to, right.to),
-  );
-  for (const row of repairRows) {
-    if (!calledRefs.has(row.ref)) continue;
-    if (input.surface) {
-      if (row.kind === "keyAlias") {
-        const properties = schemaProperties(surfaceByRef.get(row.ref));
-        if (properties && row.from in properties) continue;
-      } else {
-        const provider = row.ref.split(".")[0] ?? row.ref;
-        if (surfaceRefs.has(`${provider}.${row.from}`)) continue;
-      }
-    }
-    proposals.push({
-      kind: "modal-rename",
-      level: row.kind === "keyAlias" ? "key" : "action",
-      ref: row.ref,
-      from: row.from,
-      to: row.to,
-      note:
-        row.kind === "keyAlias"
-          ? "the spilled spelling dominates observed calls; rename the declared key and retire the repair row"
-          : "the spilled action name dominates observed calls; rename the declared action and retire the repair row",
-    });
-  }
+  // Repair rows are already guarded aliases from a spilled spelling to the
+  // canonical schema. Their existence proves compatibility is useful, not
+  // that the alias should replace the canonical name. They contribute to the
+  // lexicon metric but never become surface rewrite proposals.
 
   // overload-split: one ref carrying two disjoint parameter key-sets is an
   // overloaded action; splitting removes the per-call either/or freedom.
@@ -329,13 +305,17 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
     }
   }
 
-  // sequence-fuse: a contiguous multi-ref action sequence that repeats across
-  // executions is a composite action (or skill) waiting to be extracted.
-  const sequenceCounts = new Map<string, { sequence: string[]; occurrences: number }>();
-  for (const sourceTrace of input.traces) {
-    const refs = sourceTrace.operations
-      .filter((operation) => !operation.ref.startsWith("fabric."))
-      .map((operation) => operation.ref);
+  // sequence-fuse: only successful high-level action sequences repeated in
+  // independent fabric_exec executions can imply a reusable composite. Pi
+  // primitives are implementation steps (and should be batched instead),
+  // while failed or ignored operations break contiguity rather than being
+  // silently bridged. Every ref must be distinct and three executions must
+  // agree before action names alone are strong enough to warrant review.
+  const sequenceCounts = new Map<
+    string,
+    { sequence: string[]; occurrences: number; executions: Set<number> }
+  >();
+  const recordSequenceSegment = (refs: readonly string[], execution: number): void => {
     for (
       let length = FUSE_MIN_SEQUENCE_LENGTH;
       length <= Math.min(FUSE_MAX_SEQUENCE_LENGTH, refs.length);
@@ -343,16 +323,44 @@ export const proposeEntropyReductions = (input: EntropyProposalInput): EntropyPr
     ) {
       for (let start = 0; start + length <= refs.length; start++) {
         const sequence = refs.slice(start, start + length);
-        if (new Set(sequence).size < 2) continue;
+        if (new Set(sequence).size !== sequence.length) continue;
         const id = sequence.join("→");
-        const entry = sequenceCounts.get(id) ?? { sequence, occurrences: 0 };
+        const entry = sequenceCounts.get(id) ?? {
+          sequence,
+          occurrences: 0,
+          executions: new Set<number>(),
+        };
         entry.occurrences += 1;
+        entry.executions.add(execution);
         sequenceCounts.set(id, entry);
       }
     }
-  }
+  };
+  input.traces.forEach((sourceTrace, execution) => {
+    let segment: string[] = [];
+    const flush = (): void => {
+      recordSequenceSegment(segment, execution);
+      segment = [];
+    };
+    for (const operation of sourceTrace.operations) {
+      if (
+        operation.outcome !== "succeeded" ||
+        operation.ref.startsWith("fabric.") ||
+        operation.ref.startsWith("pi.")
+      ) {
+        flush();
+      } else {
+        segment.push(operation.ref);
+      }
+    }
+    flush();
+  });
   const fuseCandidates = [...sequenceCounts.values()]
-    .filter((entry) => entry.occurrences >= FUSE_MIN_OCCURRENCES)
+    .filter(
+      (entry) =>
+        entry.occurrences >= FUSE_MIN_OCCURRENCES &&
+        entry.executions.size >= FUSE_MIN_EXECUTIONS,
+    )
     .sort(
       (left, right) =>
         right.sequence.length - left.sequence.length ||
@@ -408,11 +416,9 @@ const deepCloneJson = (value: unknown): unknown =>
   value === undefined ? {} : (JSON.parse(JSON.stringify(value)) as unknown);
 
 // Apply the mechanically applicable proposals as a pure surface rewrite.
-// The input surface is never mutated; enum-tighten injects the observed
-// enum beneath the declared one, noise-quarantine removes the action,
-// modal-rename renames the declared key or action to the model's modal
-// spelling. Overload-split, sequence-fuse, and declare-enum produce
-// review-only proposals and are skipped here.
+// The input surface is never mutated; enum-tighten injects the observed enum
+// beneath the declared one and noise-quarantine removes the action.
+// Overload-split, sequence-fuse, and declare-enum stay review-only.
 export const applyProposalsToSurface = (
   surface: EntropySurfaceSnapshot,
   proposals: readonly EntropyProposal[],
@@ -427,34 +433,15 @@ export const applyProposalsToSurface = (
       quarantined.add(proposal.ref);
       continue;
     }
-    if (proposal.kind === "modal-rename" && proposal.level === "action") {
-      const provider = proposal.ref.split(".")[0] ?? proposal.ref;
-      const renamed = `${provider}.${proposal.from}`;
-      for (const action of actions) {
-        if (action.ref === proposal.ref) action.ref = renamed;
-      }
-      continue;
-    }
-    if (proposal.kind === "enum-tighten" || (proposal.kind === "modal-rename" && proposal.level === "key")) {
+    if (proposal.kind === "enum-tighten") {
       const action = actions.find((candidate) => candidate.ref === proposal.ref);
       if (!action || !isPlainRecord(action.inputSchema)) continue;
-      const schema = action.inputSchema;
-      const properties = schemaProperties(schema);
-      if (!properties) continue;
-      if (proposal.kind === "enum-tighten") {
-        if (!isPlainRecord(properties[proposal.key])) continue;
-        properties[proposal.key] = {
-          ...(properties[proposal.key] as Record<string, unknown>),
-          enum: [...proposal.values],
-        };
-        continue;
-      }
-      if (!(proposal.to in properties) || proposal.from in properties) continue;
-      properties[proposal.from] = properties[proposal.to]!;
-      delete properties[proposal.to];
-      if (Array.isArray(schema.required)) {
-        schema.required = schema.required.map((key) => (key === proposal.to ? proposal.from : key));
-      }
+      const properties = schemaProperties(action.inputSchema);
+      if (!properties || !isPlainRecord(properties[proposal.key])) continue;
+      properties[proposal.key] = {
+        ...(properties[proposal.key] as Record<string, unknown>),
+        enum: [...proposal.values],
+      };
     }
   }
   const survivors = actions

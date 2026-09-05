@@ -189,7 +189,7 @@ describe("compileEntropySurface", () => {
     });
     expect(second.status).toBe("converged");
     expect(second.artifact).toBe(first.artifact);
-    expect(second.proposals.map((proposal) => proposal.kind)).toEqual(["modal-rename"]);
+    expect(second.proposals).toEqual([]);
   });
 
   it("rejects a compile whose enum would break a recorded successful call", () => {
@@ -336,7 +336,7 @@ describe("compiled surface store", () => {
 });
 
 describe("entropyReviewSignals", () => {
-  it("excludes the auto kinds and keeps the review queue", () => {
+  it("excludes auto kinds and resolved repair aliases from the review queue", () => {
     const outcome = compileEntropySurface(compileInput());
     const review = entropyReviewSignals({
       report: outcome.report,
@@ -344,10 +344,10 @@ describe("entropyReviewSignals", () => {
       surface: ratchetSurface(),
       repairs: ratchetRepairs(),
     });
-    expect(review.map((proposal) => proposal.kind)).toEqual(["modal-rename"]);
+    expect(review).toEqual([]);
   });
 
-  it("surfaces declare-enum for open domains and formats it", () => {
+  it("surfaces declare-enum for explicitly marked domains and formats it", () => {
     const surface: EntropySurfaceSnapshot = {
       version: 1,
       actions: [
@@ -357,7 +357,9 @@ describe("entropyReviewSignals", () => {
             type: "object",
             additionalProperties: false,
             required: ["format"],
-            properties: { format: { type: "string" } },
+            properties: {
+              format: { type: "string", "x-fabric-enum-candidate": true },
+            },
           },
         },
       ],
@@ -398,16 +400,6 @@ describe("entropyReviewSignals", () => {
         topShare: 0.5,
       }),
     ).toBe("declare-enum mcp.render.format (a, b, c, d, ...)");
-    expect(
-      formatEntropyReviewSignal({
-        kind: "modal-rename",
-        level: "key",
-        ref: "memory.expand",
-        from: "sessionId",
-        to: "session",
-        note: "test",
-      }),
-    ).toBe("modal-rename key sessionId -> session");
   });
 });
 

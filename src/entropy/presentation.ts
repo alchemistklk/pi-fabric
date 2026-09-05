@@ -4,7 +4,33 @@ const METRIC_PRECISION = 6;
 const MAX_APPLIED_DETAILS = 3;
 const MAX_VALUE_LENGTH = 32;
 
+const ENTROPY_COMMAND_HINTS = [
+  {
+    label: "export",
+    command: "/fabric entropy export [path]",
+    comment: "snapshot the live surface (default <agent dir>/fabric/entropy/surface.json)",
+  },
+  {
+    label: "share",
+    command: "/fabric entropy export-artifact [path]",
+    comment: "write the compiled artifact (default <agent dir>/fabric/entropy/artifact.json)",
+  },
+  {
+    label: "merge",
+    command: "/fabric entropy import <path>",
+    comment: "merge a peer artifact (digest-proven entries only)",
+  },
+] as const;
+
 export const formatEntropyMetric = (value: number): string => value.toFixed(METRIC_PRECISION);
+
+export const formatEntropyCommandHints = (): string[] => {
+  const heads = ENTROPY_COMMAND_HINTS.map((hint) => `${hint.label}: ${hint.command}`);
+  const commentColumn = Math.max(...heads.map((head) => head.length)) + 2;
+  return ENTROPY_COMMAND_HINTS.map(
+    (hint, index) => `${heads[index]!.padEnd(commentColumn)}# ${hint.comment}`,
+  );
+};
 
 const formatDuration = (elapsedMs: number): string =>
   elapsedMs >= 1_000 ? `${(elapsedMs / 1_000).toFixed(1)}s` : `${Math.max(1, Math.round(elapsedMs))}ms`;
@@ -69,15 +95,6 @@ export const entropyReviewKey = (proposals: readonly EntropyProposal[]): string 
     if (proposal.kind === "sequence-fuse") {
       return JSON.stringify([proposal.kind, proposal.sequence]);
     }
-    if (proposal.kind === "modal-rename") {
-      return JSON.stringify([
-        proposal.kind,
-        proposal.level,
-        proposal.ref,
-        proposal.from,
-        proposal.to,
-      ]);
-    }
     return JSON.stringify([proposal.kind, proposal.ref]);
   });
   identities.sort();
@@ -91,9 +108,7 @@ const reviewLabel = (kind: EntropyProposal["kind"], count: number): string => {
       ? "action split"
       : kind === "sequence-fuse"
         ? "sequence fusion"
-        : kind === "modal-rename"
-          ? "rename"
-          : kind;
+        : kind;
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 };
 

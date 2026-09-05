@@ -50,7 +50,8 @@ export interface EntropyTraceInput {
   model?: string;
 }
 
-// Normalized catalog-repair row: `ref` is the target the row repairs toward.
+// Normalized compatibility alias: `ref` is the canonical target the row
+// repairs toward.
 export interface EntropyRepairRowInput {
   kind: "keyAlias" | "actionAlias";
   ref: string;
@@ -181,14 +182,6 @@ export type EntropyProposal =
       succeeded: number;
       failed: number;
       failureStageEntropyBits: number;
-    }
-  | {
-      kind: "modal-rename";
-      level: "key" | "action";
-      ref: string;
-      from: string;
-      to: string;
-      note: string;
     };
 
 export interface EntropyGateResult {
