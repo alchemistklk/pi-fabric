@@ -1,5 +1,6 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
+import ts from "typescript";
 import { runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
@@ -44,7 +45,31 @@ type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>
 let quickJsModulePromise: Promise<QuickJsModule> | undefined;
 
 // Static π.<identifier> references (bracket access like π[k] is not provable).
-const PI_REF_PATTERN = /(?:^|[^\w$.])π\.([A-Za-z_$][\w$]*)/g;
+// Parse instead of scanning text so examples inside strings and comments do not
+// become false missing-payload failures.
+const referencedPiKeys = (code: string): string[] => {
+  const source = ts.createSourceFile(
+    "fabric-exec.ts",
+    `async function __fabricProgram() {\n${code}\n}`,
+    ts.ScriptTarget.Latest,
+    false,
+    ts.ScriptKind.TS,
+  );
+  const keys: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "π" &&
+      !keys.includes(node.name.text)
+    ) {
+      keys.push(node.name.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return keys;
+};
 
 // Models routinely reference π.<key> without providing the payloads parameter,
 // and the runtime error only lands after a full execution round trip (#68).
@@ -55,13 +80,7 @@ const missingStringsKeys = (
   strings: Record<string, string> | undefined,
 ): string[] => {
   const provided = strings ?? {};
-  const missing: string[] = [];
-  for (const match of code.matchAll(PI_REF_PATTERN)) {
-    const key = match[1];
-    if (key === undefined || key in provided) continue;
-    if (!missing.includes(key)) missing.push(key);
-  }
-  return missing;
+  return referencedPiKeys(code).filter((key) => !(key in provided));
 };
 
 const quickJsModule = (): Promise<QuickJsModule> => {

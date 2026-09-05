@@ -693,6 +693,22 @@ await Promise.all([
     expect(provided.terminationReason).toBe("completed");
   });
 
+  it("ignores π examples inside strings and comments during payload preflight", async () => {
+    const code = [
+      'const example = "use π.task only with a matching payload";',
+      "// π.commentExample is documentation, not an access",
+      "return example;",
+    ].join("\n");
+    const result = await new QuickJsRuntime().execute(
+      code,
+      async () => undefined,
+      { ...options, strings: { contract: "content" } },
+    );
+
+    expect(result.terminationReason).toBe("completed");
+    expect(result.error).toBeUndefined();
+  });
+
   it("does not flag bracket access or bare π on dynamic keys", async () => {
     const result = await new QuickJsRuntime().execute(
       'const key = "k"; return Object.keys(π).length + (π[key] === undefined ? 0 : 1);',

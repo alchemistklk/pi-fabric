@@ -573,49 +573,31 @@ describe("Fabric dynamic UI", () => {
     expect(third.join("\n")).toContain("beta");
   });
 
-  it("leases rows within one run and releases them for a newer run", () => {
+  it("releases rows when agents leave the activity snapshot", () => {
     const current = snapshot();
-    const call = current.runs[0]!.calls.find((candidate) => candidate.kind === "extension")!;
     current.actors = [];
     current.state = [];
     current.runs[0]!.items = [];
-    current.runs[0]!.calls = [
-      {
-        ...call,
-        id: "custom-index",
-        label: "Custom index",
-        status: "running",
-        entityKind: "custom",
-      },
-    ];
+    current.runs[0]!.calls = [];
     const base = current.agents[0]!;
     current.agents = [
       { ...base, id: "agent-1", name: "alpha" },
       { ...base, id: "agent-2", name: "beta" },
     ];
     const widget = new FabricWidget(theme, () => current, 8);
-    const withAgents = widget.render(72);
-    expect(withAgents).toHaveLength(3);
+    expect(widget.render(72)).toHaveLength(3);
+
+    current.agents = [current.agents[0]!];
+    widget.invalidate();
+    const withOneAgent = widget.render(72);
+    expect(withOneAgent).toHaveLength(2);
+    expect(withOneAgent.every((line) => visibleWidth(line) > 0)).toBe(true);
 
     current.agents = [];
     widget.invalidate();
     const withoutAgents = widget.render(72);
-    expect(withoutAgents).toHaveLength(withAgents.length);
-    expect(withoutAgents.join("\n")).not.toContain("Custom index");
-    expect(withoutAgents.at(-1)).toBe("");
-
-    const previousRun = current.runs[0]!;
-    current.runs[0] = {
-      ...previousRun,
-      id: "run-2",
-      name: "Smaller follow-up",
-      startedAt: current.now,
-      updatedAt: current.now,
-    };
-    widget.invalidate();
-    const newerRun = widget.render(72);
-    expect(newerRun).toHaveLength(1);
-    expect(newerRun.join("\n")).not.toContain("Custom index");
+    expect(withoutAgents).toHaveLength(1);
+    expect(withoutAgents[0]).toContain("Fabric");
   });
 
   it("keeps the hidden-row marker visible at the width boundary", () => {

@@ -120,8 +120,6 @@ export class FabricWidget implements Component {
   #lastWidth: number | undefined;
   #lastSnapshot: FabricDashboardSnapshot | undefined;
   #lastLines: string[] | undefined;
-  #leaseKey: string | undefined;
-  #leasedRows = 0;
   #pending:
     | { width: number; snapshot: FabricDashboardSnapshot; lines: string[] }
     | undefined;
@@ -163,11 +161,10 @@ export class FabricWidget implements Component {
   }
 
   #renderLines(snapshot: FabricDashboardSnapshot, width: number): string[] {
-    const { lines: content, leaseKey } = this.#buildContent(snapshot);
-    return this.#leaseContent(this.#boundContent(content, width), leaseKey);
+    return this.#boundContent(this.#buildContent(snapshot), width);
   }
 
-  #buildContent(snapshot: FabricDashboardSnapshot): { lines: string[]; leaseKey: string } {
+  #buildContent(snapshot: FabricDashboardSnapshot): string[] {
     const candidateRun = snapshot.runs[0];
     const candidateFinishedAt = candidateRun?.finishedAt ?? candidateRun?.updatedAt ?? 0;
     const run =
@@ -246,30 +243,7 @@ export class FabricWidget implements Component {
       ),
       ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
     );
-    const ambientOwners = [
-      ...activeAgents.map((agent) => `agent:${agent.id}`),
-      ...visibleActors.map(
-        (actor) => `actor:${actor.id}:${actor.worker?.id ?? actor.lastRunId ?? "idle"}`,
-      ),
-    ];
-    return {
-      lines,
-      leaseKey: run?.id ?? (ambientOwners.length > 0 ? `ambient:${ambientOwners.join(",")}` : "ambient"),
-    };
-  }
-
-  #leaseContent(lines: string[], leaseKey: string): string[] {
-    if (this.#leaseKey !== leaseKey) {
-      this.#leaseKey = leaseKey;
-      this.#leasedRows = lines.length;
-    } else {
-      this.#leasedRows = Math.max(this.#leasedRows, lines.length);
-    }
-    if (lines.length >= this.#leasedRows) return lines;
-    return [
-      ...lines,
-      ...Array.from({ length: this.#leasedRows - lines.length }, () => ""),
-    ];
+    return lines;
   }
 
   #boundContent(content: string[], width: number): string[] {

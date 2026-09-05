@@ -145,7 +145,7 @@ export const createFabricExecTool = (
       "Search before reading: use `pi.grep`/`pi.find` to locate relevant lines, then `pi.read({path, offset, limit})` that range. Escape regex metacharacters, or use `literal:true` for exact punctuated text. Keep fan-out search limits small and widen only on misses. An unbounded `pi.read` returns at most 2000 lines or 50KB and, when truncated, ends with a `Use offset=…` continuation notice; reserve whole-file reads for small files you will use in full.",
       "For coding tasks, keep an acceptance ledger: turn the request into concrete checks, trace the relevant execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger, escalating only for failures or cross-cutting risk; inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
       "Amortize round trips without inflating context: batch only independent, bounded work. Keep search→read and edit→verify sequential when an output determines the next action. Use `settle:true` for tests or probes whose nonzero result is evidence rather than an exceptional stop; for a known long suite, set `pi.bash` `timeout` in seconds once instead of retrying a timed-out call. Filter or summarize noisy command output inside the program and return decisions, failures, and evidence—not raw logs or unused intermediate results.",
-      "For multiline edits/writes, pass named payloads through top-level `payloads` and use `π.key`; prefer `pi.edit`/`pi.write`. `pi.bash`: no stdin.",
+      "For edits/writes, pass named payloads through top-level `payloads`; each `π.key` must exactly match a key there; prefer `pi.edit`/`pi.write`. `pi.bash`: no stdin.",
       "Use `display.name` and objective `display.description`; Fabric pairs them with verified outcomes in deterministic compaction.",
     ],
     // The model-facing schema is intentionally flat: one large `code` string
@@ -166,12 +166,12 @@ export const createFabricExecTool = (
     parameters: Type.Object({
       code: Type.String({
         description:
-          "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. See session guidance / `fabric-exec` skill for exact signatures.",
+          "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. `π` contains only the exact keys supplied by this call's `payloads`. See session guidance / `fabric-exec` skill for exact signatures.",
       }),
       payloads: Type.Optional(
         Type.Record(Type.String(), Type.String(), {
           description:
-            "Named payloads exposed as π.key, useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed.",
+            "Named payloads exposed under the same exact name as π.key (for example, payloads.contract becomes π.contract). Never reference a π key absent from this map. Useful for content that is awkward to quote inside code. Prefer an object of string values; a JSON-object string is parsed.",
         }),
       ),
       resultFormat: Type.Optional(Type.Union(RESULT_FORMATS.map((value) => Type.Literal(value)))),
