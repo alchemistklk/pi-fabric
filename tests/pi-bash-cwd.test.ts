@@ -8,6 +8,7 @@ import {
   BashCwdDefinitions,
   resolveBashCwdArgument,
   resolvePiBashCwd,
+  resolvePowerShellToolDefinitionFactory,
   withBashCwdSchema,
 } from "../src/providers/pi-bash-cwd.js";
 
@@ -131,6 +132,18 @@ describe("withBashCwdSchema", () => {
 
   it("is idempotent", () => {
     expect(withBashCwdSchema(schema)).toBe(schema);
+  });
+});
+
+describe("PowerShell host compatibility", () => {
+  it("omits the factory when the host does not export it", () => {
+    expect(resolvePowerShellToolDefinitionFactory({})).toBeUndefined();
+  });
+
+  it("returns the host factory when it is available", () => {
+    expect(resolvePowerShellToolDefinitionFactory({
+      createPowerShellToolDefinition: createBashToolDefinition,
+    })).toBe(createBashToolDefinition);
   });
 });
 

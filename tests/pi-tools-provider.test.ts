@@ -231,6 +231,22 @@ describe("PiToolsProvider lifecycle", () => {
     }
   });
 
+  it("omits PowerShell when the host factory is unavailable", async () => {
+    const provider = new PiToolsProvider(
+      process.cwd(),
+      undefined,
+      undefined,
+      { powerShellToolDefinitionFactory: undefined },
+    );
+
+    expect(await provider.describe("powershell", baseContext)).toBeUndefined();
+    expect((await provider.list({}, baseContext)).map((item) => item.name))
+      .not.toContain("powershell");
+    expect(await provider.describe("bash", baseContext)).toBeDefined();
+    await expect(provider.invoke("powershell", { command: "Write-Output ok" }, baseContext))
+      .rejects.toThrow("Unknown Pi tool: powershell");
+  });
+
   it("registers PowerShell with shell schema and execution risk", async () => {
     const provider = new PiToolsProvider(process.cwd(), undefined, undefined);
     const descriptor = await provider.describe("powershell", baseContext);

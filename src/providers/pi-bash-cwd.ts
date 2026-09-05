@@ -1,8 +1,8 @@
 import { accessSync, constants, statSync } from "node:fs";
 import path from "node:path";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
-  createPowerShellToolDefinition,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
@@ -130,7 +130,28 @@ export const withBashCwdSchema = (schema: unknown): unknown => withShellCwdSchem
 
 const MAX_CACHED_DEFINITIONS = 16;
 
-type ShellDefinitionFactory = (cwd: string) => ToolDefinition<any, any, any>;
+export type ShellDefinitionFactory = (cwd: string) => ToolDefinition<any, any, any>;
+
+/**
+ * PowerShell entered Pi's host API after Fabric's minimum supported version.
+ * Namespace lookup is deliberate: a named ESM import would reject the whole
+ * Fabric module before an older host could reach this feature gate.
+ */
+export const resolvePowerShellToolDefinitionFactory = (
+  moduleExports: unknown,
+): ShellDefinitionFactory | undefined => {
+  if (
+    moduleExports === null ||
+    (typeof moduleExports !== "object" && typeof moduleExports !== "function")
+  ) {
+    return undefined;
+  }
+  const candidate = Reflect.get(moduleExports, "createPowerShellToolDefinition");
+  return typeof candidate === "function" ? candidate as ShellDefinitionFactory : undefined;
+};
+
+export const powerShellToolDefinitionFactory =
+  resolvePowerShellToolDefinitionFactory(PiCodingAgent);
 
 /** Definitions bound to execution directories, with a small LRU cache. */
 class ShellCwdDefinitions {
@@ -162,7 +183,7 @@ export class BashCwdDefinitions extends ShellCwdDefinitions {
 }
 
 export class PowerShellCwdDefinitions extends ShellCwdDefinitions {
-  constructor() {
-    super(createPowerShellToolDefinition);
+  constructor(createDefinition: ShellDefinitionFactory) {
+    super(createDefinition);
   }
 }

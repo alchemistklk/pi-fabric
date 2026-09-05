@@ -89,6 +89,13 @@ for (const forbidden of ["src/fabric-runtime-state.ts", "src/ui/settings.ts", 'f
 }
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));
 const lazySource = [...lazyFiles].map((file) => readFileSync(file, "utf8")).join("\n");
+const mandatoryPowerShellFactoryImport =
+  /import\s*\{[^}]*\bcreatePowerShellToolDefinition\b[^}]*\}\s*from\s*["']@earendil-works\/pi-coding-agent["']/s;
+if (mandatoryPowerShellFactoryImport.test(lazySource)) {
+  throw new Error(
+    "Optional Pi PowerShell factory must be accessed through the module namespace",
+  );
+}
 for (const expected of ["src/fabric-runtime-state.ts", "src/ui/settings.ts", 'import("mcporter")']) {
   if (!lazySource.includes(expected)) {
     throw new Error(`Expected lazy entry marker not found: ${expected}`);
