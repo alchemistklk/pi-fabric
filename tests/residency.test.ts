@@ -161,6 +161,14 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
       piBinary: "pi",
       claudeBinary: "claude",
       vedaBinary: "veda",
+      piModels: {
+        available: [
+          { provider: "provider", id: "visible", name: "Visible" },
+          { provider: "deepseek", id: "deepseek-chat", name: "DeepSeek Chat" },
+        ],
+        aliases: {},
+        defaultModel: "provider/visible",
+      },
     },
   };
 };
@@ -565,6 +573,56 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       await actors.close();
       await agents.close();
       await state.participants.close();
+    }
+  });
+
+  it("rejects a durable actor model that became hidden at the resident owner", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-hidden-model");
+    const client = new ResidencyClient({
+      config: state.config,
+      mesh: state.mesh,
+      participants: state.participants,
+      mainAgent: state.mainAgent,
+      hostPath,
+    });
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true,
+      hostId: state.identity.id,
+      pollMs: 20,
+      acknowledgementTimeoutMs: 3_000,
+    });
+    control.start(() => ({ accepted: false }));
+
+    try {
+      const actor = await client.createActor({
+        name: "visibility witness",
+        instructions: "Run only while the bound model remains visible.",
+        residency: "durable",
+        runner: "pi",
+        model: "provider/visible",
+      });
+      state.config.piModels = {
+        available: [],
+        aliases: {},
+        defaultModel: "provider/visible",
+      };
+      await client.ensureHost();
+
+      await expect(
+        control.request(
+          client.hostId,
+          actor.id,
+          "followUp",
+          { message: "Do not launch the hidden binding" },
+          client.hostId,
+        ),
+      ).rejects.toThrow(/not available to this Pi session/);
+      await client.removeActor(actor.id);
+    } finally {
+      await control.close();
+      await client.close();
+      await state.participants.close();
+      await stopResident(state.config);
     }
   });
 

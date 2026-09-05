@@ -1,5 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import {
+  resolveAvailablePiModel,
+  type FabricModelCandidate,
+} from "./core/model-resolution.js";
+import { loadModelUsage } from "./core/model-usage.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -625,6 +630,51 @@ export class FabricRuntimeState {
     const agentConfig = enforceSchema
       ? { ...this.#config.agents, enabled: false }
       : this.#config.agents;
+    const modelsConfig = this.#config.models;
+    const visiblePiModels = () => {
+      try {
+        return context.modelRegistry.getAvailable();
+      } catch {
+        return [];
+      }
+    };
+    const piModelState = (models = visiblePiModels()) => {
+      const available: FabricModelCandidate[] = models.map((model) => ({
+        provider: String(model.provider),
+        id: String(model.id),
+        ...(typeof model.name === "string" ? { name: model.name } : {}),
+      }));
+      const defaultModel = context.model
+        ? `${context.model.provider}/${context.model.id}`
+        : undefined;
+      return {
+        available,
+        aliases: structuredClone(modelsConfig.aliases),
+        ...(defaultModel ? { defaultModel } : {}),
+      };
+    };
+    const resolveParticipantPiModel = (selector?: string) => {
+      const models = visiblePiModels();
+      const state = piModelState(models);
+      const query = selector?.trim() || state.defaultModel || "";
+      const resolved = resolveAvailablePiModel(query, {
+        aliases: state.aliases,
+        available: state.available,
+        lastUsed: loadModelUsage(),
+      });
+      const model = models.find(
+        (candidate) =>
+          String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
+          String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
+      );
+      if (!model) {
+        throw new Error(
+          `Model ${JSON.stringify(query)} is not available to this Pi session. ` +
+            'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
+        );
+      }
+      return { key: `${resolved.provider}/${resolved.id}`, model };
+    };
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       fullCodeMode: this.#config.fullCodeMode,
       mainAgentId,
@@ -652,15 +702,10 @@ export class FabricRuntimeState {
         }).appendText || undefined;
       },
       preparePiModel: async (modelKey) => {
-        const separator = modelKey.indexOf("/");
-        if (separator <= 0 || separator === modelKey.length - 1) return;
-        const model = context.modelRegistry.find(
-          modelKey.slice(0, separator),
-          modelKey.slice(separator + 1),
-        );
-        if (!model) return;
-        const auth = await context.modelRegistry.getApiKeyAndHeaders(model);
+        const resolved = resolveParticipantPiModel(modelKey);
+        const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
+        return resolved.key;
       },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
@@ -747,6 +792,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             retention: this.#config.retention,
+            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
           }
         : {
@@ -757,6 +803,7 @@ export class FabricRuntimeState {
             claimResidency: "session",
             rootId: mainAgentId,
             retention: this.#config.retention,
+            resolvePiModel: (model) => resolveParticipantPiModel(model).key,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
@@ -802,11 +849,13 @@ export class FabricRuntimeState {
               process.env.PI_FABRIC_CLAUDE_BINARY ?? this.#config.agents.claude.binary,
             vedaBinary:
               process.env.PI_FABRIC_VEDA_BINARY ?? this.#config.agents.veda.binary,
+            piModels: piModelState(),
             modelGuidance: [],
           },
           mesh: this.#mesh,
           participants: this.#participants,
           mainAgent,
+          piModelState,
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;

@@ -273,3 +273,50 @@ export const resolveFabricModel = (
   if (candidates.length > 1) return { kind: "ambiguous", query, candidates };
   return { kind: "not-found", query };
 };
+
+const unavailablePiModelError = (
+  query: string,
+  resolution?: Extract<FabricModelResolution, { kind: "ambiguous" | "not-found" }>,
+): Error => {
+  const detail = resolution?.kind === "not-found" && resolution.tried !== undefined
+    ? ` Alias targets tried: ${resolution.tried.join(", ")}.`
+    : resolution?.kind === "ambiguous"
+      ? ` Visible matches: ${resolution.candidates.map(modelKey).join(", ")}.`
+      : "";
+  return new Error(
+    `Model ${JSON.stringify(query)} is not available to this Pi session.${detail} ` +
+      'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
+  );
+};
+
+/**
+ * Resolve a Pi participant selector strictly within the execution owner's
+ * visible registry. Exact provider/id keys never fall back to fuzzy matching;
+ * aliases and inexact selectors retain the normal Fabric resolution policy.
+ */
+export const resolveAvailablePiModel = (
+  selector: string,
+  options: {
+    aliases: Record<string, string[]>;
+    available: readonly FabricModelCandidate[];
+    lastUsed?: FabricModelUsage;
+  },
+): FabricModelCandidate => {
+  const query = selector.trim();
+  const alias = Object.keys(options.aliases).some(
+    (name) => name.toLowerCase() === query.toLowerCase(),
+  );
+  if (PROVIDER_MODEL_RE.test(query) && !alias) {
+    const exact = options.available.find(
+      (model) => modelKey(model).toLowerCase() === query.toLowerCase(),
+    );
+    if (exact) return exact;
+    throw unavailablePiModelError(query);
+  }
+
+  const resolution = resolveFabricModel(query, options);
+  if (resolution.kind === "resolved" || resolution.kind === "already-active") {
+    return resolution.model;
+  }
+  throw unavailablePiModelError(query, resolution);
+};

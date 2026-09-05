@@ -388,9 +388,11 @@ export class AgentManager {
   readonly #transports: Map<FabricAgentTransport, AgentTransportAdapter>;
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
-  readonly #preparePiModel: ((model: string) => Promise<void>) | undefined;
+  readonly #preparePiModel:
+    | ((model: string | undefined) => Promise<string | void>)
+    | undefined;
   readonly #resolveParticipantGuidance: AgentParticipantGuidanceResolver | undefined;
-  readonly #piModelPreparations = new Map<string, Promise<void>>();
+  readonly #piModelPreparations = new Map<string, Promise<string | undefined>>();
   readonly #budget: BudgetLedgerState | undefined;
   readonly #budgetOwned: boolean;
   readonly #uiListeners = new Set<() => void>();
@@ -424,7 +426,7 @@ export class AgentManager {
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
-      preparePiModel?: (model: string) => Promise<void>;
+      preparePiModel?: (model: string | undefined) => Promise<string | void>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
     } = {},
   ) {
@@ -485,22 +487,21 @@ export class AgentManager {
     }
   }
 
-  async #prepareModel(model: string): Promise<void> {
-    if (!this.#preparePiModel) return;
-    const separator = model.indexOf("/");
-    const provider = separator > 0 ? model.slice(0, separator) : model;
-    const existing = this.#piModelPreparations.get(provider);
-    if (existing) {
-      await existing;
-      return;
-    }
-    const preparation = this.#preparePiModel(model);
-    this.#piModelPreparations.set(provider, preparation);
+  async #prepareModel(model: string | undefined): Promise<string | undefined> {
+    if (!this.#preparePiModel) return model;
+    const key = model?.trim() || "<session-default>";
+    const existing = this.#piModelPreparations.get(key);
+    if (existing) return existing;
+    const preparation = this.#preparePiModel(model).then((prepared) => {
+      if (typeof prepared !== "string") return model;
+      return prepared.trim() || model;
+    });
+    this.#piModelPreparations.set(key, preparation);
     try {
-      await preparation;
+      return await preparation;
     } finally {
-      if (this.#piModelPreparations.get(provider) === preparation) {
-        this.#piModelPreparations.delete(provider);
+      if (this.#piModelPreparations.get(key) === preparation) {
+        this.#piModelPreparations.delete(key);
       }
     }
   }
@@ -554,7 +555,7 @@ export class AgentManager {
     const tools = this.#childTools(request, runner);
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
-    const model =
+    let model =
       request.model ??
       (runner === "claude"
         ? this.config.claude.model
@@ -563,7 +564,6 @@ export class AgentManager {
           : this.config.model);
     if (runner === "claude" && model) normalizeClaudeModel(model);
     if (runner === "veda" && model) normalizeVedaModel(model);
-    if (runner === "pi" && model) await this.#prepareModel(model);
     if (this.#budget) {
       const spent = readBudgetLedger(this.#budget.file).cost;
       if (spent >= this.#budget.budget) {
@@ -573,6 +573,12 @@ export class AgentManager {
       }
     }
     const release = await this.#semaphore.acquire(signal);
+    try {
+      if (runner === "pi") model = await this.#prepareModel(model);
+    } catch (error) {
+      release();
+      throw error;
+    }
     const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
     const runDirectory = path.join(this.#runRoot, id);
@@ -1104,6 +1110,18 @@ export class AgentManager {
     if (managed.settled || this.#closing || managed.abortSignal?.aborted) return false;
     managed.startupAttempts++;
     try {
+      if (managed.runner === "pi") {
+        const model = await this.#prepareModel(managed.model);
+        const modelIndex = managed.launch.workerArguments.indexOf("--model");
+        if (model) {
+          if (modelIndex >= 0) managed.launch.workerArguments[modelIndex + 1] = model;
+          else managed.launch.workerArguments.push("--model", model);
+          managed.model = model;
+        } else if (modelIndex >= 0) {
+          managed.launch.workerArguments.splice(modelIndex, 2);
+          delete managed.model;
+        }
+      }
       fs.rmSync(managed.statusFile, { force: true });
       managed.transport = await managed.adapter.launch(managed.launch);
       delete managed.latestRecord;

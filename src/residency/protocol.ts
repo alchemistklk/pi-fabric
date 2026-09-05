@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
+import type { FabricModelCandidate } from "../core/model-resolution.js";
 import type { FabricAgentConfig, FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { AgentHandleInfo, AgentRunRequest } from "../agents/types.js";
@@ -21,6 +22,12 @@ export const residentRoot = (meshRoot: string, rootId: string): string =>
 export const residentDeliveryPrefix = (rootId: string): string =>
   `${RESIDENT_DELIVERY_PREFIX}${digest(rootId).slice(0, 32)}/`;
 
+export interface ResidentPiModelState {
+  available: FabricModelCandidate[];
+  aliases: Record<string, string[]>;
+  defaultModel?: string;
+}
+
 export interface ResidentHostConfig {
   format: typeof RESIDENT_HOST_FORMAT;
   rootId: string;
@@ -40,6 +47,7 @@ export interface ResidentHostConfig {
   piBinary: string;
   claudeBinary: string;
   vedaBinary: string;
+  piModels?: ResidentPiModelState;
   modelGuidance?: FabricOwnedModelGuidance[];
 }
 

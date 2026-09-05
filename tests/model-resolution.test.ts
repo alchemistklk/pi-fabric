@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   normalizeModelAliases,
+  resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../src/core/model-resolution.js";
@@ -58,6 +59,37 @@ describe("normalizeModelAliases", () => {
     expect(normalizeModelAliases(undefined)).toEqual({});
     expect(normalizeModelAliases(null)).toEqual({});
     expect(normalizeModelAliases(["google/gemini-2.5-flash"])).toEqual({});
+  });
+});
+
+describe("resolveAvailablePiModel", () => {
+  it("accepts visible exact, fuzzy, and alias selectors", () => {
+    const aliases = normalizeModelAliases({ fast: "google/gemini-2.5-flash" });
+    expect(resolveAvailablePiModel("google/gemini-2.5-pro", {
+      aliases,
+      available: AVAILABLE,
+    })).toMatchObject({ provider: "google", id: "gemini-2.5-pro" });
+    expect(resolveAvailablePiModel("gemni-2.5-pro", {
+      aliases,
+      available: AVAILABLE,
+    })).toMatchObject({ provider: "google", id: "gemini-2.5-pro" });
+    expect(resolveAvailablePiModel("fast", {
+      aliases,
+      available: AVAILABLE,
+    })).toMatchObject({ provider: "google", id: "gemini-2.5-flash" });
+  });
+
+  it("rejects hidden exact IDs and exhausted aliases with a session error", () => {
+    expect(() => resolveAvailablePiModel("google/private-gemini", {
+      aliases: {},
+      available: AVAILABLE,
+    })).toThrow(/not available to this Pi session/);
+    expect(() => resolveAvailablePiModel("retired", {
+      aliases: normalizeModelAliases({
+        retired: ["google/private-gemini", "anthropic/private-claude"],
+      }),
+      available: AVAILABLE,
+    })).toThrow(/google\/private-gemini, anthropic\/private-claude/);
   });
 });
 

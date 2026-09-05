@@ -6,6 +6,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import {
+  normalizeModelAliases,
+  resolveAvailablePiModel,
+  type FabricModelCandidate,
+} from "../core/model-resolution.js";
+import { loadModelUsage } from "../core/model-usage.js";
+import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
@@ -172,9 +178,30 @@ class ResidentHost {
       });
     }
     const guidanceConfigPath = path.join(config.residencyRoot, "config.json");
-    const currentModelGuidance = () => {
-      const current = readJson<Partial<ResidentHostConfig>>(guidanceConfigPath);
-      return parseFabricOwnedModelGuidance(current?.modelGuidance ?? config.modelGuidance);
+    const currentConfig = (): Partial<ResidentHostConfig> =>
+      readJson<Partial<ResidentHostConfig>>(guidanceConfigPath) ?? config;
+    const currentModelGuidance = () =>
+      parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
+    const resolveResidentPiModel = (selector?: string): string => {
+      const state = currentConfig().piModels ?? config.piModels;
+      const available: FabricModelCandidate[] = Array.isArray(state?.available)
+        ? state.available.flatMap((candidate) =>
+            typeof candidate?.provider === "string" && typeof candidate.id === "string"
+              ? [{
+                  provider: candidate.provider,
+                  id: candidate.id,
+                  ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
+                }]
+              : [],
+          )
+        : [];
+      const query = selector?.trim() || state?.defaultModel?.trim() || "";
+      const resolved = resolveAvailablePiModel(query, {
+        aliases: normalizeModelAliases(state?.aliases),
+        available,
+        lastUsed: loadModelUsage(),
+      });
+      return `${resolved.provider}/${resolved.id}`;
     };
     this.agents = new AgentManager(config.cwd, config.agents, {
       workerPath: config.workerPath,
@@ -191,6 +218,7 @@ class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
+      preparePiModel: async (model) => resolveResidentPiModel(model),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -250,6 +278,7 @@ class ResidentHost {
         rootId: config.rootId,
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: config.retention,
+        resolvePiModel: resolveResidentPiModel,
       },
     ], actorRoots, config.mesh.actorScope);
     this.lifecycle = new LifecycleBroker(

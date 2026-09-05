@@ -44,12 +44,29 @@ const usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const visiblePiModels = [
+  { provider: "anthropic", id: "executor", name: "Executor" },
+  { provider: "anthropic", id: "frontier", name: "Frontier" },
+  { provider: "provider", id: "project" },
+  { provider: "provider", id: "project-default" },
+  { provider: "provider", id: "one-off" },
+  { provider: "provider", id: "session" },
+  { provider: "provider", id: "model-a" },
+  { provider: "provider", id: "model-b" },
+];
+
+const visibleModelRegistry = {
+  getAvailable: () => visiblePiModels,
+  find: (provider: string, id: string) =>
+    visiblePiModels.find((model) => model.provider === provider && model.id === id),
+};
+
 const context: FabricInvocationContext = {
   cwd: process.cwd(),
   signal: undefined,
   parentToolCallId: "test",
   nestedToolCallId: "nested",
-  extensionContext: {} as ExtensionContext,
+  extensionContext: { modelRegistry: visibleModelRegistry } as unknown as ExtensionContext,
   update() {},
   activity() {},
 };
@@ -69,6 +86,7 @@ const setup = (
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
+    vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
     runRoot: path.join(root, "runs"),
   });
   agentManagers.push(agents);
@@ -344,13 +362,15 @@ describe("AgentsProvider runner support", () => {
     const { provider } = setup();
     const run = await provider.describe("run", context);
     const spawn = await provider.describe("spawn", context);
-    const runProperties = (run?.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
-    const spawnProperties = (spawn?.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
+    type RunnerProperty = { enum?: string[]; type?: string; description?: string };
+    const runProperties = (run?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
+    const spawnProperties = (spawn?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
     expect(runProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
     expect(spawnProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
-    const persona = { type: "string", description: expect.stringContaining("Veda persona") };
-    expect(runProperties.persona).toMatchObject(persona);
-    expect(spawnProperties.persona).toMatchObject(persona);
+    expect(runProperties.persona?.type).toBe("string");
+    expect(runProperties.persona?.description).toContain("Veda persona");
+    expect(spawnProperties.persona?.type).toBe("string");
+    expect(spawnProperties.persona?.description).toContain("Veda persona");
     // Veda forwards any -m value to the backend, so model discovery is an
     // empty advisory list rather than a runtime enumeration.
     await expect(provider.invoke("models", { runner: "veda" }, context)).resolves.toEqual([]);
@@ -791,6 +811,7 @@ describe("AgentsProvider runner support", () => {
     const handoffContext: FabricInvocationContext = {
       ...context,
       extensionContext: {
+        ...context.extensionContext,
         sessionManager: source,
         model: { provider: "anthropic", id: "frontier" },
       } as unknown as ExtensionContext,
@@ -890,7 +911,10 @@ describe("AgentsProvider runner support", () => {
     const source = SessionManager.inMemory(root);
     const handoffContext = {
       ...context,
-      extensionContext: { sessionManager: source } as unknown as ExtensionContext,
+      extensionContext: {
+        ...context.extensionContext,
+        sessionManager: source,
+      } as unknown as ExtensionContext,
     };
     await expect(provider.invoke("handoff", {}, handoffContext)).rejects.toThrow(
       /requires an explicit Pi target model/,
@@ -1011,7 +1035,10 @@ describe("AgentsProvider runner support", () => {
     const source = SessionManager.inMemory(root);
     const handoffContext = {
       ...context,
-      extensionContext: { sessionManager: source } as unknown as ExtensionContext,
+      extensionContext: {
+        ...context.extensionContext,
+        sessionManager: source,
+      } as unknown as ExtensionContext,
     };
     const handoffDescriptor = await provider.describe("handoff", handoffContext);
     const handoffSchema = handoffDescriptor?.inputSchema as { properties: Record<string, unknown> };
@@ -1090,6 +1117,7 @@ describe("AgentsProvider runner support", () => {
     const handoffContext: FabricInvocationContext = {
       ...context,
       extensionContext: {
+        ...context.extensionContext,
         sessionManager: source,
         model: { provider: "anthropic", id: "frontier" },
       } as unknown as ExtensionContext,
@@ -2351,32 +2379,142 @@ describe("AgentsProvider switchModel", () => {
     );
   });
 
-  it("resolves inexact run models to the canonical provider/id before spawning", async () => {
-    const { provider, agents } = setup();
+  it("resolves visible exact, fuzzy, and alias run models before spawning", async () => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: { fast: ["opencode/hidden", "google/gemini-2.5-flash"] },
+      },
+    });
     const spawn = vi.spyOn(agents, "spawn");
-    await provider.invoke(
-      "run",
-      { task: "return a short result", model: "gemini" },
-      modelContext(),
-    );
-    expect(spawn).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "google/gemini-2.5-pro" }),
-      undefined,
-    );
+    const selectors = [
+      ["google/gemini-2.5-flash", "google/gemini-2.5-flash"],
+      ["gemini", "google/gemini-2.5-pro"],
+      ["fast", "google/gemini-2.5-flash"],
+    ] as const;
+
+    for (const [model, expected] of selectors) {
+      await provider.invoke(
+        "run",
+        { task: `run ${model}`, model },
+        modelContext(),
+      );
+      expect(spawn).toHaveBeenLastCalledWith(
+        expect.objectContaining({ model: expected }),
+        undefined,
+      );
+    }
   });
 
-  it("passes unresolvable run models through verbatim for the child runtime", async () => {
+  it.each(["run", "spawn"] as const)(
+    "rejects unavailable exact models for agents.%s",
+    async (action) => {
+      const { provider, agents } = setup();
+      const spawn = vi.spyOn(agents, "spawn");
+
+      await expect(
+        provider.invoke(
+          action,
+          { task: "do not launch", model: "opencode/ox-alpha" },
+          modelContext(),
+        ),
+      ).rejects.toThrow(/not available to this Pi session/);
+      expect(spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects exhausted Pi model aliases instead of forwarding them", async () => {
+    const { provider } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: { retired: ["opencode/old", "opencode/older"] },
+      },
+    });
+
+    await expect(
+      provider.invoke(
+        "run",
+        { task: "do not launch", model: "retired" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session.*opencode\/old, opencode\/older/);
+  });
+
+  it("rejects unavailable Pi models for handoff and actor creation", async () => {
+    const { provider, actors } = setup();
+    const deferHandoff = vi.fn(() => ({
+      scheduled: true as const,
+      status: "deferred" as const,
+      boundary: "fabric_exec_end" as const,
+    }));
+    const invocation = { ...modelContext(), deferHandoff };
+
+    await expect(
+      provider.invoke("handoff", { model: "opencode/ox-alpha" }, invocation),
+    ).rejects.toThrow(/not available to this Pi session/);
+    expect(deferHandoff).not.toHaveBeenCalled();
+    await expect(
+      provider.invoke(
+        "create",
+        { name: "hidden actor", instructions: "Do not create.", model: "opencode/ox-alpha" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session/);
+    expect(actors.list()).toEqual([]);
+  });
+
+  it("rejects unavailable actor setModel and activation overrides", async () => {
+    const { provider } = setup();
+    const actor = await provider.invoke(
+      "create",
+      {
+        name: "visible actor",
+        instructions: "Use only visible models.",
+        model: "google/gemini-2.5-flash",
+      },
+      modelContext(),
+    ) as FabricActorInfo;
+
+    await expect(
+      provider.invoke("setModel", { id: actor.id, model: "opencode/ox-alpha" }, modelContext()),
+    ).rejects.toThrow(/not available to this Pi session/);
+    await expect(
+      provider.invoke(
+        "ask",
+        { id: actor.id, message: "Do not run", model: "opencode/ox-alpha" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session/);
+    await expect(
+      provider.invoke(
+        "tell",
+        { id: actor.id, message: "Do not queue", model: "opencode/ox-alpha" },
+        modelContext(),
+      ),
+    ).rejects.toThrow(/not available to this Pi session/);
+  });
+
+  it("passes Claude and Veda model strings through unchanged", async () => {
     const { provider, agents } = setup();
     const spawn = vi.spyOn(agents, "spawn");
+
     await provider.invoke(
-      "run",
-      { task: "return a short result", model: "opencode/ox-alpha" },
+      "spawn",
+      { task: "Claude pass-through", runner: "claude", model: "private/claude-model" },
       modelContext(),
     );
-    expect(spawn).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "opencode/ox-alpha" }),
-      undefined,
+    await provider.invoke(
+      "spawn",
+      { task: "Veda pass-through", runner: "veda", model: "private/veda-model" },
+      modelContext(),
     );
+
+    expect(spawn.mock.calls[0]?.[0]).toMatchObject({
+      runner: "claude",
+      model: "private/claude-model",
+    });
+    expect(spawn.mock.calls[1]?.[0]).toMatchObject({
+      runner: "veda",
+      model: "private/veda-model",
+    });
   });
 
   it("rejects unknown selectors and exhausted alias chains", async () => {

@@ -274,6 +274,7 @@ export class ActorManager {
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
+  readonly #resolvePiModel: ((model: string) => string) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
@@ -328,6 +329,7 @@ export class ActorManager {
       persistent?: boolean;
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
+      resolvePiModel?: (model: string) => string;
       lineageAlive?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
@@ -347,6 +349,7 @@ export class ActorManager {
     this.#persistent = options.persistent ?? false;
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
+    this.#resolvePiModel = options.resolvePiModel;
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
@@ -436,6 +439,8 @@ export class ActorManager {
     if (runner !== "pi" && runner !== "claude") {
       throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
     }
+    const requestedModel = typeof request.model === "string" ? request.model.trim() : "";
+    const model = requestedModel ? this.#resolvedModel(runner, requestedModel) : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
@@ -457,7 +462,7 @@ export class ActorManager {
       coalesce: request.coalesce ?? true,
       residency,
       runner,
-      ...(request.model ? { model: request.model } : {}),
+      ...(model ? { model } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.tools ? { tools: [...new Set(request.tools)] } : {}),
       ...(request.transport ? { transport: request.transport } : {}),
@@ -562,15 +567,19 @@ export class ActorManager {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
     }
     const next = typeof model === "string" ? model.trim() : "";
+    if (scope === "session") this.#syncActorsFromRegistry();
+    const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
+    const resolved = next
+      ? scope === "project" || this.#canManage(actor.id)
+        ? this.#resolvedModel(actor.runner, next)
+        : next
+      : undefined;
     if (scope === "session") {
-      this.#syncActorsFromRegistry();
-      const actor = this.#requireActor(id);
-      await this.#bindings.setModel(actor.id, next || undefined);
+      await this.#bindings.setModel(actor.id, resolved);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
-    const actor = this.#requireOwnedActor(id);
-    if (next) actor.model = next;
+    if (resolved) actor.model = resolved;
     else delete actor.model;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
@@ -1243,9 +1252,12 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
-    const binding = options.binding !== undefined
-      ? this.#validatedRunBinding(options.binding)
-      : this.#runBinding(actor, options.overrides);
+    const binding = this.#resolvedRunBinding(
+      actor,
+      options.binding !== undefined
+        ? this.#validatedRunBinding(options.binding)
+        : this.#runBinding(actor, options.overrides),
+    );
     const createdAt = Date.now();
     const sequence = ++actor.latestActivationSequence;
     if (options.coalesceKey) {
@@ -2258,6 +2270,21 @@ export class ActorManager {
       void this.#publishPresence(actor).catch(() => undefined);
     }
     if (added > 0) this.#emitChange();
+  }
+
+  #resolvedModel(runner: FabricAgentRunner, model: string): string {
+    return runner === "pi" && this.#resolvePiModel
+      ? this.#resolvePiModel(model)
+      : model;
+  }
+
+  #resolvedRunBinding(
+    actor: ManagedActor,
+    binding: FabricActorRunBinding,
+  ): FabricActorRunBinding {
+    return binding.model
+      ? { ...binding, model: this.#resolvedModel(actor.runner, binding.model) }
+      : binding;
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {

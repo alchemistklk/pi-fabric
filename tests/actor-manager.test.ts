@@ -31,6 +31,10 @@ const setup = (
     requirements: readonly FabricCapabilityRequirement[],
     signal: AbortSignal,
   ) => Promise<FabricCapabilityViewLease>,
+  modelValidation?: {
+    preparePiModel?: (model: string | undefined) => Promise<string | void>;
+    resolvePiModel?: (model: string) => string;
+  },
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
@@ -38,6 +42,9 @@ const setup = (
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     runRoot: path.join(root, "runs"),
+    ...(modelValidation?.preparePiModel
+      ? { preparePiModel: modelValidation.preparePiModel }
+      : {}),
   });
   agentManagers.push(agents);
   const identity: MeshIdentity = {
@@ -62,6 +69,9 @@ const setup = (
       persistent,
       ...(canManageActor ? { canManageActor } : {}),
       ...(acquireCapabilityView ? { acquireCapabilityView } : {}),
+      ...(modelValidation?.resolvePiModel
+        ? { resolvePiModel: modelValidation.resolvePiModel }
+        : {}),
     },
   );
   actorManagers.push(actors);
@@ -108,6 +118,72 @@ describe("ActorManager", () => {
 
     owns = true;
     expect(actors.tell(actor.id, "run after takeover")).toMatchObject({ queued: true });
+  });
+
+  it("rejects unavailable Pi models on create, setModel, and activation overrides", async () => {
+    const resolvePiModel = (model: string): string => {
+      if (model !== "provider/visible") {
+        throw new Error(`Model ${JSON.stringify(model)} is not available to this Pi session`);
+      }
+      return model;
+    };
+    const { actors } = setup(false, undefined, undefined, { resolvePiModel });
+
+    await expect(
+      actors.create({
+        name: "hidden create",
+        instructions: "Do not persist.",
+        runner: "pi",
+        model: "provider/hidden",
+      }),
+    ).rejects.toThrow(/not available to this Pi session/);
+    const actor = await actors.create({
+      name: "visible actor",
+      instructions: "Use the visible model.",
+      runner: "pi",
+      model: "provider/visible",
+    });
+
+    await expect(actors.setModel(actor.id, "provider/hidden")).rejects.toThrow(
+      /not available to this Pi session/,
+    );
+    expect(() =>
+      actors.tell(actor.id, "Do not queue", undefined, {
+        overrides: { model: "provider/hidden" },
+      })
+    ).toThrow(/not available to this Pi session/);
+    await expect(
+      actors.ask(actor.id, "Do not run", undefined, undefined, {
+        overrides: { model: "provider/hidden" },
+      }),
+    ).rejects.toThrow(/not available to this Pi session/);
+    expect(actors.status(actor.id).queued).toBe(0);
+  });
+
+  it("rejects a persisted actor binding that becomes hidden before launch", async () => {
+    let visible = true;
+    const preparePiModel = async (model: string | undefined): Promise<string | void> => {
+      if (!visible || model !== "provider/visible") {
+        throw new Error(`Model ${JSON.stringify(model)} is not available to this Pi session`);
+      }
+      return model;
+    };
+    const { actors, agents, root } = setup(true, undefined, undefined, { preparePiModel });
+    const actor = await actors.create({
+      name: "stale binding",
+      instructions: "Never launch a newly hidden model.",
+      runner: "pi",
+    });
+    await actors.setModel(actor.id, "provider/visible");
+    expect(fs.readdirSync(path.join(root, "actors", "bindings"))).toHaveLength(1);
+
+    visible = false;
+    await expect(actors.ask(actor.id, "Do not launch")).rejects.toThrow(
+      /not available to this Pi session/,
+    );
+    await waitFor(() => actors.status(actor.id).status === "idle");
+    expect(agents.list()).toEqual([]);
+    expect(actors.status(actor.id).lastError).toMatch(/not available to this Pi session/);
   });
 
   it("isolates two live sessions over one shared actor definition", async () => {
@@ -1528,11 +1604,12 @@ describe("ActorManager", () => {
 
     const first = actors.ask(actor.id, "STOP_DIRECTIVE");
     const queued = actors.ask(actor.id, "queued behind the stop");
-
-    await expect(first).resolves.toMatchObject({ action: "stop" });
-    await expect(queued).rejects.toThrow(
+    const queuedRejection = expect(queued).rejects.toThrow(
       `Fabric actor one-shot (${actor.id}) stopped itself with a stop directive while messages were queued`,
     );
+
+    await expect(first).resolves.toMatchObject({ action: "stop" });
+    await queuedRejection;
     await waitFor(() => actors.status(actor.id).status === "stopped");
   });
 

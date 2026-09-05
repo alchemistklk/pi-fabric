@@ -297,11 +297,15 @@ describe("AgentManager", () => {
     ).rejects.toThrow(/cannot combine sessionSeed with sessionFile/);
   });
 
-  it("coalesces concurrent Pi model preparation by provider", async () => {
+  it("does not let same-provider preparation authorize a different model", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
-    const preparePiModel = vi.fn(async () => {
+    const preparePiModel = vi.fn(async (model: string | undefined) => {
       await new Promise((resolve) => setTimeout(resolve, 50));
+      if (model === "openai-codex/gpt-hidden") {
+        throw new Error(`Model ${JSON.stringify(model)} is not available to this Pi session`);
+      }
+      return model;
     });
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -310,21 +314,51 @@ describe("AgentManager", () => {
     });
     managers.push(manager);
 
-    const results = await Promise.all([
+    const [visible, hidden] = await Promise.allSettled([
       manager.run({
-        task: "First prepared child",
-        model: "openai-codex/gpt-first",
+        task: "Visible prepared child",
+        model: "openai-codex/gpt-visible",
         transport: "process",
       }),
       manager.run({
-        task: "Second prepared child",
-        model: "openai-codex/gpt-second",
+        task: "Hidden prepared child",
+        model: "openai-codex/gpt-hidden",
         transport: "process",
       }),
     ]);
 
-    expect(results.every((result) => result.status === "completed")).toBe(true);
-    expect(preparePiModel).toHaveBeenCalledTimes(1);
+    expect(visible).toMatchObject({ status: "fulfilled", value: { status: "completed" } });
+    expect(hidden).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ message: expect.stringContaining("not available to this Pi session") }),
+    });
+    expect(preparePiModel).toHaveBeenCalledTimes(2);
+    expect(preparePiModel.mock.calls.map(([model]) => model).sort()).toEqual([
+      "openai-codex/gpt-hidden",
+      "openai-codex/gpt-visible",
+    ]);
+  });
+
+  it("validates the configured Pi model default before launching", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(
+      process.cwd(),
+      { ...DEFAULT_FABRIC_CONFIG.agents, model: "provider/hidden" },
+      {
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+        runRoot: root,
+        preparePiModel: async (model) => {
+          throw new Error(`Model ${JSON.stringify(model)} is not available to this Pi session`);
+        },
+      },
+    );
+    managers.push(manager);
+
+    await expect(manager.spawn({ task: "Do not launch", runner: "pi" })).rejects.toThrow(
+      /not available to this Pi session/,
+    );
+    expect(fs.readdirSync(root)).toEqual([]);
   });
 
   it("retries a Pi child that fails before its first turn", async () => {

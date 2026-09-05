@@ -57,9 +57,14 @@ import type {
   AgentSessionSeed,
 } from "../agents/types.js";
 import type { ThinkingTransferInput } from "../agents/thinking-transfer.js";
-import { DEFAULT_FABRIC_CONFIG, type FabricModelsConfig } from "../config.js";
+import {
+  DEFAULT_FABRIC_CONFIG,
+  type FabricAgentRunner,
+  type FabricModelsConfig,
+} from "../config.js";
 import {
   FUZZY_RESOLUTION_MARKERS,
+  resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
@@ -664,24 +669,11 @@ export class AgentsProvider implements FabricProvider {
     );
   }
 
-  /**
-   * Resolve an explicit Pi-runner model selector against the authenticated
-   * registry, honoring models.aliases and pi-model-sort recency for inexact
-   * terms. Unresolvable selectors pass through verbatim: the child Pi runtime
-   * resolves catalog refresh state and custom ids itself and reports its own
-   * error when nothing matches.
-   */
-  #resolvePiModelArgs(
-    args: Record<string, unknown>,
+  /** Resolve a Pi participant selector only within this session's visible registry. */
+  #resolvePiModel(
+    model: string,
     context: FabricInvocationContext,
-  ): Record<string, unknown> {
-    const runner =
-      args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
-        ? args.runner
-        : this.manager.config.runner;
-    if (runner !== "pi") return args;
-    const model = typeof args.model === "string" ? args.model.trim() : "";
-    if (!model) return args;
+  ): string {
     let available: FabricModelCandidate[] = [];
     try {
       available = context.extensionContext.modelRegistry.getAvailable().map((candidate) => ({
@@ -690,17 +682,39 @@ export class AgentsProvider implements FabricProvider {
         ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
       }));
     } catch {
-      available = [];
+      // The authoritative visible set is empty when registry discovery fails.
     }
-    if (available.length === 0) return args;
-    const resolution = resolveFabricModel(model, {
+    const resolved = resolveAvailablePiModel(model, {
       aliases: this.modelsConfig().aliases,
       available,
       lastUsed: loadModelUsage(),
     });
-    if (resolution.kind !== "resolved" && resolution.kind !== "already-active") return args;
-    const key = `${resolution.model.provider}/${resolution.model.id}`;
-    return key === model ? args : { ...args, model: key };
+    return `${resolved.provider}/${resolved.id}`;
+  }
+
+  #resolvePiModelArgs(
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    runnerOverride?: FabricAgentRunner,
+  ): Record<string, unknown> {
+    const runner = runnerOverride ??
+      (args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
+        ? args.runner
+        : this.manager.config.runner);
+    if (runner !== "pi") return args;
+    const model = typeof args.model === "string" ? args.model.trim() : "";
+    if (!model) return args;
+    const resolved = this.#resolvePiModel(model, context);
+    return resolved === model ? args : { ...args, model: resolved };
+  }
+
+  #resolvePiRunBinding(
+    binding: FabricActorRunBinding,
+    runner: FabricAgentRunner,
+    context: FabricInvocationContext,
+  ): FabricActorRunBinding {
+    if (runner !== "pi" || !binding.model) return binding;
+    return { ...binding, model: this.#resolvePiModel(binding.model, context) };
   }
 
   async list(
@@ -741,9 +755,13 @@ export class AgentsProvider implements FabricProvider {
         "agents.handoff must be scheduled from inside fabric_exec and completed at its outer result boundary",
       );
     }
-    const handoffArgs = { ...args };
+    const handoffArgs = this.#resolvePiModelArgs(
+      { ...args, model },
+      context,
+      "pi",
+    );
     delete handoffArgs.cwd;
-    return context.deferHandoff({ ...handoffArgs, model });
+    return context.deferHandoff(handoffArgs);
   }
 
   async executeHandoff(
@@ -773,11 +791,12 @@ export class AgentsProvider implements FabricProvider {
     );
     request.runner = "pi";
     request.sessionSeed = sessionSeed;
+    const targetModel = request.model ?? model;
     const handoffCompaction = checkedHandoffCompaction(args.compact);
     if (handoffCompaction) request.handoffCompact = handoffCompaction;
     request.thinkingTransfer = resolveThinkingTransfer(
       context.extensionContext,
-      model,
+      targetModel,
       sessionSeed.sourceModel,
     );
     const handle = await this.manager.spawn(request, context.signal);
@@ -788,7 +807,7 @@ export class AgentsProvider implements FabricProvider {
       name: handle.name,
     });
     context.update(
-      `Trajectory handed off to ${handle.name} (${model}); caller is waiting for implementation`,
+      `Trajectory handed off to ${handle.name} (${targetModel}); caller is waiting for implementation`,
     );
     const completed = await waitWithProgress(
       this.manager,
@@ -958,7 +977,7 @@ export class AgentsProvider implements FabricProvider {
         return this.lifecycle.unsubscribe(String(args.id));
       case "models": {
         const runner =
-          args.runner === "pi" || args.runner === "claude"
+          args.runner === "pi" || args.runner === "claude" || args.runner === "veda"
             ? args.runner
             : this.manager.config.runner;
         if (runner === "veda") {
@@ -1062,6 +1081,11 @@ export class AgentsProvider implements FabricProvider {
         if (!outcome.ok) {
           throw new Error(`agents.switchModel: ${outcome.error ?? "switch failed"}`);
         }
+        try {
+          this.residency?.syncPiModels();
+        } catch {
+          // The next durable command retries synchronization before execution.
+        }
         context.activity?.({
           type: "progress",
           message: `Main model ${previous ? `${previous} → ` : ""}${resolution.model.provider}/${resolution.model.id}`,
@@ -1101,15 +1125,19 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         const message = String(args.message);
         this.actorManager.validateDirectMessage(message, args.data);
-        const overrides = actorRunBinding(args);
         const { actor, participant } = this.#resolveActorTarget(id);
+        const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
+        const requestedOverrides = actorRunBinding(args);
+        const overrides = ownsActor
+          ? this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context)
+          : requestedOverrides;
         context.activity?.({
           type: "entity",
           id: actor?.id ?? participant!.id,
           kind: "actor",
           name: actor?.name ?? participant!.name,
         });
-        if (actor && this.actorManager.owns(actor.id)) {
+        if (actor && ownsActor) {
           return waitWithActorProgress(
             this.manager,
             this.#transcripts,
@@ -1201,12 +1229,21 @@ export class AgentsProvider implements FabricProvider {
           typeof args.limit === "number" ? args.limit : 50,
         );
       }
-      case "setModel":
+      case "setModel": {
+        const id = String(args.id);
+        const model = typeof args.model === "string" ? args.model.trim() : "";
+        const target = this.#resolveActorTarget(id);
+        const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
+        const runner = target.actor?.runner ?? target.participant!.runner;
+        const resolvedModel = model && ownsActor
+          ? this.#resolvePiModelArgs({ model }, context, runner).model as string
+          : model || undefined;
         return this.actorManager.setModel(
-          String(args.id),
-          typeof args.model === "string" ? args.model : undefined,
+          id,
+          resolvedModel,
           args.scope === "project" ? "project" : "session",
         );
+      }
       case "setThinking":
         return this.actorManager.setThinking(
           String(args.id),
@@ -1273,7 +1310,17 @@ export class AgentsProvider implements FabricProvider {
         const as =
           typeof args.as === "string" && args.as.trim() ? args.as.trim() : undefined;
         const request = this.globalActors.toRequest(def, as);
-        const actor = await this.#createActor(request);
+        const resolvedRequest = request.model
+          ? {
+              ...request,
+              model: this.#resolvePiModelArgs(
+                { model: request.model },
+                context,
+                request.runner ?? this.manager.config.runner,
+              ).model as string,
+            }
+          : request;
+        const actor = await this.#createActor(resolvedRequest);
         this.participants.scheduleRefresh();
         context.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
         return actor;
@@ -1394,10 +1441,14 @@ export class AgentsProvider implements FabricProvider {
       throw error;
     }
     const { actor, participant } = target;
-    if (actor && (!participant || participant.local)) {
+    const localActor = Boolean(actor && (!participant || participant.local));
+    const binding = options.binding && context && localActor
+      ? this.#resolvePiRunBinding(options.binding, actor!.runner, context)
+      : options.binding;
+    if (actor && localActor) {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {
-        ...(options.binding ? { overrides: options.binding } : {}),
+        ...(binding ? { overrides: binding } : {}),
       });
       return { queued: true, messageId: result.messageId, routed: "local" };
     }
@@ -1406,12 +1457,12 @@ export class AgentsProvider implements FabricProvider {
       throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
     }
     const sessionBinding = actor?.binding;
-    const binding = actor
-      ? this.actorManager.resolveBinding(actor.id, options.binding)
-      : options.binding;
+    const resolvedBinding = actor
+      ? this.actorManager.resolveBinding(actor.id, binding)
+      : binding;
     const needsBinding = Boolean(
-      binding?.model ||
-        binding?.thinking ||
+      resolvedBinding?.model ||
+        resolvedBinding?.thinking ||
         sessionBinding?.model ||
         sessionBinding?.thinking,
     );
@@ -1434,7 +1485,7 @@ export class AgentsProvider implements FabricProvider {
         ...(typeof options.triggerTurn === "boolean"
           ? { triggerTurn: options.triggerTurn }
           : {}),
-        ...(needsBinding && binding ? { binding } : {}),
+        ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
       },
       participant.ownerIdentityId,
     );
